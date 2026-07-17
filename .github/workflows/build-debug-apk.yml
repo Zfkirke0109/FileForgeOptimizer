@@ -22,6 +22,40 @@ jobs:
           gradle-version: '8.10.2'
       - name: Build debug APK
         run: gradle assembleDebug
+      - name: Sign and verify APK with shared keystore
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          EXPECTED_SIGNER_SHA256: ${{ secrets.EXPECTED_SIGNER_SHA256 }}
+        run: |
+          set -euo pipefail
+          for secret in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD EXPECTED_SIGNER_SHA256; do
+            test -n "${!secret}" || { echo "::error::Required signing secret $secret is not configured."; exit 1; }
+          done
+          keystore="$RUNNER_TEMP/rootlesszachdsp.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          chmod 600 "$keystore"
+          keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          expected="$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')"
+          cert="$(keytool -exportcert -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" | sha256sum | awk '{print toupper($1)}')"
+          test "$cert" = "$expected" || { echo "::error::Signing certificate fingerprint mismatch."; exit 1; }
+
+          apk="app/build/outputs/apk/debug/app-debug.apk"
+          aligned="$RUNNER_TEMP/app-debug-aligned.apk"
+          signed="$RUNNER_TEMP/app-debug-signed.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -f -P 16 4 "$apk" "$aligned"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --ks "$keystore" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD --out "$signed" "$aligned"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$signed" | tee "$RUNNER_TEMP/apksigner.txt"
+          actual="$(awk -F': ' '/Signer #[0-9]+ certificate SHA-256 digest:/ {print toupper($2); exit}' "$RUNNER_TEMP/apksigner.txt" | tr -d '[:space:]:' )"
+          test "$actual" = "$expected" || { echo "::error::Signed APK certificate mismatch."; exit 1; }
+          mv "$signed" "$apk"
+          rm -f "$keystore" "$aligned"
+      - name: Remove signing material from runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/rootlesszachdsp.jks"
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
