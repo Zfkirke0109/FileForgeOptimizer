@@ -226,7 +226,7 @@ object Optimizers {
         val compact = when (value) {
             is JSONObject -> value.toString()
             is JSONArray -> value.toString()
-            else -> JSONObject.valueToString(value)
+            else -> value?.toString() ?: "null"
         }
         return OptimizeResult(compact.toByteArray(Charsets.UTF_8), "Minified JSON.")
     }
