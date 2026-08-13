@@ -7,6 +7,10 @@ android {
     namespace 'com.fileforge.optimizer'
     compileSdk 35
 
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
     defaultConfig {
         applicationId 'com.fileforge.optimizer'
         minSdk 26
@@ -27,4 +31,6 @@ android {
 
 dependencies {
     implementation 'androidx.documentfile:documentfile:1.0.1'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
 }

@@ -130,6 +130,7 @@ class MainActivity : Activity() {
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             )
             try {
+                @Suppress("WrongConstant") // `flags` is masked to the two documented access-mode grants above.
                 contentResolver.takePersistableUriPermission(uri, flags)
             } catch (_: Exception) {
                 // Some providers do not allow persisted grants; the active grant can still work for the session.
