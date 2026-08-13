@@ -81,6 +81,32 @@ class CandidateStoreTest {
     }
 
     @Test
+    fun unscopedStoreCreatesCandidatesInIndependentRunDirectories() {
+        withCacheDirectory { cacheDirectory ->
+            val store = CandidateStore(cacheDirectory)
+            val first = store.create("run-a", ".zip")
+            val second = store.create("run-b", ".zip")
+
+            assertEquals(File(cacheDirectory, "fileforge/run-a").canonicalFile, first.file.parentFile.canonicalFile)
+            assertEquals(File(cacheDirectory, "fileforge/run-b").canonicalFile, second.file.parentFile.canonicalFile)
+            first.close()
+            assertTrue(second.file.exists())
+            second.close()
+            assertFalse(File(cacheDirectory, "fileforge").exists())
+        }
+    }
+
+    @Test
+    fun unscopedStoreRejectsCandidateCreationWithoutAnExplicitRunId() {
+        withCacheDirectory { cacheDirectory ->
+            val store = CandidateStore(cacheDirectory)
+
+            assertThrows(IllegalStateException::class.java) { store.create(".zip") }
+            assertFalse(File(cacheDirectory, "fileforge").exists())
+        }
+    }
+
+    @Test
     fun candidateOperationsAfterCloseAreRejected() {
         withCacheDirectory { cacheDirectory ->
             val candidate = CandidateStore(cacheDirectory, "run-a").create(".zip")

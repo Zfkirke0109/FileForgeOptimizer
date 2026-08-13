@@ -75,6 +75,24 @@ class OptimizationCoordinatorDryRunTest {
     }
 
     @Test
+    fun briefConstructorUsesItsRunIdWithAnUnscopedCandidateStore() {
+        withCandidateDirectory { candidateDirectory ->
+            val gateway = RecordingDocumentGateway(compressibleZipFixture)
+            val coordinator = OptimizationCoordinator(
+                gateway,
+                CandidateStore(candidateDirectory),
+                "brief-run"
+            )
+
+            val outcome = coordinator.process(gateway.rootFile, "archive.zip", dryRunIntent, NeverCancelled)
+
+            assertTrue(outcome is FileOutcome.WouldOptimize)
+            assertEquals(emptyList<String>(), gateway.writeOperations)
+            assertDirectoryEmpty(candidateDirectory)
+        }
+    }
+
+    @Test
     fun dryRunVerifiesNonSmallerCandidateBeforeReturningNoGain() {
         withCandidateDirectory { candidateDirectory ->
             val gateway = RecordingDocumentGateway(compressibleZipFixture)

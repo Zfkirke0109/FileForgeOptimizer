@@ -10,43 +10,63 @@ import java.io.OutputStream
 
 class CandidateCleanupException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
-class CandidateStore(private val cacheDirectory: File, runId: String) {
+class CandidateStore private constructor(
+    cacheDirectory: File,
+    private val scopedRunId: String?,
+    private val fileSystem: CandidateFileSystem,
+    @Suppress("UNUSED_PARAMETER") private val constructorMarker: Boolean
+) {
     private val root = File(cacheDirectory, ROOT_DIRECTORY)
-    private val runDirectory: File
-    private var fileSystem: CandidateFileSystem = JvmCandidateFileSystem
 
     init {
-        require(runId.isSafePathSegment()) { "Invalid candidate run id" }
-        runDirectory = File(root, runId)
+        scopedRunId?.let { require(it.isSafePathSegment()) { "Invalid candidate run id" } }
     }
+
+    constructor(cacheDirectory: File) : this(cacheDirectory, null, JvmCandidateFileSystem, true)
+
+    constructor(cacheDirectory: File, runId: String) : this(cacheDirectory, runId, JvmCandidateFileSystem, true)
 
     internal constructor(
         cacheDirectory: File,
         runId: String,
         fileSystem: CandidateFileSystem
-    ) : this(cacheDirectory, runId) {
-        this.fileSystem = fileSystem
+    ) : this(cacheDirectory, runId, fileSystem, true)
+
+    fun create(runId: String, suffix: String): CandidateFile {
+        require(runId.isSafePathSegment()) { "Invalid candidate run id" }
+        val ownedRunId = scopedRunId
+        if (ownedRunId != null) {
+            require(runId == ownedRunId) { "Scoped store cannot create candidates for another run" }
+        }
+        return createInRun(File(root, runId), suffix)
     }
 
     fun create(suffix: String): CandidateFile {
+        val runId = checkNotNull(scopedRunId) {
+            "An unscoped CandidateStore requires create(runId, suffix)."
+        }
+        return createInRun(File(root, runId), suffix)
+    }
+
+    private fun createInRun(runDirectory: File, suffix: String): CandidateFile {
         require(suffix.isSafeCandidateSuffix()) { "Invalid candidate suffix" }
         fileSystem.createDirectories(runDirectory)
         val file = try {
             fileSystem.createTempFile(runDirectory, suffix)
         } catch (failure: Exception) {
-            cleanDirectoriesAfterCreateFailure(failure)
+            cleanDirectoriesAfterCreateFailure(runDirectory, failure)
             throw failure
         }
-        return CandidateFile(file) { release(file) }
+        return CandidateFile(file) { release(runDirectory, file) }
     }
 
-    private fun release(file: File) {
+    private fun release(runDirectory: File, file: File) {
         requireDeleted(file, "candidate file")
         deleteIfEmpty(runDirectory, "candidate run directory")
         deleteIfEmpty(root, "candidate root directory")
     }
 
-    private fun cleanDirectoriesAfterCreateFailure(createFailure: Exception) {
+    private fun cleanDirectoriesAfterCreateFailure(runDirectory: File, createFailure: Exception) {
         try {
             deleteIfEmpty(runDirectory, "candidate run directory")
             deleteIfEmpty(root, "candidate root directory")

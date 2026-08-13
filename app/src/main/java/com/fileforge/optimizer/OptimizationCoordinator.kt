@@ -67,7 +67,16 @@ class OptimizationCoordinator(
     private val documentGateway: DocumentGateway,
     private val candidateStore: CandidateStore
 ) {
+    private var runId: String? = null
     private var zipCandidateProcessor: ZipCandidateProcessor = StrictStreamingZipCandidateProcessor
+
+    constructor(
+        documentGateway: DocumentGateway,
+        candidateStore: CandidateStore,
+        runId: String
+    ) : this(documentGateway, candidateStore) {
+        this.runId = runId
+    }
 
     internal constructor(
         documentGateway: DocumentGateway,
@@ -112,7 +121,7 @@ class OptimizationCoordinator(
         cancellation: CancellationToken
     ): FileOutcome {
         val oldBytes = documentGateway.length(node)
-        candidateStore.create(ZIP_CANDIDATE_SUFFIX).use { candidate ->
+        createCandidate().use { candidate ->
             documentGateway.openRead(node).use { source ->
                 candidate.openOutputStream().use { output ->
                     zipCandidateProcessor.optimize(source, output, runIntent.mode, cancellation)
@@ -154,6 +163,10 @@ class OptimizationCoordinator(
         }
         return header
     }
+
+    private fun createCandidate(): CandidateFile =
+        runId?.let { candidateStore.create(it, ZIP_CANDIDATE_SUFFIX) }
+            ?: candidateStore.create(ZIP_CANDIDATE_SUFFIX)
 
     private companion object {
         const val HEADER_BYTES = 8 * 1024

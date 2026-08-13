@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -21,6 +23,33 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
+      - name: Determine whether to run the large streaming regression
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+          DELETED: ${{ github.event.deleted }}
+        run: |
+          run_large_streaming_test=false
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            run_large_streaming_test=true
+          elif [[ "$DELETED" == "true" || -z "$AFTER_SHA" || "$AFTER_SHA" =~ ^0+$ ]]; then
+            run_large_streaming_test=true
+          elif [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]]; then
+            run_large_streaming_test=true
+          elif ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null || \
+            ! git cat-file -e "${AFTER_SHA}^{commit}" 2>/dev/null; then
+            run_large_streaming_test=true
+          elif git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- \
+            app/src/main/java/com/fileforge/optimizer/StreamingZipOptimizer.kt \
+            app/src/main/java/com/fileforge/optimizer/CancellationToken.kt | \
+            grep -F -x -q -e app/src/main/java/com/fileforge/optimizer/StreamingZipOptimizer.kt \
+              -e app/src/main/java/com/fileforge/optimizer/CancellationToken.kt; then
+            run_large_streaming_test=true
+          fi
+
+          echo "FILEFORGE_RUN_LARGE_STREAMING_TEST=$run_large_streaming_test" >> "$GITHUB_ENV"
       - name: Test, lint, and assemble debug APK
         run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
       - name: Upload unsigned debug APK

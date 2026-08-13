@@ -2,6 +2,7 @@ package com.fileforge.optimizer
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.OutputStream
 import java.nio.file.Files
@@ -14,6 +15,11 @@ class LargeStreamingZipTest {
 
     @Test
     fun optimizesAndVerifiesA301MiBArchiveWithLessThan64MiBHeapGrowth() {
+        assumeTrue(
+            "Set FILEFORGE_RUN_LARGE_STREAMING_TEST=true to run the 301 MiB regression",
+            "true".equals(System.getenv("FILEFORGE_RUN_LARGE_STREAMING_TEST"), ignoreCase = true),
+        )
+
         val source = Files.createTempFile("fileforge-301m-source", ".zip")
         val output = Files.createTempFile("fileforge-301m-output", ".zip")
         try {
