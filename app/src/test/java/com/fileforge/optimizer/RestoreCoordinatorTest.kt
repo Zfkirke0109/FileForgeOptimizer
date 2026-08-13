@@ -282,6 +282,10 @@ class RestoreCoordinatorTest {
                     if (phase == "write") error("write failed")
                     super.write(str, off, len)
                 }
+                override fun write(str: String) {
+                    if (phase == "write") error("write failed")
+                    super.write(str)
+                }
                 override fun flush() {
                     if (phase == "flush") error("flush failed")
                     super.flush()
