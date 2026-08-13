@@ -191,18 +191,16 @@ class RestoreCoordinatorTest {
     }
 
     @Test
-    fun receiptOpenFailurePreventsWriteAndReceiptWriteFlushOrCloseFailureRetainsReport() {
-        listOf("open", "write", "flush", "close").forEach { phase ->
-            val receipt = FaultingReceiptWriter(phase)
-            withRestore(receiptWriter = receipt) { gateway, coordinator, _, run ->
-                val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+    fun receiptOpenFailurePreventsOriginalWrite() = assertReceiptFailure("open", originalWasWritten = false)
 
-                if (phase == "open") assertFalse(gateway.events.any { it == "write:root/docs/a.zip" })
-                else assertEquals(backupA.toList(), gateway.contents("docs/a.zip").toList())
-                assertTrue("receipt phase=$phase error=${report.receiptError}", report.receiptError?.contains(phase) == true)
-            }
-        }
-    }
+    @Test
+    fun receiptWriteFailureRetainsCompletedRestoreReport() = assertReceiptFailure("write", originalWasWritten = true)
+
+    @Test
+    fun receiptFlushFailureRetainsCompletedRestoreReport() = assertReceiptFailure("flush", originalWasWritten = true)
+
+    @Test
+    fun receiptCloseFailureRetainsCompletedRestoreReport() = assertReceiptFailure("close", originalWasWritten = true)
 
     @Test
     fun cancellationDuringOriginalRestoreCopyRepairsCurrentEntryThenStops() = withRestore(entries = listOf(entry("docs/a.zip"), entry("docs/b.zip"))) {
@@ -239,6 +237,16 @@ class RestoreCoordinatorTest {
         val run = UndoRun(UndoHeader(runId, "2026-08-13T19:00:00Z"), entries, RunStatus.COMPLETED)
         val coordinator = RestoreCoordinator(gateway, gateway.root, receiptWriter) { timestamp }
         block(gateway, coordinator, recording, run)
+    }
+
+    private fun assertReceiptFailure(phase: String, originalWasWritten: Boolean) {
+        withRestore(receiptWriter = FaultingReceiptWriter(phase)) { gateway, coordinator, _, run ->
+            val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+            if (!originalWasWritten) assertFalse(gateway.events.any { it == "write:root/docs/a.zip" })
+            else assertEquals(backupA.toList(), gateway.contents("docs/a.zip").toList())
+            assertTrue("receipt phase=$phase error=${report.receiptError}", report.receiptError?.contains(phase) == true)
+        }
     }
 
     private fun entry(
