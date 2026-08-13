@@ -124,7 +124,7 @@ internal class FixedCandidateProcessor(
 ) : ZipCandidateProcessor {
     override fun optimize(input: InputStream, output: OutputStream, mode: OptimizeMode, cancellation: CancellationToken): ZipOptimizationSummary {
         input.copyTo(OutputStream.nullOutputStream(), 32 * 1024)
-        candidate.asInputStream().copyTo(output, 32 * 1024)
+        candidate.inputStream().copyTo(output, 32 * 1024)
         return ZipOptimizationSummary(1, candidate.size.toLong(), candidate.size.toLong(), "candidate")
     }
 
