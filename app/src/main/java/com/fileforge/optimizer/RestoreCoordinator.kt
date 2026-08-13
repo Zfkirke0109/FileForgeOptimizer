@@ -80,6 +80,8 @@ class RestoreCoordinator(
         val original: DocumentNode
         val backup: DocumentNode
         try {
+            DocumentPathPolicy.requireSafeRelative(entry.relativePath)
+            DocumentPathPolicy.requireSafeRelative(entry.backupPath)
             original = DocumentPathPolicy.resolve(selectedRoot, entry.relativePath, documentGateway)
                 ?: return result(entry, RestoreEntryStatus.ORIGINAL_MISSING, "Original is missing")
             backup = DocumentPathPolicy.resolve(selectedRoot, entry.backupPath, documentGateway)
