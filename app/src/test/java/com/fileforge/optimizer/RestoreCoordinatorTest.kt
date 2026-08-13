@@ -199,7 +199,7 @@ class RestoreCoordinatorTest {
 
                 if (phase == "open") assertFalse(gateway.events.any { it == "write:root/docs/a.zip" })
                 else assertEquals(backupA.toList(), gateway.contents("docs/a.zip").toList())
-                assertTrue(report.receiptError?.contains(phase) == true)
+                assertTrue("receipt phase=$phase error=${report.receiptError}", report.receiptError?.contains(phase) == true)
             }
         }
     }
@@ -269,6 +269,10 @@ class RestoreCoordinatorTest {
                 override fun write(cbuf: CharArray, off: Int, len: Int) {
                     if (phase == "write") error("write failed")
                     super.write(cbuf, off, len)
+                }
+                override fun write(str: String, off: Int, len: Int) {
+                    if (phase == "write") error("write failed")
+                    super.write(str, off, len)
                 }
                 override fun flush() {
                     if (phase == "flush") error("flush failed")
