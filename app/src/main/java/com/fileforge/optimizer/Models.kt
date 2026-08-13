@@ -1,5 +1,8 @@
 package com.fileforge.optimizer
 
+import java.util.Collections
+import java.util.LinkedHashMap
+
 enum class OptimizeMode { SAFE, AGGRESSIVE }
 
 data class OptimizerSettings(
@@ -21,21 +24,24 @@ enum class RunStatus { RUNNING, COMPLETED, COMPLETED_WITH_ERRORS, CANCELLED, FAI
 
 enum class SkipReason { UNSUPPORTED, NO_CHANGE, NO_GAIN, APK_GUARD, MEMORY_LIMIT, VERIFICATION_FAILED }
 
-data class ProgressSnapshot(
+class ProgressSnapshot(
     val phase: String,
     val currentRelativePath: String? = null,
     val filesDiscovered: Int = 0,
     val filesProcessed: Int = 0,
     val candidates: Int = 0,
     val optimized: Int = 0,
-    val skipsByReason: Map<SkipReason, Int> = emptyMap(),
+    skipsByReason: Map<SkipReason, Int> = emptyMap(),
     val errors: Int = 0,
     val bytesRead: Long = 0,
     val bytesWritten: Long = 0,
     val savedBytes: Long = 0,
     val potentialSavingsBytes: Long = 0,
     val totalWork: Int? = null
-)
+) {
+    val skipsByReason: Map<SkipReason, Int> =
+        Collections.unmodifiableMap(LinkedHashMap(skipsByReason))
+}
 
 class FileHeader(name: String, bytes: ByteArray) {
     val name: String = name
