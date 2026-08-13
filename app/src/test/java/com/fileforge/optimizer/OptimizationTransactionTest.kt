@@ -3,6 +3,7 @@ package com.fileforge.optimizer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import java.io.IOException
 import java.nio.file.Files
@@ -117,6 +118,23 @@ class OptimizationTransactionTest {
                 assertFalse(outcome is FileOutcome.Optimized)
                 assertTrue(gateway.events.none { it.startsWith("mkdir:") || it.startsWith("create-file:") || it.startsWith("write:") })
                 assertTrue(undo.entries.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun cancellationDuringBackupPropagatesBeforeOriginalMutationAndDuringOriginalCopyRollsBack() {
+        listOf("backup" to "write-bytes:root/FileForge_Backups_run-1/archive.zip:32768", "original" to "write-bytes:root/archive.zip:32768").forEach { (phase, event) ->
+            withCoordinator { gateway, coordinator, _ ->
+                var cancelled = false
+                gateway.afterEvent = { if (it == event) cancelled = true }
+                val token = CancellationToken { if (cancelled) throw OptimizationCancelledException("$phase cancelled") }
+
+                assertThrows(OptimizationCancelledException::class.java) {
+                    coordinator.process(gateway.node("archive.zip")!!, "archive.zip", realRun, token)
+                }
+                if (phase == "backup") assertFalse(gateway.events.any { it == "write:root/archive.zip" })
+                else assertEquals(original.toList(), gateway.contents("archive.zip").toList())
             }
         }
     }

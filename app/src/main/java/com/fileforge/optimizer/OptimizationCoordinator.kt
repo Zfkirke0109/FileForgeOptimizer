@@ -20,7 +20,7 @@ data class CommitContext(
     val completedAt: () -> String
 ) {
     init {
-        DocumentPathPolicy.requireSafeRelative(runId)
+        DocumentPathPolicy.requireSafeSegment(runId)
     }
 }
 
@@ -178,7 +178,7 @@ class OptimizationCoordinator(
             } else {
                 cancellation.throwIfCancelled()
                 commitContext?.let { context ->
-                    commitCandidate(node, relativePath, kind, oldBytes, candidate, context)
+                    commitCandidate(node, relativePath, kind, oldBytes, candidate, context, cancellation)
                 } ?: FileOutcome.Failed(relativePath, "Replacement is unavailable until the backup transaction is installed.")
             }
         }
@@ -190,7 +190,8 @@ class OptimizationCoordinator(
         kind: FileKind,
         oldBytes: Long,
         candidate: CandidateFile,
-        context: CommitContext
+        context: CommitContext,
+        cancellation: CancellationToken
     ): FileOutcome {
         var backup: DocumentNode? = null
         var originalIntegrity: StreamIntegrity? = null
@@ -201,18 +202,18 @@ class OptimizationCoordinator(
             val backupNode = createBackup(context.selectedRoot, backupPath)
             backup = backupNode
             val originalSnapshot = documentGateway.openRead(original).use { source ->
-                documentGateway.openWrite(backupNode).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination) }
+                documentGateway.openWrite(backupNode).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, cancellation) }
             }
             originalIntegrity = originalSnapshot
-            val verifiedBackup = documentGateway.openRead(backupNode).use(StreamIntegrityChecker::hash)
+            val verifiedBackup = documentGateway.openRead(backupNode).use { StreamIntegrityChecker.hash(it, cancellation) }
             check(verifiedBackup == originalSnapshot) { "Backup verification failed" }
             check(originalSnapshot.bytes == oldBytes) { "Original size changed during backup" }
 
             originalMutationStarted = true
             val writtenCandidate = candidate.openInputStream().use { source ->
-                documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination) }
+                documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, cancellation) }
             }
-            val verifiedOriginal = documentGateway.openRead(original).use(StreamIntegrityChecker::hash)
+            val verifiedOriginal = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, cancellation) }
             check(verifiedOriginal == writtenCandidate) { "Optimized document verification failed" }
             originalVerified = true
 
@@ -231,9 +232,19 @@ class OptimizationCoordinator(
                 )
             )
             FileOutcome.Optimized(relativePath, originalSnapshot.bytes, writtenCandidate.bytes, STREAMING_ZIP_TOOL, "${STREAMING_ZIP_TOOL}: candidate verified.")
+        } catch (cancelled: OptimizationCancelledException) {
+            val rollbackBackup = backup
+            val rollbackIntegrity = originalIntegrity
+            if (originalMutationStarted && !originalVerified && rollbackBackup != null && rollbackIntegrity != null) {
+                val rollback = restoreBackup(original, rollbackBackup, rollbackIntegrity)
+                if (rollback is RollbackResult.Failed) cancelled.addSuppressed(rollback.cause)
+            }
+            throw cancelled
         } catch (failure: Exception) {
-            val rollback = if (originalMutationStarted && !originalVerified && backup != null && originalIntegrity != null) {
-                restoreBackup(original, backup, originalIntegrity)
+            val rollbackBackup = backup
+            val rollbackIntegrity = originalIntegrity
+            val rollback = if (originalMutationStarted && !originalVerified && rollbackBackup != null && rollbackIntegrity != null) {
+                restoreBackup(original, rollbackBackup, rollbackIntegrity)
             } else {
                 RollbackResult.NotNeeded
             }
@@ -243,9 +254,9 @@ class OptimizationCoordinator(
 
     private fun restoreBackup(original: DocumentNode, backup: DocumentNode, expected: StreamIntegrity): RollbackResult = try {
         val restored = documentGateway.openRead(backup).use { source ->
-            documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination) }
+            documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, NeverCancelled) }
         }
-        val verified = documentGateway.openRead(original).use(StreamIntegrityChecker::hash)
+        val verified = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, NeverCancelled) }
         check(restored == expected && verified == expected) { "Rollback verification failed" }
         RollbackResult.Restored
     } catch (failure: Exception) {
@@ -253,6 +264,7 @@ class OptimizationCoordinator(
     }
 
     private fun backupPath(runId: String, relativePath: String): String {
+        DocumentPathPolicy.requireSafeSegment(runId)
         DocumentPathPolicy.requireSafeRelative(relativePath)
         return "$BACKUP_PREFIX$runId/$relativePath"
     }

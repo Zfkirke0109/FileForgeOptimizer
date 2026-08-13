@@ -10,40 +10,59 @@ internal data class StreamIntegrity(val bytes: Long, val sha256: String)
 internal object StreamIntegrityChecker {
     const val BUFFER_BYTES = 32 * 1024
 
-    fun copyAndHash(input: InputStream, output: OutputStream): StreamIntegrity {
+    fun copyAndHash(
+        input: InputStream,
+        output: OutputStream,
+        cancellation: CancellationToken = NeverCancelled
+    ): StreamIntegrity {
         val digest = MessageDigest.getInstance("SHA-256")
         val buffer = ByteArray(BUFFER_BYTES)
         var bytes = 0L
         while (true) {
+            cancellation.throwIfCancelled()
             val read = input.read(buffer)
             if (read < 0) break
             if (read == 0) continue
+            cancellation.throwIfCancelled()
             output.write(buffer, 0, read)
             digest.update(buffer, 0, read)
-            bytes += read
+            bytes = checkedAdd(bytes, read)
         }
         output.flush()
         return StreamIntegrity(bytes, digest.digest().toHex())
     }
 
-    fun hash(input: InputStream): StreamIntegrity {
+    fun hash(input: InputStream, cancellation: CancellationToken = NeverCancelled): StreamIntegrity {
         val digest = MessageDigest.getInstance("SHA-256")
         val buffer = ByteArray(BUFFER_BYTES)
         var bytes = 0L
         while (true) {
+            cancellation.throwIfCancelled()
             val read = input.read(buffer)
             if (read < 0) break
             if (read == 0) continue
+            cancellation.throwIfCancelled()
             digest.update(buffer, 0, read)
-            bytes += read
+            bytes = checkedAdd(bytes, read)
         }
         return StreamIntegrity(bytes, digest.digest().toHex())
+    }
+
+    internal fun checkedAdd(bytes: Long, read: Int): Long {
+        if (read < 0 || bytes > Long.MAX_VALUE - read) throw ArithmeticException("Stream byte count overflow")
+        return bytes + read
     }
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 }
 
 internal object DocumentPathPolicy {
+    fun requireSafeSegment(value: String): String {
+        require(value.isNotBlank() && value != "." && value != ".." &&
+            value.none { it == '/' || it == '\\' || it == ':' }) { "Unsafe path segment" }
+        return value
+    }
+
     fun requireSafeRelative(path: String): List<String> {
         require(path.isNotBlank() && !path.startsWith('/') && !path.startsWith('\\')) { "Path must be relative" }
         val segments = path.split('/')

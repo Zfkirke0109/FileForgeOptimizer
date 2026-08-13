@@ -125,8 +125,108 @@ class RestoreCoordinatorTest {
         assertEquals(1, receipt.names.size)
     }
 
+    @Test
+    fun restoreRejectsForeignOrArbitraryInRootBackupForV2AndLegacyBeforeAnyWrite() {
+        listOf(
+            entry("docs/a.zip", "FileForge_Backups_other-run/docs/a.zip"),
+            entry("docs/a.zip", "unrelated/same-sized.zip"),
+            entry("docs/a.zip", "FileForge_Backups_other-run/docs/a.zip").copy(
+                originalSha256 = null, optimizedSha256 = null, verificationLevel = UndoVerificationLevel.LEGACY_SIZE_ONLY
+            )
+        ).forEach { forged ->
+            withRestore(entries = listOf(forged)) { gateway, coordinator, receipt, run ->
+                gateway.put("FileForge_Backups_other-run/docs/a.zip", backupA)
+                gateway.put("unrelated/same-sized.zip", backupA)
+
+                val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+                assertEquals(RestoreEntryStatus.PATH_REJECTED, report.entries.single().status)
+                assertFalse(gateway.events.any { it == "write:root/docs/a.zip" })
+                assertTrue(receipt.names.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun restoreRejectsDirectoryOriginalOrBackupBeforeReadWriteOrReceipt() {
+        listOf(
+            entry("docs/original-dir") to "docs/original-dir",
+            entry("docs/backup-dir") to "FileForge_Backups_run-1/docs/backup-dir"
+        ).forEach { (directoryEntry, directoryPath) ->
+            withRestore(entries = listOf(directoryEntry)) { gateway, coordinator, receipt, run ->
+                gateway.put(directoryEntry.relativePath, backupA)
+                gateway.putDirectory(directoryPath)
+
+                val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+                assertEquals(RestoreEntryStatus.DIRECTORY_REJECTED, report.entries.single().status)
+                assertFalse(gateway.events.any { it == "write:root/${directoryEntry.relativePath}" })
+                assertTrue(receipt.names.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun receiptUsesAnExclusiveUniqueNameForRepeatedSameTickRestore() = withRestore { _, coordinator, receipt, run ->
+        val first = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+        val second = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+        assertEquals(RestoreEntryStatus.RESTORED, first.entries.single().status)
+        assertEquals(RestoreEntryStatus.RESTORED, second.entries.single().status)
+        assertEquals("FileForge_Restore_run-1_20260813T200000Z.jsonl", receipt.names.first())
+        assertEquals("FileForge_Restore_run-1_20260813T200000Z-1.jsonl", receipt.names.last())
+    }
+
+    @Test
+    fun unsafeRunIdOrTimestampNeverOpensReceiptOrWritesOriginal() {
+        listOf("../run" to "20260813T200000Z", "run-1" to "../time").forEach { (runId, timestamp) ->
+            withRestore(runId = runId, timestamp = timestamp) { gateway, coordinator, receipt, run ->
+                val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+                assertEquals(RestoreEntryStatus.PATH_REJECTED, report.entries.single().status)
+                assertFalse(gateway.events.any { it == "write:root/docs/a.zip" })
+                assertTrue(receipt.names.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun receiptOpenFailurePreventsWriteAndReceiptWriteFlushOrCloseFailureRetainsReport() {
+        listOf("open", "write", "flush", "close").forEach { phase ->
+            val receipt = FaultingReceiptWriter(phase)
+            withRestore(receiptWriter = receipt) { gateway, coordinator, _, run ->
+                val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+                if (phase == "open") assertFalse(gateway.events.any { it == "write:root/docs/a.zip" })
+                else assertEquals(backupA.toList(), gateway.contents("docs/a.zip").toList())
+                assertTrue(report.receiptError?.contains(phase) == true)
+            }
+        }
+    }
+
+    @Test
+    fun cancellationDuringOriginalRestoreCopyRepairsCurrentEntryThenStops() = withRestore(entries = listOf(entry("docs/a.zip"), entry("docs/b.zip"))) {
+            gateway, coordinator, receipt, run ->
+        gateway.put("docs/b.zip", byteArrayOf(7))
+        gateway.put("FileForge_Backups_run-1/docs/b.zip", backupB)
+        var cancelled = false
+        gateway.afterEvent = { if (it.startsWith("write-bytes:root/docs/a.zip")) cancelled = true }
+        val token = CancellationToken { if (cancelled) throw OptimizationCancelledException() }
+
+        val report = coordinator.restore(run, RestoreSelection.All, token)
+
+        assertEquals(RunStatus.CANCELLED, report.status)
+        assertEquals(listOf("docs/a.zip"), report.entries.map { it.relativePath })
+        assertEquals(backupA.toList(), gateway.contents("docs/a.zip").toList())
+        assertFalse(gateway.events.any { it == "write:root/docs/b.zip" })
+        assertEquals(1, receipt.names.size)
+    }
+
     private fun withRestore(
         entries: List<UndoEntry> = listOf(entry("docs/a.zip")),
+        receiptWriter: RestoreReceiptWriter = RecordingReceiptWriter(),
+        runId: String = "run-1",
+        timestamp: String = "20260813T200000Z",
         block: (RecordingDocumentGateway, RestoreCoordinator, RecordingReceiptWriter, UndoRun) -> Unit
     ) {
         val gateway = RecordingDocumentGateway().apply {
@@ -135,10 +235,10 @@ class RestoreCoordinatorTest {
             put("FileForge_Undo_v2_run-1.jsonl", "untouched".toByteArray())
             events.clear()
         }
-        val receipt = RecordingReceiptWriter()
-        val run = UndoRun(UndoHeader("run-1", "2026-08-13T19:00:00Z"), entries, RunStatus.COMPLETED)
-        val coordinator = RestoreCoordinator(gateway, gateway.root, receipt) { "20260813T200000Z" }
-        block(gateway, coordinator, receipt, run)
+        val recording = receiptWriter as? RecordingReceiptWriter ?: RecordingReceiptWriter()
+        val run = UndoRun(UndoHeader(runId, "2026-08-13T19:00:00Z"), entries, RunStatus.COMPLETED)
+        val coordinator = RestoreCoordinator(gateway, gateway.root, receiptWriter) { timestamp }
+        block(gateway, coordinator, recording, run)
     }
 
     private fun entry(
@@ -160,5 +260,25 @@ class RestoreCoordinatorTest {
     private companion object {
         val backupA = byteArrayOf(0x50, 0x4b, 1, 2, 3, 4)
         val backupB = byteArrayOf(0x50, 0x4b, 5, 6, 7, 8)
+    }
+
+    private class FaultingReceiptWriter(private val phase: String) : RestoreReceiptWriter {
+        override fun openExclusive(name: String): RestoreReceipt {
+            if (phase == "open") error("open failed")
+            return RestoreReceipt(name, object : java.io.StringWriter() {
+                override fun write(cbuf: CharArray, off: Int, len: Int) {
+                    if (phase == "write") error("write failed")
+                    super.write(cbuf, off, len)
+                }
+                override fun flush() {
+                    if (phase == "flush") error("flush failed")
+                    super.flush()
+                }
+                override fun close() {
+                    if (phase == "close") error("close failed")
+                    super.close()
+                }
+            })
+        }
     }
 }

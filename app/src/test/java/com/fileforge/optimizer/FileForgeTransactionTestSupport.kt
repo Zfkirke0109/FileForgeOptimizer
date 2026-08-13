@@ -34,6 +34,23 @@ internal class RecordingDocumentGateway : DocumentGateway {
         return file
     }
 
+    fun putDirectory(relativePath: String): DocumentNode {
+        var parent = root
+        relativePath.split('/').forEach { part ->
+            val existing = resolve(parent, part)
+            parent = when {
+                existing == null -> createDirectory(parent, part)
+                existing.isDirectory -> existing
+                else -> DocumentNode(existing.id, existing.name, isDirectory = true, length = 0).also {
+                    nodes[it.id] = it
+                    children.getOrPut(it.id) { linkedMapOf() }
+                    bytes.remove(it.id)
+                }
+            }
+        }
+        return parent
+    }
+
     fun contents(relativePath: String): ByteArray {
         val node = node(relativePath) ?: error("No node at $relativePath")
         return bytes.getValue(node.id).copyOf()
@@ -149,13 +166,14 @@ internal class RecordingUndoEntrySink(private val events: MutableList<String>) :
 internal class RecordingReceiptWriter : RestoreReceiptWriter {
     val names = mutableListOf<String>()
     val contents = mutableListOf<String>()
-    override fun open(name: String): Writer {
+    override fun openExclusive(name: String): RestoreReceipt {
+        if (name in names) throw ReceiptAlreadyExistsException("Receipt already exists: $name")
         names += name
-        return object : StringWriter() {
+        return RestoreReceipt(name, object : StringWriter() {
             override fun close() {
                 contents += toString()
             }
-        }
+        })
     }
 }
 

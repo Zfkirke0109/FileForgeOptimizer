@@ -1,11 +1,11 @@
 package com.fileforge.optimizer
 
+import java.io.IOException
 import java.io.Writer
 
 sealed class RestoreSelection {
     data object All : RestoreSelection()
     data class Entries(val relativePaths: Set<String>) : RestoreSelection()
-
     fun includes(relativePath: String): Boolean = when (this) {
         All -> true
         is Entries -> relativePath in relativePaths
@@ -13,14 +13,8 @@ sealed class RestoreSelection {
 }
 
 enum class RestoreEntryStatus {
-    RESTORED,
-    PATH_REJECTED,
-    BACKUP_MISSING,
-    BACKUP_SIZE_MISMATCH,
-    BACKUP_HASH_MISMATCH,
-    ORIGINAL_MISSING,
-    WRITE_FAILED,
-    RESTORED_VERIFICATION_FAILED
+    RESTORED, PATH_REJECTED, BACKUP_MISSING, BACKUP_SIZE_MISMATCH, BACKUP_HASH_MISMATCH,
+    ORIGINAL_MISSING, DIRECTORY_REJECTED, WRITE_FAILED, RESTORED_VERIFICATION_FAILED, RECEIPT_FAILED
 }
 
 data class RestoreEntryResult(
@@ -34,11 +28,16 @@ data class RestoreReport(
     val run: UndoRun,
     val entries: List<RestoreEntryResult>,
     val status: RunStatus,
-    val restoredCount: Int
+    val restoredCount: Int,
+    val receiptError: String? = null
 )
 
-fun interface RestoreReceiptWriter {
-    fun open(name: String): Writer
+data class RestoreReceipt(val name: String, val writer: Writer)
+class ReceiptAlreadyExistsException(message: String) : IOException(message)
+
+/** Storage must create the named receipt exclusively; collisions are retried with a suffix. */
+interface RestoreReceiptWriter {
+    fun openExclusive(name: String): RestoreReceipt
 }
 
 class RestoreCoordinator(
@@ -49,72 +48,124 @@ class RestoreCoordinator(
 ) {
     fun restore(run: UndoRun, selection: RestoreSelection, cancellation: CancellationToken): RestoreReport {
         val results = mutableListOf<RestoreEntryResult>()
+        val selected = run.entries.filter { selection.includes(it.relativePath) }
+        val safeRunId = try { DocumentPathPolicy.requireSafeSegment(run.header.runId) } catch (_: IllegalArgumentException) {
+            return rejectedRunReport(run, selected)
+        }
+        val timestamp = try { DocumentPathPolicy.requireSafeSegment(clock()) } catch (_: IllegalArgumentException) {
+            return rejectedRunReport(run, selected)
+        }
+        var receipt: RestoreReceipt? = null
+        var receiptError: String? = null
         var status = RunStatus.COMPLETED
-        var receipt: Writer? = null
+        var stoppedForAudit = false
         try {
-            for (entry in run.entries) {
-                if (!selection.includes(entry.relativePath)) continue
+            for (entry in selected) {
+                if (stoppedForAudit) break
                 try {
                     cancellation.throwIfCancelled()
-                } catch (_: OptimizationCancelledException) {
+                    val attempt = restoreEntry(entry, safeRunId, cancellation) {
+                        receipt ?: openReceipt(safeRunId, timestamp).also { receipt = it }
+                    }
+                    results += attempt.result
+                    if (receipt != null) {
+                        try {
+                            writeReceipt(receipt!!.writer, attempt.result)
+                        } catch (failure: Exception) {
+                            receiptError = failure.message ?: failure.javaClass.name
+                            stoppedForAudit = true
+                        }
+                    }
+                    if (attempt.cancelled) {
+                        status = RunStatus.CANCELLED
+                        break
+                    }
+                } catch (cancelled: OptimizationCancelledException) {
                     status = RunStatus.CANCELLED
                     break
-                }
-                val result = restoreEntry(entry) {
-                    if (receipt == null) receipt = receiptWriter.open(receiptName(run.header.runId))
-                    receipt!!
-                }
-                results += result
-                if (receipt != null && (result.status == RestoreEntryStatus.RESTORED || result.status == RestoreEntryStatus.WRITE_FAILED || result.status == RestoreEntryStatus.RESTORED_VERIFICATION_FAILED)) {
-                    writeReceipt(receipt!!, result)
+                } catch (failure: ReceiptOpenException) {
+                    results += result(entry, RestoreEntryStatus.RECEIPT_FAILED, failure.message ?: "Receipt could not be opened")
+                    receiptError = failure.message ?: failure.javaClass.name
+                    stoppedForAudit = true
                 }
             }
         } finally {
-            receipt?.close()
+            receipt?.let {
+                try { it.writer.close() } catch (failure: Exception) {
+                    receiptError = receiptError ?: (failure.message ?: failure.javaClass.name)
+                }
+            }
         }
-        if (status == RunStatus.COMPLETED && results.any { it.status != RestoreEntryStatus.RESTORED }) status = RunStatus.COMPLETED_WITH_ERRORS
-        return RestoreReport(run, results, status, results.count { it.status == RestoreEntryStatus.RESTORED })
+        if (status == RunStatus.COMPLETED && (receiptError != null || results.any { it.status != RestoreEntryStatus.RESTORED })) {
+            status = RunStatus.COMPLETED_WITH_ERRORS
+        }
+        return RestoreReport(run, results, status, results.count { it.status == RestoreEntryStatus.RESTORED }, receiptError)
     }
 
-    private fun restoreEntry(entry: UndoEntry, receiptForAttempt: () -> Writer): RestoreEntryResult {
+    private fun rejectedRunReport(run: UndoRun, selected: List<UndoEntry>) = RestoreReport(
+        run, selected.map { result(it, RestoreEntryStatus.PATH_REJECTED, "Unsafe run ID or receipt timestamp") },
+        RunStatus.COMPLETED_WITH_ERRORS, 0
+    )
+
+    private fun restoreEntry(
+        entry: UndoEntry,
+        runId: String,
+        cancellation: CancellationToken,
+        receiptForAttempt: () -> RestoreReceipt
+    ): RestoreAttempt {
+        val expectedBackupPath = "FileForge_Backups_$runId/${entry.relativePath}"
         val original: DocumentNode
         val backup: DocumentNode
         try {
             DocumentPathPolicy.requireSafeRelative(entry.relativePath)
             DocumentPathPolicy.requireSafeRelative(entry.backupPath)
+            if (entry.backupPath != expectedBackupPath) return RestoreAttempt(result(entry, RestoreEntryStatus.PATH_REJECTED, "Backup is not bound to this run and entry"))
             original = DocumentPathPolicy.resolve(selectedRoot, entry.relativePath, documentGateway)
-                ?: return result(entry, RestoreEntryStatus.ORIGINAL_MISSING, "Original is missing")
-            backup = DocumentPathPolicy.resolve(selectedRoot, entry.backupPath, documentGateway)
-                ?: return result(entry, RestoreEntryStatus.BACKUP_MISSING, "Backup is missing")
+                ?: return RestoreAttempt(result(entry, RestoreEntryStatus.ORIGINAL_MISSING, "Original is missing"))
+            if (original.isDirectory) return RestoreAttempt(result(entry, RestoreEntryStatus.DIRECTORY_REJECTED, "Restore documents must be files"))
+            backup = DocumentPathPolicy.resolve(selectedRoot, expectedBackupPath, documentGateway)
+                ?: return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_MISSING, "Backup is missing"))
         } catch (_: IllegalArgumentException) {
-            return result(entry, RestoreEntryStatus.PATH_REJECTED, "Restore paths must stay within the selected root")
+            return RestoreAttempt(result(entry, RestoreEntryStatus.PATH_REJECTED, "Restore paths must stay within the selected root"))
         }
+        if (backup.isDirectory) return RestoreAttempt(result(entry, RestoreEntryStatus.DIRECTORY_REJECTED, "Restore documents must be files"))
 
         val backupIntegrity = try {
-            documentGateway.openRead(backup).use(StreamIntegrityChecker::hash)
+            documentGateway.openRead(backup).use { StreamIntegrityChecker.hash(it, cancellation) }
+        } catch (cancelled: OptimizationCancelledException) {
+            throw cancelled
         } catch (failure: Exception) {
-            return result(entry, RestoreEntryStatus.BACKUP_MISSING, failure.message ?: "Backup cannot be read")
+            return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_MISSING, failure.message ?: "Backup cannot be read"))
         }
-        if (backupIntegrity.bytes != entry.originalBytes) {
-            return result(entry, RestoreEntryStatus.BACKUP_SIZE_MISMATCH, "Backup size does not match undo record")
-        }
+        if (backupIntegrity.bytes != entry.originalBytes) return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_SIZE_MISMATCH, "Backup size does not match undo record"))
         if (entry.verificationLevel == UndoVerificationLevel.SHA_256 && backupIntegrity.sha256 != entry.originalSha256) {
-            return result(entry, RestoreEntryStatus.BACKUP_HASH_MISMATCH, "Backup SHA-256 does not match undo record")
+            return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_HASH_MISMATCH, "Backup SHA-256 does not match undo record"))
         }
-
-        receiptForAttempt()
-        val restored = try {
-            documentGateway.openRead(backup).use { source ->
-                documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination) }
+        try { receiptForAttempt() } catch (failure: Exception) { throw ReceiptOpenException(failure) }
+        return try {
+            val restored = documentGateway.openRead(backup).use { source ->
+                documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, cancellation) }
             }
+            val verified = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, cancellation) }
+            RestoreAttempt(verifiedResult(entry, restored, verified))
+        } catch (_: OptimizationCancelledException) {
+            RestoreAttempt(repairFromBackup(original, backup, entry), cancelled = true)
         } catch (failure: Exception) {
-            return result(entry, RestoreEntryStatus.WRITE_FAILED, failure.message ?: "Restore write failed")
+            RestoreAttempt(result(entry, RestoreEntryStatus.WRITE_FAILED, failure.message ?: "Restore write failed"))
         }
-        val verified = try {
-            documentGateway.openRead(original).use(StreamIntegrityChecker::hash)
-        } catch (failure: Exception) {
-            return result(entry, RestoreEntryStatus.RESTORED_VERIFICATION_FAILED, failure.message ?: "Restore verification failed")
+    }
+
+    private fun repairFromBackup(original: DocumentNode, backup: DocumentNode, entry: UndoEntry): RestoreEntryResult = try {
+        val restored = documentGateway.openRead(backup).use { source ->
+            documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, NeverCancelled) }
         }
+        val verified = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, NeverCancelled) }
+        verifiedResult(entry, restored, verified)
+    } catch (failure: Exception) {
+        result(entry, RestoreEntryStatus.WRITE_FAILED, failure.message ?: "Cancellation repair failed")
+    }
+
+    private fun verifiedResult(entry: UndoEntry, restored: StreamIntegrity, verified: StreamIntegrity): RestoreEntryResult {
         val valid = restored.bytes == entry.originalBytes && verified.bytes == entry.originalBytes &&
             (entry.verificationLevel == UndoVerificationLevel.LEGACY_SIZE_ONLY ||
                 (restored.sha256 == entry.originalSha256 && verified.sha256 == entry.originalSha256))
@@ -122,10 +173,17 @@ class RestoreCoordinator(
             result(entry, RestoreEntryStatus.RESTORED_VERIFICATION_FAILED, "Restored document does not match undo record")
     }
 
+    private fun openReceipt(runId: String, timestamp: String): RestoreReceipt {
+        val base = "FileForge_Restore_${runId}_${timestamp}"
+        repeat(MAX_RECEIPT_COLLISIONS) { attempt ->
+            val suffix = if (attempt == 0) "" else "-$attempt"
+            try { return receiptWriter.openExclusive("$base$suffix.jsonl") } catch (_: ReceiptAlreadyExistsException) { }
+        }
+        throw IOException("Could not create a unique restore receipt")
+    }
+
     private fun result(entry: UndoEntry, status: RestoreEntryStatus, message: String = "") =
         RestoreEntryResult(entry.relativePath, status, entry.verificationLevel, message)
-
-    private fun receiptName(runId: String): String = "FileForge_Restore_${runId}_${clock()}.jsonl"
 
     private fun writeReceipt(writer: Writer, result: RestoreEntryResult) {
         writer.write("{\"relativePath\":\"${escapeJson(result.relativePath)}\",\"status\":\"${result.status.name}\",\"verification\":\"${result.verification.name}\",\"message\":\"${escapeJson(result.message)}\"}\n")
@@ -133,17 +191,29 @@ class RestoreCoordinator(
     }
 
     private fun escapeJson(value: String): String = buildString(value.length) {
-        value.forEach { character ->
-            when (character) {
-                '"' -> append("\\\"")
-                '\\' -> append("\\\\")
-                '\b' -> append("\\b")
-                '\u000C' -> append("\\f")
-                '\n' -> append("\\n")
-                '\r' -> append("\\r")
-                '\t' -> append("\\t")
-                else -> if (character.code < 0x20) append("\\u%04x".format(character.code)) else append(character)
+        requireWellFormedUtf16(value)
+        value.forEach { character -> when (character) {
+            '"' -> append("\\\""); '\\' -> append("\\\\"); '\b' -> append("\\b"); '\u000C' -> append("\\f")
+            '\n' -> append("\\n"); '\r' -> append("\\r"); '\t' -> append("\\t")
+            else -> if (character.code < 0x20) append("\\u%04x".format(character.code)) else append(character)
+        } }
+    }
+
+    private fun requireWellFormedUtf16(value: String) {
+        var index = 0
+        while (index < value.length) {
+            val c = value[index]
+            if (c.isHighSurrogate()) {
+                require(index + 1 < value.length && value[index + 1].isLowSurrogate()) { "Unpaired surrogate in receipt" }
+                index += 2
+            } else {
+                require(!c.isLowSurrogate()) { "Unpaired surrogate in receipt" }
+                index++
             }
         }
     }
+
+    private data class RestoreAttempt(val result: RestoreEntryResult, val cancelled: Boolean = false)
+    private class ReceiptOpenException(cause: Throwable) : IOException(cause.message, cause)
+    private companion object { const val MAX_RECEIPT_COLLISIONS = 100 }
 }
