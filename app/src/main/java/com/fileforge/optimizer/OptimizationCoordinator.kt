@@ -2,6 +2,31 @@ package com.fileforge.optimizer
 
 import java.io.InputStream
 
+internal interface ZipCandidateProcessor {
+    fun optimize(
+        input: InputStream,
+        output: java.io.OutputStream,
+        mode: OptimizeMode,
+        cancellation: CancellationToken
+    ): ZipOptimizationSummary
+
+    fun verify(input: InputStream, cancellation: CancellationToken): ZipVerification
+}
+
+internal object StrictStreamingZipCandidateProcessor : ZipCandidateProcessor {
+    private val optimizer = StreamingZipOptimizer()
+
+    override fun optimize(
+        input: InputStream,
+        output: java.io.OutputStream,
+        mode: OptimizeMode,
+        cancellation: CancellationToken
+    ): ZipOptimizationSummary = optimizer.optimize(input, output, mode, cancellation) {}
+
+    override fun verify(input: InputStream, cancellation: CancellationToken): ZipVerification =
+        optimizer.verify(input, cancellation)
+}
+
 sealed class FileOutcome {
     abstract val relativePath: String
 
@@ -40,10 +65,18 @@ sealed class FileOutcome {
 
 class OptimizationCoordinator(
     private val documentGateway: DocumentGateway,
-    private val candidateStore: CandidateStore,
-    private val runId: String,
-    private val streamingZipOptimizer: StreamingZipOptimizer = StreamingZipOptimizer()
+    private val candidateStore: CandidateStore
 ) {
+    private var zipCandidateProcessor: ZipCandidateProcessor = StrictStreamingZipCandidateProcessor
+
+    internal constructor(
+        documentGateway: DocumentGateway,
+        candidateStore: CandidateStore,
+        zipCandidateProcessor: ZipCandidateProcessor
+    ) : this(documentGateway, candidateStore) {
+        this.zipCandidateProcessor = zipCandidateProcessor
+    }
+
     fun process(
         node: DocumentNode,
         relativePath: String,
@@ -65,8 +98,10 @@ class OptimizationCoordinator(
                     "No bounded-memory optimizer is available for $kind."
                 )
             }
-        } catch (t: Throwable) {
-            FileOutcome.Failed(relativePath, t.message ?: t.javaClass.name, t)
+        } catch (cancelled: OptimizationCancelledException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            FileOutcome.Failed(relativePath, failure.message ?: failure.javaClass.name, failure)
         }
     }
 
@@ -77,23 +112,22 @@ class OptimizationCoordinator(
         cancellation: CancellationToken
     ): FileOutcome {
         val oldBytes = documentGateway.length(node)
-        candidateStore.create(runId, ZIP_CANDIDATE_SUFFIX).use { candidate ->
+        candidateStore.create(ZIP_CANDIDATE_SUFFIX).use { candidate ->
             documentGateway.openRead(node).use { source ->
                 candidate.openOutputStream().use { output ->
-                    streamingZipOptimizer.optimize(source, output, runIntent.mode, cancellation) {}
+                    zipCandidateProcessor.optimize(source, output, runIntent.mode, cancellation)
                 }
             }
 
+            cancellation.throwIfCancelled()
+            candidate.openInputStream().use { optimized ->
+                zipCandidateProcessor.verify(optimized, cancellation)
+            }
             cancellation.throwIfCancelled()
             val newBytes = candidate.length
             if (newBytes >= oldBytes) {
                 return FileOutcome.Skipped(relativePath, SkipReason.NO_GAIN)
             }
-
-            candidate.openInputStream().use { optimized ->
-                streamingZipOptimizer.verify(optimized, cancellation)
-            }
-            cancellation.throwIfCancelled()
 
             val note = "${STREAMING_ZIP_TOOL}: candidate verified."
             return if (runIntent.dryRun) {

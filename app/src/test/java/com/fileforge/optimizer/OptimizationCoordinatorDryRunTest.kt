@@ -1,9 +1,13 @@
 package com.fileforge.optimizer
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
+import java.io.IOException
+import java.io.InputStream
 import java.io.OutputStream
 import java.nio.file.Files
 import java.util.zip.Deflater
@@ -70,13 +74,128 @@ class OptimizationCoordinatorDryRunTest {
         }
     }
 
+    @Test
+    fun dryRunVerifiesNonSmallerCandidateBeforeReturningNoGain() {
+        withCandidateDirectory { candidateDirectory ->
+            val gateway = RecordingDocumentGateway(compressibleZipFixture)
+            val processor = object : ZipCandidateProcessor {
+                var verifyCalls = 0
+
+                override fun optimize(
+                    input: InputStream,
+                    output: OutputStream,
+                    mode: OptimizeMode,
+                    cancellation: CancellationToken
+                ): ZipOptimizationSummary {
+                    output.write(ByteArray(compressibleZipFixture.size + 1))
+                    return ZipOptimizationSummary(1, 0, compressibleZipFixture.size + 1L, "invalid")
+                }
+
+                override fun verify(input: InputStream, cancellation: CancellationToken): ZipVerification {
+                    verifyCalls++
+                    throw IOException("invalid candidate")
+                }
+            }
+
+            val outcome = coordinator(gateway, candidateDirectory, processor).process(
+                gateway.rootFile,
+                "archive.zip",
+                dryRunIntent,
+                NeverCancelled
+            )
+
+            assertEquals(1, processor.verifyCalls)
+            assertTrue(outcome is FileOutcome.Failed)
+            assertFalse(outcome is FileOutcome.Skipped && outcome.reason == SkipReason.NO_GAIN)
+            assertEquals(emptyList<String>(), gateway.writeOperations)
+            assertDirectoryEmpty(candidateDirectory)
+        }
+    }
+
+    @Test
+    fun cancellationBeforeCandidateCreationPropagatesWithoutCreatingCandidate() {
+        withCandidateDirectory { candidateDirectory ->
+            val gateway = RecordingDocumentGateway(compressibleZipFixture)
+
+            assertThrows(OptimizationCancelledException::class.java) {
+                coordinator(gateway, candidateDirectory).process(
+                    gateway.rootFile,
+                    "archive.zip",
+                    dryRunIntent,
+                    CancellationToken { throw OptimizationCancelledException() }
+                )
+            }
+
+            assertEquals(emptyList<String>(), gateway.writeOperations)
+            assertDirectoryEmpty(candidateDirectory)
+        }
+    }
+
+    @Test
+    fun cancellationDuringOptimizationPropagatesAndDeletesCandidate() {
+        withCandidateDirectory { candidateDirectory ->
+            val gateway = RecordingDocumentGateway(compressibleZipFixture)
+            val processor = object : ZipCandidateProcessor {
+                override fun optimize(
+                    input: InputStream,
+                    output: OutputStream,
+                    mode: OptimizeMode,
+                    cancellation: CancellationToken
+                ): ZipOptimizationSummary = throw OptimizationCancelledException()
+
+                override fun verify(input: InputStream, cancellation: CancellationToken): ZipVerification =
+                    error("verify must not run")
+            }
+
+            assertThrows(OptimizationCancelledException::class.java) {
+                coordinator(gateway, candidateDirectory, processor).process(
+                    gateway.rootFile, "archive.zip", dryRunIntent, NeverCancelled
+                )
+            }
+
+            assertEquals(emptyList<String>(), gateway.writeOperations)
+            assertDirectoryEmpty(candidateDirectory)
+        }
+    }
+
+    @Test
+    fun cancellationDuringVerificationPropagatesAndDeletesCandidate() {
+        withCandidateDirectory { candidateDirectory ->
+            val gateway = RecordingDocumentGateway(compressibleZipFixture)
+            val processor = object : ZipCandidateProcessor {
+                override fun optimize(
+                    input: InputStream,
+                    output: OutputStream,
+                    mode: OptimizeMode,
+                    cancellation: CancellationToken
+                ): ZipOptimizationSummary {
+                    output.write(byteArrayOf(0x50, 0x4b, 0x03, 0x04))
+                    return ZipOptimizationSummary(1, 0, 4, "candidate")
+                }
+
+                override fun verify(input: InputStream, cancellation: CancellationToken): ZipVerification =
+                    throw OptimizationCancelledException()
+            }
+
+            assertThrows(OptimizationCancelledException::class.java) {
+                coordinator(gateway, candidateDirectory, processor).process(
+                    gateway.rootFile, "archive.zip", dryRunIntent, NeverCancelled
+                )
+            }
+
+            assertEquals(emptyList<String>(), gateway.writeOperations)
+            assertDirectoryEmpty(candidateDirectory)
+        }
+    }
+
     private fun coordinator(
         gateway: RecordingDocumentGateway,
-        candidateDirectory: java.io.File
+        candidateDirectory: java.io.File,
+        processor: ZipCandidateProcessor = StrictStreamingZipCandidateProcessor
     ): OptimizationCoordinator = OptimizationCoordinator(
-        documentGateway = gateway,
-        candidateStore = CandidateStore(candidateDirectory),
-        runId = "dry-run-test"
+        gateway,
+        CandidateStore(candidateDirectory, "dry-run-test"),
+        processor
     )
 
     private fun withCandidateDirectory(block: (java.io.File) -> Unit) {
