@@ -46,7 +46,7 @@ fun interface RestoreReceiptWriter {
     fun open(name: String): Writer
 }
 
-/** Optional stronger contract for stores that can atomically create a new receipt. */
+/** A legacy writer is source-compatible but cannot authorize mutations without exclusive creation. */
 interface ExclusiveRestoreReceiptWriter : RestoreReceiptWriter {
     fun openExclusive(name: String): RestoreReceipt
     override fun open(name: String): Writer = openExclusive(name).writer
@@ -58,7 +58,6 @@ class RestoreCoordinator(
     private val receiptWriter: RestoreReceiptWriter,
     private val clock: () -> String
 ) {
-    private var fallbackReceiptCounter = 0L
     fun restore(run: UndoRun, selection: RestoreSelection, cancellation: CancellationToken): RestoreReport {
         val results = mutableListOf<RestoreEntryResult>()
         val selected = run.entries.filter { selection.includes(it.relativePath) }
@@ -195,14 +194,13 @@ class RestoreCoordinator(
     }
 
     private fun openReceipt(runId: String, timestamp: String): RestoreReceipt {
+        val exclusive = receiptWriter as? ExclusiveRestoreReceiptWriter
+            ?: throw IOException("Restore receipts require exclusive creation")
         val base = "FileForge_Restore_${runId}_${timestamp}"
         repeat(MAX_RECEIPT_COLLISIONS) { attempt ->
             val suffix = if (attempt == 0) "" else "-$attempt"
             try {
-                val exclusive = receiptWriter as? ExclusiveRestoreReceiptWriter
-                if (exclusive != null) return exclusive.openExclusive("$base$suffix.jsonl")
-                val counter = ++fallbackReceiptCounter
-                return RestoreReceipt("$base-$counter.jsonl", receiptWriter.open("$base-$counter.jsonl"))
+                return exclusive.openExclusive("$base$suffix.jsonl")
             } catch (_: ReceiptAlreadyExistsException) { }
         }
         throw IOException("Could not create a unique restore receipt")

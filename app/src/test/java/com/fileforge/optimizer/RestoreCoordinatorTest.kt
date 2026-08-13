@@ -246,10 +246,31 @@ class RestoreCoordinatorTest {
     }
 
     @Test
-    fun legacyReceiptWriterRemainsSamCompatible() {
-        val legacy: RestoreReceiptWriter = RestoreReceiptWriter { java.io.StringWriter() }
-        withRestore(receiptWriter = legacy) { _, coordinator, _, run ->
-            assertEquals(RestoreEntryStatus.RESTORED, coordinator.restore(run, RestoreSelection.All, NeverCancelled).entries.single().status)
+    fun legacyReceiptWriterRemainsSamCompatibleButCannotAuthorizeMutation() {
+        var opened = false
+        val legacy: RestoreReceiptWriter = RestoreReceiptWriter { opened = true; java.io.StringWriter() }
+        withRestore(receiptWriter = legacy) { gateway, coordinator, _, run ->
+            val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+            assertEquals(RestoreEntryStatus.RECEIPT_FAILED, report.entries.single().status)
+            assertFalse(opened)
+            assertFalse(gateway.events.any { it == "write:root/docs/a.zip" })
+        }
+    }
+
+    @Test
+    fun freshCoordinatorNeverOverwritesExistingExclusiveReceiptAndRetriesSuffix() {
+        val receipts = RecordingReceiptWriter()
+        withRestore(receiptWriter = receipts) { gateway, _, _, run ->
+            val first = RestoreCoordinator(gateway, gateway.root, receipts) { "20260813T200000Z" }
+            val second = RestoreCoordinator(gateway, gateway.root, receipts) { "20260813T200000Z" }
+
+            assertEquals(RestoreEntryStatus.RESTORED, first.restore(run, RestoreSelection.All, NeverCancelled).entries.single().status)
+            assertEquals(RestoreEntryStatus.RESTORED, second.restore(run, RestoreSelection.All, NeverCancelled).entries.single().status)
+            assertEquals(
+                listOf("FileForge_Restore_run-1_20260813T200000Z.jsonl", "FileForge_Restore_run-1_20260813T200000Z-1.jsonl"),
+                receipts.names
+            )
         }
     }
 
