@@ -129,7 +129,9 @@ The first JSON line is a header containing:
 - run ID and timestamps;
 - selected mode and feature settings;
 - app version and build variant;
-- terminal run status when known.
+- initial run status `RUNNING`.
+
+When the run ends, the repository appends and flushes a terminal summary JSON line containing the final status and aggregate report. It never rewrites the header or already committed file records, which keeps the log recoverable on SAF providers that do not support reliable random-access updates. A log without a terminal summary is treated as an interrupted run whose completed file records are still restorable.
 
 Each subsequent line is an independent record containing:
 
