@@ -27,7 +27,7 @@ class RestoreCoordinatorTest {
 
     @Test
     fun preWriteBackupHashMismatchReturnsFailureWithoutOriginalWriteOrReceipt() = withRestore { gateway, coordinator, receipt, run ->
-        gateway.put("FileForge_Backups_run-1/docs/a.zip", byteArrayOf(9, 9, 9))
+        gateway.put("FileForge_Backups_run-1/docs/a.zip", byteArrayOf(9, 9, 9, 9, 9, 9))
 
         val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
 
@@ -46,6 +46,7 @@ class RestoreCoordinatorTest {
             entry(relativePath = "safe.zip", backupPath = "/outside/safe.zip")
         ).forEach { unsafe ->
             withRestore(entries = listOf(unsafe)) { gateway, coordinator, receipt, run ->
+                if (unsafe.relativePath == "missing.zip") gateway.put("missing.zip", byteArrayOf(1))
                 val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
 
                 assertTrue(report.entries.single().status in setOf(
