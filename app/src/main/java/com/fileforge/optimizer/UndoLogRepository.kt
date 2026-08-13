@@ -12,13 +12,13 @@ private fun String?.isValidSha256(): Boolean =
 data class UndoHeader(
     val runId: String,
     val startedAt: String,
+    val schemaVersion: Int = 2,
     val mode: OptimizeMode = OptimizeMode.SAFE,
     val apkLabMode: Boolean = false,
     val textMinify: Boolean = false,
     val dryRun: Boolean = false,
     val appVersion: String = "unknown",
-    val buildVariant: String = "unknown",
-    val schemaVersion: Int = 2
+    val buildVariant: String = "unknown"
 )
 
 data class UndoEntry(
@@ -28,11 +28,11 @@ data class UndoEntry(
     val backupPath: String,
     val originalSha256: String?,
     val note: String,
+    val verificationLevel: UndoVerificationLevel = UndoVerificationLevel.SHA_256,
     val optimizedSha256: String? = originalSha256,
     val fileKind: FileKind = FileKind.UNSUPPORTED,
     val toolId: String = "unknown",
-    val completedAt: String = "unknown",
-    val verificationLevel: UndoVerificationLevel = UndoVerificationLevel.SHA_256
+    val completedAt: String = "unknown"
 ) {
     init {
         require(originalBytes >= 0) { "originalBytes must be nonnegative" }
@@ -125,12 +125,13 @@ class UndoLogRepository {
             val fields = parseJsonObject(line) ?: return@forEach
             if (fields.long("schemaVersion") != V2_SCHEMA_VERSION.toLong()) return@forEach
             when (fields.string("recordType")) {
-                "entry" -> parseV2Entry(fields)?.let {
+                "entry" -> {
                     if (terminal != null) terminalInvalidated = true
-                    entries += it
+                    parseV2Entry(fields)?.let(entries::add)
                 }
-                "terminal" -> parseTerminal(fields)?.let {
-                    if (terminal != null) terminalInvalidated = true else terminal = it
+                "terminal" -> {
+                    if (terminal != null) terminalInvalidated = true
+                    else parseTerminal(fields)?.let { terminal = it }
                 }
             }
         }
@@ -161,7 +162,16 @@ class UndoLogRepository {
         val dryRun = fields.boolean("dryRun") ?: return null
         val appVersion = fields.requiredText("appVersion") ?: return null
         val buildVariant = fields.requiredText("buildVariant") ?: return null
-        return UndoHeader(runId, startedAt, mode, apkLabMode, textMinify, dryRun, appVersion, buildVariant)
+        return UndoHeader(
+            runId = runId,
+            startedAt = startedAt,
+            mode = mode,
+            apkLabMode = apkLabMode,
+            textMinify = textMinify,
+            dryRun = dryRun,
+            appVersion = appVersion,
+            buildVariant = buildVariant
+        )
     }
 
     private fun parseV2Entry(fields: Map<String, JsonField>): UndoEntry? = safely {
@@ -198,8 +208,9 @@ class UndoLogRepository {
     }
 
     private fun parseLegacyEntry(line: String, stamp: String): UndoEntry? {
-        val boundaries = separatorBoundaries(line)
-        val candidates = mutableListOf<UndoEntry>()
+        if (line.length > MAX_LEGACY_LINE_LENGTH) return null
+        val boundaries = separatorBoundaries(line) ?: return null
+        var candidate: UndoEntry? = null
         for (first in 0 until boundaries.size) for (second in first + 1 until boundaries.size)
             for (third in second + 1 until boundaries.size) for (fourth in third + 1 until boundaries.size) {
                 val relativePath = line.substring(0, boundaries[first])
@@ -209,20 +220,34 @@ class UndoLogRepository {
                 val note = line.substring(boundaries[fourth] + LEGACY_SEPARATOR.length)
                 if (relativePath.isNotEmpty() && originalBytes != null && optimizedBytes != null && originalBytes >= 0 && optimizedBytes >= 0 &&
                     backupPath == "FileForge_Backups_$stamp/$relativePath"
-                ) candidates += UndoEntry(
-                    relativePath, originalBytes, optimizedBytes, backupPath, null, note, null, FileKind.UNSUPPORTED,
-                    "legacy", "", UndoVerificationLevel.LEGACY_SIZE_ONLY
-                )
+                ) {
+                    if (candidate != null) return null
+                    candidate = UndoEntry(
+                        relativePath = relativePath,
+                        originalBytes = originalBytes,
+                        optimizedBytes = optimizedBytes,
+                        backupPath = backupPath,
+                        originalSha256 = null,
+                        note = note,
+                        verificationLevel = UndoVerificationLevel.LEGACY_SIZE_ONLY,
+                        optimizedSha256 = null,
+                        fileKind = FileKind.UNSUPPORTED,
+                        toolId = "legacy",
+                        completedAt = ""
+                    )
+                }
             }
-        return candidates.singleOrNull()
+        return candidate
     }
 
-    private fun separatorBoundaries(line: String): List<Int> = buildList {
+    private fun separatorBoundaries(line: String): List<Int>? {
+        val boundaries = mutableListOf<Int>()
         var start = 0
         while (true) {
             val index = line.indexOf(LEGACY_SEPARATOR, start)
-            if (index < 0) return@buildList
-            add(index)
+            if (index < 0) return boundaries
+            if (boundaries.size == MAX_LEGACY_SEPARATORS) return null
+            boundaries += index
             start = index + LEGACY_SEPARATOR.length
         }
     }
@@ -404,6 +429,8 @@ class UndoLogRepository {
         const val LEGACY_SCHEMA_VERSION = 1
         const val LEGACY_FORMAT = "Format: relative_path | original_bytes | optimized_bytes | backup_path | note"
         const val LEGACY_SEPARATOR = " | "
+        const val MAX_LEGACY_LINE_LENGTH = 64 * 1024
+        const val MAX_LEGACY_SEPARATORS = 32
         const val HIGH_SURROGATE = '\uD800'
         const val LOW_SURROGATE = '\uDFFF'
         val LEGACY_HEADER = Regex("FileForge Undo Log (.+)")

@@ -216,6 +216,13 @@ class UndoLogRepositoryTest {
     }
 
     @Test
+    fun separatorHeavyLegacyRowIsRejectedBeforeAmbiguityEnumeration() {
+        val legacyLog = legacyLog("20260813_121314", "field" + " | field".repeat(33))
+
+        assertTrue(repository.read(legacyLog.reader()).entries.isEmpty())
+    }
+
+    @Test
     fun terminalBeforeAnEntryLeavesTheRunRunningButRetainsTheEntry() {
         val text = listOf(v2HeaderJson("ordered"), v2TerminalJson(entriesCommitted = 0), v2EntryJson("after-terminal.txt"))
             .joinToString("\n", postfix = "\n")
@@ -232,6 +239,36 @@ class UndoLogRepositoryTest {
             .joinToString("\n", postfix = "\n")
 
         assertEquals(RunStatus.RUNNING, repository.read(text.reader()).status)
+    }
+
+    @Test
+    fun malformedRecognizedEntryAfterTerminalLeavesTheRunRunningAndRetainsEarlierEntries() {
+        val text = listOf(
+            v2HeaderJson("malformed-entry-after-terminal"),
+            v2EntryJson("one.txt"),
+            v2TerminalJson(1),
+            "{\"schemaVersion\":2,\"recordType\":\"entry\"}"
+        ).joinToString("\n", postfix = "\n")
+
+        val run = repository.read(text.reader())
+
+        assertEquals(RunStatus.RUNNING, run.status)
+        assertEquals(listOf("one.txt"), run.entries.map { it.relativePath })
+    }
+
+    @Test
+    fun malformedRecognizedTerminalAfterTerminalLeavesTheRunRunningAndRetainsEarlierEntries() {
+        val text = listOf(
+            v2HeaderJson("malformed-terminal-after-terminal"),
+            v2EntryJson("one.txt"),
+            v2TerminalJson(1),
+            "{\"schemaVersion\":2,\"recordType\":\"terminal\",\"status\":\"COMPLETED\"}"
+        ).joinToString("\n", postfix = "\n")
+
+        val run = repository.read(text.reader())
+
+        assertEquals(RunStatus.RUNNING, run.status)
+        assertEquals(listOf("one.txt"), run.entries.map { it.relativePath })
     }
 
     @Test
@@ -314,6 +351,23 @@ class UndoLogRepositoryTest {
 
         assertTrue(run.entries.isEmpty())
         assertEquals(RunStatus.RUNNING, run.status)
+    }
+
+    @Test
+    fun originalPositionalUndoModelConstructorsRemainSourceCompatible() {
+        val header = UndoHeader("id", "start", 1)
+        val legacyEntry = UndoEntry(
+            "legacy.txt",
+            100,
+            50,
+            "FileForge_Backups_id/legacy.txt",
+            null,
+            "legacy note",
+            UndoVerificationLevel.LEGACY_SIZE_ONLY
+        )
+
+        assertEquals(1, header.schemaVersion)
+        assertEquals(UndoVerificationLevel.LEGACY_SIZE_ONLY, legacyEntry.verificationLevel)
     }
 
     private fun v2Entry(relativePath: String) = UndoEntry(
