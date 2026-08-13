@@ -9,6 +9,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.FilterInputStream
 import java.io.InputStream
+import java.io.OutputStream
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipException
@@ -106,6 +107,19 @@ class StreamingZipOptimizerTest {
     }
 
     @Test
+    fun verificationAcceptsAValidMultiEntryCentralDirectory() {
+        val zip = zipBytes(
+            fileEntry("first.txt", "first".toByteArray()),
+            fileEntry("second.txt", "second".toByteArray())
+        )
+
+        val verification = optimizer.verify(zip.inputStream(), NeverCancelled)
+
+        assertEquals(2, verification.entries)
+        assertEquals(11L, verification.bytesRead)
+    }
+
+    @Test
     fun verificationRejectsArchiveTruncatedBeforeEocd() {
         val complete = zipBytes(fileEntry("truncated.txt", "content".toByteArray()))
         val truncated = complete.copyOfRange(0, complete.size - EOCD_BYTES)
@@ -113,6 +127,58 @@ class StreamingZipOptimizerTest {
         assertThrows(ZipException::class.java) {
             optimizer.verify(truncated.inputStream(), NeverCancelled)
         }
+    }
+
+    @Test
+    fun verificationRejectsFabricatedFourByteCentralDirectory() {
+        val malformed = archiveWithCentralDirectory(byteArrayOf(0x50, 0x4b, 0x01, 0x02))
+
+        assertCentralDirectoryFailure(malformed)
+    }
+
+    @Test
+    fun verificationRejectsIncompleteCentralDirectoryFixedHeader() {
+        val malformed = archiveWithCentralDirectory(centralDirectoryBytes().copyOfRange(0, CENTRAL_DIRECTORY_FIXED_BYTES - 1))
+
+        assertCentralDirectoryFailure(malformed)
+    }
+
+    @Test
+    fun verificationRejectsCentralDirectoryVariableLengthsBeyondDeclaredBounds() {
+        val malformedCentralDirectory = ByteArray(CENTRAL_DIRECTORY_FIXED_BYTES)
+        writeInt(malformedCentralDirectory, 0, CENTRAL_DIRECTORY_SIGNATURE)
+        writeShort(malformedCentralDirectory, 28, 1)
+        val malformed = archiveWithCentralDirectory(malformedCentralDirectory)
+
+        assertCentralDirectoryFailure(malformed)
+    }
+
+    @Test
+    fun verificationRejectsCentralDirectoryWithWrongRecordCount() {
+        val record = centralDirectoryBytes()
+        val malformed = archiveWithCentralDirectory(record + record)
+
+        assertCentralDirectoryFailure(malformed)
+    }
+
+    @Test
+    fun verificationRejectsCentralDirectoryWithTrailingBytes() {
+        val malformed = archiveWithCentralDirectory(centralDirectoryBytes() + byteArrayOf(0x7f))
+
+        assertCentralDirectoryFailure(malformed)
+    }
+
+    @Test
+    fun verificationRejectsZip64CentralDirectorySentinel() {
+        val archive = zipBytes(fileEntry("zip64.txt", "data".toByteArray()))
+        val malformed = archive.clone().also { bytes ->
+            writeInt(bytes, eocdOffset(bytes) + 12, ZIP64_SENTINEL)
+        }
+
+        val exception = assertThrows(ZipException::class.java) {
+            optimizer.verify(malformed.inputStream(), NeverCancelled)
+        }
+        assertTrue(exception.message.orEmpty().contains("Unsupported"))
     }
 
     @Test
@@ -129,38 +195,41 @@ class StreamingZipOptimizerTest {
 
     @Test
     fun rejectsDuplicateEntryNamesInsteadOfSilentlyCollapsingThem() {
-        val duplicateArchive = rawStoredEntries(
+        val duplicateArchive = validStoredArchive(
             "same.txt" to "first".toByteArray(),
             "same.txt" to "second".toByteArray()
         )
 
-        assertThrows(ZipException::class.java) {
+        val exception = assertThrows(ZipException::class.java) {
             optimizer.optimize(duplicateArchive.inputStream(), ByteArrayOutputStream(), OptimizeMode.SAFE, NeverCancelled) {}
         }
+        assertTrue(exception.message.orEmpty().contains("Duplicate archive entry"))
     }
 
     @Test
     fun rejectsDuplicateNamesAfterNormalizingDirectorySeparatorsDuringOptimization() {
-        val duplicateArchive = rawStoredEntries(
+        val duplicateArchive = validStoredArchive(
             "nested/file.txt" to "first".toByteArray(),
             "nested\\file.txt" to "second".toByteArray()
         )
 
-        assertThrows(ZipException::class.java) {
+        val exception = assertThrows(ZipException::class.java) {
             optimizer.optimize(duplicateArchive.inputStream(), ByteArrayOutputStream(), OptimizeMode.SAFE, NeverCancelled) {}
         }
+        assertTrue(exception.message.orEmpty().contains("Duplicate archive entry"))
     }
 
     @Test
     fun rejectsDuplicateNamesAfterNormalizingDirectorySeparatorsDuringVerification() {
-        val duplicateArchive = rawStoredEntries(
+        val duplicateArchive = validStoredArchive(
             "nested/file.txt" to "first".toByteArray(),
             "nested\\file.txt" to "second".toByteArray()
         )
 
-        assertThrows(ZipException::class.java) {
+        val exception = assertThrows(ZipException::class.java) {
             optimizer.verify(duplicateArchive.inputStream(), NeverCancelled)
         }
+        assertTrue(exception.message.orEmpty().contains("Duplicate archive entry"))
     }
 
     @Test
@@ -197,16 +266,18 @@ class StreamingZipOptimizerTest {
     }
 
     @Test
-    fun usesAggressiveDeflateLevelAndReportsItInTheSummaryNote() {
+    fun configuresZipOutputStreamWithAggressiveLevelAndReportsItInTheSummaryNote() {
         val output = ByteArrayOutputStream()
+        val recordingOptimizer = RecordingStreamingZipOptimizer()
 
-        val summary = optimizer.optimize(
+        val summary = recordingOptimizer.optimize(
             zipBytes(fileEntry("mode.txt", "payload".toByteArray())).inputStream(),
             output,
             OptimizeMode.AGGRESSIVE,
             NeverCancelled
         ) {}
 
+        assertEquals(9, recordingOptimizer.configuredDeflateLevel)
         assertEquals("Recompressed ZIP container at deflate level 9. Entry comments are best-effort with forward-only input.", summary.note)
     }
 
@@ -290,8 +361,10 @@ class StreamingZipOptimizerTest {
         return output.toByteArray()
     }
 
-    private fun rawStoredEntries(vararg entries: Pair<String, ByteArray>): ByteArray {
+    private fun validStoredArchive(vararg entries: Pair<String, ByteArray>): ByteArray {
         val output = ByteArrayOutputStream()
+        val centralDirectory = ByteArrayOutputStream()
+        var localOffset = 0L
         entries.forEach { (name, contents) ->
             val nameBytes = name.toByteArray(Charsets.UTF_8)
             val crc = CRC32().apply { update(contents) }.value
@@ -308,7 +381,35 @@ class StreamingZipOptimizerTest {
             writeShort(output, 0)
             output.write(nameBytes)
             output.write(contents)
+            writeInt(centralDirectory, CENTRAL_DIRECTORY_SIGNATURE)
+            writeShort(centralDirectory, 20)
+            writeShort(centralDirectory, 20)
+            writeShort(centralDirectory, 0)
+            writeShort(centralDirectory, ZipEntry.STORED)
+            writeShort(centralDirectory, 0)
+            writeShort(centralDirectory, 0)
+            writeInt(centralDirectory, crc)
+            writeInt(centralDirectory, contents.size.toLong())
+            writeInt(centralDirectory, contents.size.toLong())
+            writeShort(centralDirectory, nameBytes.size)
+            writeShort(centralDirectory, 0)
+            writeShort(centralDirectory, 0)
+            writeShort(centralDirectory, 0)
+            writeShort(centralDirectory, 0)
+            writeInt(centralDirectory, 0)
+            writeInt(centralDirectory, localOffset)
+            centralDirectory.write(nameBytes)
+            localOffset += 30L + nameBytes.size + contents.size
         }
+        centralDirectory.writeTo(output)
+        writeInt(output, EOCD_SIGNATURE)
+        writeShort(output, 0)
+        writeShort(output, 0)
+        writeShort(output, entries.size)
+        writeShort(output, entries.size)
+        writeInt(output, centralDirectory.size().toLong())
+        writeInt(output, localOffset)
+        writeShort(output, 0)
         return output.toByteArray()
     }
 
@@ -347,6 +448,52 @@ class StreamingZipOptimizerTest {
         writeShort(output, ((value ushr 16) and 0xffff).toInt())
     }
 
+    private fun writeInt(bytes: ByteArray, offset: Int, value: Long) {
+        bytes[offset] = (value and 0xff).toByte()
+        bytes[offset + 1] = ((value ushr 8) and 0xff).toByte()
+        bytes[offset + 2] = ((value ushr 16) and 0xff).toByte()
+        bytes[offset + 3] = ((value ushr 24) and 0xff).toByte()
+    }
+
+    private fun writeShort(bytes: ByteArray, offset: Int, value: Int) {
+        bytes[offset] = (value and 0xff).toByte()
+        bytes[offset + 1] = ((value ushr 8) and 0xff).toByte()
+    }
+
+    private fun archiveWithCentralDirectory(centralDirectory: ByteArray): ByteArray {
+        val validArchive = zipBytes(fileEntry("local.txt", "payload".toByteArray()))
+        val localEnd = littleEndianInt(validArchive, eocdOffset(validArchive) + 16)
+        val output = ByteArrayOutputStream()
+        output.write(validArchive, 0, localEnd)
+        output.write(centralDirectory)
+        writeInt(output, EOCD_SIGNATURE)
+        writeShort(output, 0)
+        writeShort(output, 0)
+        writeShort(output, 1)
+        writeShort(output, 1)
+        writeInt(output, centralDirectory.size.toLong())
+        writeInt(output, localEnd.toLong())
+        writeShort(output, 0)
+        return output.toByteArray()
+    }
+
+    private fun centralDirectoryBytes(): ByteArray {
+        val validArchive = zipBytes(fileEntry("local.txt", "payload".toByteArray()))
+        val eocd = eocdOffset(validArchive)
+        val offset = littleEndianInt(validArchive, eocd + 16)
+        val size = littleEndianInt(validArchive, eocd + 12)
+        return validArchive.copyOfRange(offset, offset + size)
+    }
+
+    private fun eocdOffset(bytes: ByteArray): Int = bytes.size - EOCD_BYTES
+
+    private fun assertCentralDirectoryFailure(archive: ByteArray) {
+        val exception = assertThrows(ZipException::class.java) {
+            optimizer.verify(archive.inputStream(), NeverCancelled)
+        }
+        assertTrue(exception.message.orEmpty().contains("central directory", ignoreCase = true))
+    }
+
     private class EightKiBInputStream(input: InputStream) : FilterInputStream(input) {
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
             super.read(buffer, offset, minOf(length, 8 * 1024))
@@ -377,8 +524,24 @@ class StreamingZipOptimizerTest {
 
     private class TestCancellation : RuntimeException()
 
+    private class RecordingStreamingZipOptimizer : StreamingZipOptimizer() {
+        var configuredDeflateLevel = -1
+
+        override fun createZipOutputStream(output: OutputStream): ZipOutputStream =
+            object : ZipOutputStream(output) {
+                override fun setLevel(level: Int) {
+                    configuredDeflateLevel = level
+                    super.setLevel(level)
+                }
+            }
+    }
+
     private companion object {
         const val EOCD_BYTES = 22
+        const val CENTRAL_DIRECTORY_FIXED_BYTES = 46
+        const val CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50L
+        const val EOCD_SIGNATURE = 0x06054b50L
+        const val ZIP64_SENTINEL = 0xffffffffL
         val testExtra = byteArrayOf(0x34, 0x12, 0x01, 0x00, 0x7f)
     }
 }

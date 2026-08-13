@@ -42,7 +42,7 @@ object ArchivePathPolicy {
             (path.length >= 3 && path[0].isLetter() && path[1] == ':' && (path[2] == '/' || path[2] == '\\'))
 }
 
-class StreamingZipOptimizer {
+open class StreamingZipOptimizer {
     fun optimize(
         input: InputStream,
         output: OutputStream,
@@ -59,7 +59,7 @@ class StreamingZipOptimizer {
         val names = HashSet<String>()
 
         ZipInputStream(NonClosingInputStream(trackedInput)).use { zipIn ->
-            ZipOutputStream(NonClosingOutputStream(countedOutput)).use { zipOut ->
+            createZipOutputStream(NonClosingOutputStream(countedOutput)).use { zipOut ->
                 zipOut.setLevel(level)
                 while (true) {
                     cancellation.throwIfCancelled()
@@ -138,6 +138,8 @@ class StreamingZipOptimizer {
         source.extra?.let { extra = it }
         source.comment?.let { comment = it }
     }
+
+    protected open fun createZipOutputStream(output: OutputStream): ZipOutputStream = ZipOutputStream(output)
 
     private fun drainAndRequireCentralDirectory(
         input: TailTrackingInputStream,
@@ -222,11 +224,40 @@ class StreamingZipOptimizer {
             }
             val tailStartOffset = totalBytesRead - tailSize
             val centralDirectoryTailOffset = centralDirectoryOffset - tailStartOffset
-            if (centralDirectorySize >= 4L && centralDirectoryTailOffset >= 0L &&
-                centralDirectoryTailOffset + 4L <= tailSize.toLong() &&
-                unsignedIntAt(centralDirectoryTailOffset.toInt()) != CENTRAL_DIRECTORY_SIGNATURE
+            if (centralDirectoryTailOffset < 0L || centralDirectorySize > tailSize.toLong() ||
+                centralDirectoryTailOffset + centralDirectorySize > tailSize.toLong()
             ) {
-                throw ZipException("Invalid central directory header")
+                throw ZipException("Central directory exceeds retained validation tail")
+            }
+            requireClassicCentralDirectory(
+                centralDirectoryTailOffset.toInt(),
+                centralDirectorySize.toInt(),
+                entries
+            )
+        }
+
+        private fun requireClassicCentralDirectory(start: Int, size: Int, expectedEntries: Int) {
+            val end = start + size
+            var cursor = start
+            var records = 0
+            while (cursor < end) {
+                if (end - cursor < CENTRAL_DIRECTORY_FIXED_BYTES ||
+                    unsignedIntAt(cursor) != CENTRAL_DIRECTORY_SIGNATURE
+                ) {
+                    throw ZipException("Malformed central directory record")
+                }
+
+                val nameLength = unsignedShortAt(cursor + 28)
+                val extraLength = unsignedShortAt(cursor + 30)
+                val commentLength = unsignedShortAt(cursor + 32)
+                val recordSize = CENTRAL_DIRECTORY_FIXED_BYTES + nameLength + extraLength + commentLength
+                if (recordSize > end - cursor) throw ZipException("Malformed central directory variable lengths")
+
+                cursor += recordSize
+                records++
+            }
+            if (cursor != end || records != expectedEntries) {
+                throw ZipException("Central directory record count or size mismatch")
             }
         }
 
@@ -262,6 +293,7 @@ class StreamingZipOptimizer {
             const val EOCD_SIGNATURE = 0x06054b50L
             const val CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50L
             const val EOCD_MIN_BYTES = 22
+            const val CENTRAL_DIRECTORY_FIXED_BYTES = 46
             const val MAX_EOCD_TAIL_BYTES = EOCD_MIN_BYTES + 0xffff
             const val ZIP64_SENTINEL = 0xffffffffL
         }
