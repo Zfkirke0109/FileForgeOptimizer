@@ -58,12 +58,14 @@ internal object StreamIntegrityChecker {
 
 internal object DocumentPathPolicy {
     fun requireSafeSegment(value: String): String {
+        requireWellFormedUtf16(value)
         require(value.isNotBlank() && value != "." && value != ".." &&
             value.none { it == '/' || it == '\\' || it == ':' }) { "Unsafe path segment" }
         return value
     }
 
     fun requireSafeRelative(path: String): List<String> {
+        requireWellFormedUtf16(path)
         require(path.isNotBlank() && !path.startsWith('/') && !path.startsWith('\\')) { "Path must be relative" }
         val segments = path.split('/')
         require(segments.none { it.isEmpty() || it == "." || it == ".." || it.contains('\\') || it.contains(':') }) {
@@ -76,5 +78,19 @@ internal object DocumentPathPolicy {
         var current = root
         requireSafeRelative(path).forEach { segment -> current = gateway.resolve(current, segment) ?: return null }
         return current
+    }
+
+    private fun requireWellFormedUtf16(value: String) {
+        var index = 0
+        while (index < value.length) {
+            val character = value[index]
+            if (character.isHighSurrogate()) {
+                require(index + 1 < value.length && value[index + 1].isLowSurrogate()) { "Malformed UTF-16 path" }
+                index += 2
+            } else {
+                require(!character.isLowSurrogate()) { "Malformed UTF-16 path" }
+                index++
+            }
+        }
     }
 }

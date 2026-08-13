@@ -220,6 +220,49 @@ class RestoreCoordinatorTest {
         assertEquals(1, receipt.names.size)
     }
 
+    @Test
+    fun ordinaryPostWriteVerificationFailureRepairsFromBackupAndExposesRepairResult() = withRestore { gateway, coordinator, _, run ->
+        var originalWrites = 0
+        gateway.corruptAfterWrite = { it.id == "root/docs/a.zip" && ++originalWrites == 1 }
+
+        val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+        val result = report.entries.single()
+        assertEquals(RestoreEntryStatus.RESTORED_VERIFICATION_FAILED, result.status)
+        assertEquals(RestoreRepairResult.Restored, result.repair)
+        assertEquals(backupA.toList(), gateway.contents("docs/a.zip").toList())
+    }
+
+    @Test
+    fun receiptContainsOnlyEntriesWhoseOriginalWriteWasAttempted() = withRestore(entries = listOf(entry("docs/a.zip"), entry("docs/b.zip"))) {
+            gateway, coordinator, receipt, run ->
+        gateway.put("docs/b.zip", byteArrayOf(7))
+
+        coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+        assertEquals(1, receipt.contents.single().lineSequence().count { it.isNotBlank() })
+        assertTrue(receipt.contents.single().contains("docs/a.zip"))
+        assertFalse(receipt.contents.single().contains("docs/b.zip"))
+    }
+
+    @Test
+    fun legacyReceiptWriterRemainsSamCompatible() {
+        val legacy: RestoreReceiptWriter = RestoreReceiptWriter { java.io.StringWriter() }
+        withRestore(receiptWriter = legacy) { _, coordinator, _, run ->
+            assertEquals(RestoreEntryStatus.RESTORED, coordinator.restore(run, RestoreSelection.All, NeverCancelled).entries.single().status)
+        }
+    }
+
+    @Test
+    fun malformedUtf16PathIsRejectedBeforeReceiptOrWrite() = withRestore(entries = listOf(entry("docs/\uD800.zip"))) {
+            gateway, coordinator, receipt, run ->
+        val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+        assertEquals(RestoreEntryStatus.PATH_REJECTED, report.entries.single().status)
+        assertFalse(gateway.events.any { it.startsWith("write:root/docs/") })
+        assertTrue(receipt.names.isEmpty())
+    }
+
     private fun withRestore(
         entries: List<UndoEntry> = listOf(entry("docs/a.zip")),
         receiptWriter: RestoreReceiptWriter = RecordingReceiptWriter(),
@@ -270,7 +313,7 @@ class RestoreCoordinatorTest {
         val backupB = byteArrayOf(0x50, 0x4b, 5, 6, 7, 8)
     }
 
-    private class FaultingReceiptWriter(private val phase: String) : RestoreReceiptWriter {
+    private class FaultingReceiptWriter(private val phase: String) : ExclusiveRestoreReceiptWriter {
         override fun openExclusive(name: String): RestoreReceipt {
             if (phase == "open") error("open failed")
             return RestoreReceipt(name, object : java.io.StringWriter() {

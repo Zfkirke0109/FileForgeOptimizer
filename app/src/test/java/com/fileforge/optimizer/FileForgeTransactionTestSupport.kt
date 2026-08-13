@@ -163,7 +163,7 @@ internal class RecordingUndoEntrySink(private val events: MutableList<String>) :
     }
 }
 
-internal class RecordingReceiptWriter : RestoreReceiptWriter {
+internal class RecordingReceiptWriter : ExclusiveRestoreReceiptWriter {
     val names = mutableListOf<String>()
     val contents = mutableListOf<String>()
     override fun openExclusive(name: String): RestoreReceipt {

@@ -21,8 +21,15 @@ data class RestoreEntryResult(
     val relativePath: String,
     val status: RestoreEntryStatus,
     val verification: UndoVerificationLevel,
-    val message: String = ""
+    val message: String = "",
+    val repair: RestoreRepairResult = RestoreRepairResult.NotNeeded
 )
+
+sealed class RestoreRepairResult {
+    data object NotNeeded : RestoreRepairResult()
+    data object Restored : RestoreRepairResult()
+    data class Failed(val cause: Throwable) : RestoreRepairResult()
+}
 
 data class RestoreReport(
     val run: UndoRun,
@@ -35,9 +42,14 @@ data class RestoreReport(
 data class RestoreReceipt(val name: String, val writer: Writer)
 class ReceiptAlreadyExistsException(message: String) : IOException(message)
 
-/** Storage must create the named receipt exclusively; collisions are retried with a suffix. */
-interface RestoreReceiptWriter {
+fun interface RestoreReceiptWriter {
+    fun open(name: String): Writer
+}
+
+/** Optional stronger contract for stores that can atomically create a new receipt. */
+interface ExclusiveRestoreReceiptWriter : RestoreReceiptWriter {
     fun openExclusive(name: String): RestoreReceipt
+    override fun open(name: String): Writer = openExclusive(name).writer
 }
 
 class RestoreCoordinator(
@@ -46,6 +58,7 @@ class RestoreCoordinator(
     private val receiptWriter: RestoreReceiptWriter,
     private val clock: () -> String
 ) {
+    private var fallbackReceiptCounter = 0L
     fun restore(run: UndoRun, selection: RestoreSelection, cancellation: CancellationToken): RestoreReport {
         val results = mutableListOf<RestoreEntryResult>()
         val selected = run.entries.filter { selection.includes(it.relativePath) }
@@ -68,7 +81,7 @@ class RestoreCoordinator(
                         receipt ?: openReceipt(safeRunId, timestamp).also { receipt = it }
                     }
                     results += attempt.result
-                    if (receipt != null) {
+                    if (receipt != null && attempt.attemptedWrite) {
                         try {
                             writeReceipt(receipt!!.writer, attempt.result)
                         } catch (failure: Exception) {
@@ -142,27 +155,35 @@ class RestoreCoordinator(
             return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_HASH_MISMATCH, "Backup SHA-256 does not match undo record"))
         }
         try { receiptForAttempt() } catch (failure: Exception) { throw ReceiptOpenException(failure) }
+        var attemptedWrite = false
         return try {
             val restored = documentGateway.openRead(backup).use { source ->
+                attemptedWrite = true
                 documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, cancellation) }
             }
             val verified = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, cancellation) }
-            RestoreAttempt(verifiedResult(entry, restored, verified))
+            val primary = verifiedResult(entry, restored, verified)
+            if (primary.status == RestoreEntryStatus.RESTORED) RestoreAttempt(primary, attemptedWrite = attemptedWrite) else
+                RestoreAttempt(primary.copy(repair = repairFromBackup(original, backup, entry)), attemptedWrite = attemptedWrite)
         } catch (_: OptimizationCancelledException) {
-            RestoreAttempt(repairFromBackup(original, backup, entry), cancelled = true)
+            val repair = repairFromBackup(original, backup, entry)
+            val status = if (repair == RestoreRepairResult.Restored) RestoreEntryStatus.RESTORED else RestoreEntryStatus.WRITE_FAILED
+            RestoreAttempt(result(entry, status, "Cancellation repair completed", repair), cancelled = true, attemptedWrite = attemptedWrite)
         } catch (failure: Exception) {
-            RestoreAttempt(result(entry, RestoreEntryStatus.WRITE_FAILED, failure.message ?: "Restore write failed"))
+            val repair = if (attemptedWrite) repairFromBackup(original, backup, entry) else RestoreRepairResult.NotNeeded
+            RestoreAttempt(result(entry, RestoreEntryStatus.WRITE_FAILED, failure.message ?: "Restore write failed", repair), attemptedWrite = attemptedWrite)
         }
     }
 
-    private fun repairFromBackup(original: DocumentNode, backup: DocumentNode, entry: UndoEntry): RestoreEntryResult = try {
+    private fun repairFromBackup(original: DocumentNode, backup: DocumentNode, entry: UndoEntry): RestoreRepairResult = try {
         val restored = documentGateway.openRead(backup).use { source ->
             documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, NeverCancelled) }
         }
         val verified = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, NeverCancelled) }
-        verifiedResult(entry, restored, verified)
+        check(verifiedResult(entry, restored, verified).status == RestoreEntryStatus.RESTORED) { "Repair verification failed" }
+        RestoreRepairResult.Restored
     } catch (failure: Exception) {
-        result(entry, RestoreEntryStatus.WRITE_FAILED, failure.message ?: "Cancellation repair failed")
+        RestoreRepairResult.Failed(failure)
     }
 
     private fun verifiedResult(entry: UndoEntry, restored: StreamIntegrity, verified: StreamIntegrity): RestoreEntryResult {
@@ -177,13 +198,18 @@ class RestoreCoordinator(
         val base = "FileForge_Restore_${runId}_${timestamp}"
         repeat(MAX_RECEIPT_COLLISIONS) { attempt ->
             val suffix = if (attempt == 0) "" else "-$attempt"
-            try { return receiptWriter.openExclusive("$base$suffix.jsonl") } catch (_: ReceiptAlreadyExistsException) { }
+            try {
+                val exclusive = receiptWriter as? ExclusiveRestoreReceiptWriter
+                if (exclusive != null) return exclusive.openExclusive("$base$suffix.jsonl")
+                val counter = ++fallbackReceiptCounter
+                return RestoreReceipt("$base-$counter.jsonl", receiptWriter.open("$base-$counter.jsonl"))
+            } catch (_: ReceiptAlreadyExistsException) { }
         }
         throw IOException("Could not create a unique restore receipt")
     }
 
-    private fun result(entry: UndoEntry, status: RestoreEntryStatus, message: String = "") =
-        RestoreEntryResult(entry.relativePath, status, entry.verificationLevel, message)
+    private fun result(entry: UndoEntry, status: RestoreEntryStatus, message: String = "", repair: RestoreRepairResult = RestoreRepairResult.NotNeeded) =
+        RestoreEntryResult(entry.relativePath, status, entry.verificationLevel, message, repair)
 
     private fun writeReceipt(writer: Writer, result: RestoreEntryResult) {
         writer.write("{\"relativePath\":\"${escapeJson(result.relativePath)}\",\"status\":\"${result.status.name}\",\"verification\":\"${result.verification.name}\",\"message\":\"${escapeJson(result.message)}\"}\n")
@@ -213,7 +239,11 @@ class RestoreCoordinator(
         }
     }
 
-    private data class RestoreAttempt(val result: RestoreEntryResult, val cancelled: Boolean = false)
+    private data class RestoreAttempt(
+        val result: RestoreEntryResult,
+        val cancelled: Boolean = false,
+        val attemptedWrite: Boolean = false
+    )
     private class ReceiptOpenException(cause: Throwable) : IOException(cause.message, cause)
     private companion object { const val MAX_RECEIPT_COLLISIONS = 100 }
 }
