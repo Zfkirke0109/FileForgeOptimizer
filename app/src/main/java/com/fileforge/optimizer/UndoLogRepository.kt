@@ -237,7 +237,11 @@ class UndoLogRepository {
         writer.flush()
     }
 
-    private fun jsonObject(vararg fields: Pair<String, Any>): String = fields.joinToString("{", "}", ",") { (name, value) ->
+    private fun jsonObject(vararg fields: Pair<String, Any>): String = fields.joinToString(
+        prefix = "{",
+        postfix = "}",
+        separator = ","
+    ) { (name, value) ->
         "\"${escapeJson(name)}\":${if (value is String) "\"${escapeJson(value)}\"" else value}"
     }
 

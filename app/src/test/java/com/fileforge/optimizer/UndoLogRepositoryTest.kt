@@ -71,11 +71,13 @@ class UndoLogRepositoryTest {
         assertEquals(1, output.flushCount)
         assertEquals(1, output.contents.lineSequence().count { it.isNotBlank() })
         assertTrue(output.contents.endsWith("\n"))
+        assertJsonObjectLines(output.contents)
 
         repository.appendEntry(output, v2Entry(relativePath = "docs/one.txt"))
         assertEquals(2, output.flushCount)
         assertEquals(2, output.contents.lineSequence().count { it.isNotBlank() })
         assertTrue(output.contents.endsWith("\n"))
+        assertJsonObjectLines(output.contents)
 
         repository.appendTerminal(
             output,
@@ -84,6 +86,7 @@ class UndoLogRepositoryTest {
         assertEquals(3, output.flushCount)
         assertEquals(3, output.contents.lineSequence().count { it.isNotBlank() })
         assertTrue(output.contents.endsWith("\n"))
+        assertJsonObjectLines(output.contents)
     }
 
     @Test
@@ -342,6 +345,10 @@ class UndoLogRepositoryTest {
 
         $record
     """.trimIndent() + "\n"
+
+    private fun assertJsonObjectLines(contents: String) {
+        assertTrue(contents.lineSequence().filter { it.isNotBlank() }.all { it.startsWith("{") && it.endsWith("}") })
+    }
 
     private class FlushRecordingWriter : Writer() {
         private val buffer = StringBuilder()
