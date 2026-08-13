@@ -48,18 +48,21 @@ class UndoLogRepositoryTest {
 
         repository.start(output, UndoHeader(runId = "flush-run", startedAt = "2026-08-13T19:42:00Z"))
         assertEquals(1, output.flushCount)
-        assertEquals(1, output.contents.lineSequence().count())
+        assertEquals(1, output.contents.lineSequence().count { it.isNotBlank() })
+        assertTrue(output.contents.endsWith("\n"))
 
         repository.appendEntry(output, v2Entry(relativePath = "docs/one.txt"))
         assertEquals(2, output.flushCount)
-        assertEquals(2, output.contents.lineSequence().count())
+        assertEquals(2, output.contents.lineSequence().count { it.isNotBlank() })
+        assertTrue(output.contents.endsWith("\n"))
 
         repository.appendTerminal(
             output,
             UndoTerminalSummary(RunStatus.COMPLETED, "2026-08-13T19:43:00Z", entriesCommitted = 1)
         )
         assertEquals(3, output.flushCount)
-        assertEquals(3, output.contents.lineSequence().count())
+        assertEquals(3, output.contents.lineSequence().count { it.isNotBlank() })
+        assertTrue(output.contents.endsWith("\n"))
     }
 
     @Test
