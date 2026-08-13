@@ -19,11 +19,11 @@ class StreamingZipOptimizerTest {
     private val optimizer = StreamingZipOptimizer()
 
     @Test
-    fun optimizesNestedDirectoryAndEmptyEntriesFromAnEightKiBChunkedSource() {
+    fun preservesForwardReadableMetadataForNestedDirectoryAndEmptyEntriesFromAnEightKiBChunkedSource() {
         val source = zipBytes(
             directoryEntry("nested/"),
             fileEntry("nested/empty.txt", byteArrayOf()),
-            fileEntry("nested/data.txt", "payload".toByteArray(), extra = testExtra, comment = "keep me")
+            fileEntry("nested/data.txt", "payload".toByteArray(), extra = testExtra)
         )
         val output = ByteArrayOutputStream()
         var transferred = 0L
@@ -67,6 +67,17 @@ class StreamingZipOptimizerTest {
     }
 
     @Test
+    fun rejectsWindowsDriveAndUncAbsoluteEntries() {
+        listOf("C:\\outside.txt", "\\\\server\\share\\outside.txt").forEach { name ->
+            val zip = zipBytes(fileEntry(name, "no".toByteArray()))
+
+            assertThrows(UnsafeArchivePathException::class.java) {
+                optimizer.optimize(zip.inputStream(), ByteArrayOutputStream(), OptimizeMode.SAFE, NeverCancelled) {}
+            }
+        }
+    }
+
+    @Test
     fun rejectsUnsafeEntryDuringVerification() {
         val zip = zipBytes(fileEntry("nested/../../outside.txt", "no".toByteArray()))
 
@@ -81,6 +92,26 @@ class StreamingZipOptimizerTest {
 
         assertThrows(ZipException::class.java) {
             optimizer.verify(emptyArchive.inputStream(), NeverCancelled)
+        }
+    }
+
+    @Test
+    fun verificationAcceptsAnArchiveWithAValidCentralDirectoryAndEocd() {
+        val zip = zipBytes(fileEntry("valid.txt", "complete".toByteArray()))
+
+        val verification = optimizer.verify(zip.inputStream(), NeverCancelled)
+
+        assertEquals(1, verification.entries)
+        assertEquals(8L, verification.bytesRead)
+    }
+
+    @Test
+    fun verificationRejectsArchiveTruncatedBeforeEocd() {
+        val complete = zipBytes(fileEntry("truncated.txt", "content".toByteArray()))
+        val truncated = complete.copyOfRange(0, complete.size - EOCD_BYTES)
+
+        assertThrows(ZipException::class.java) {
+            optimizer.verify(truncated.inputStream(), NeverCancelled)
         }
     }
 
@@ -109,6 +140,30 @@ class StreamingZipOptimizerTest {
     }
 
     @Test
+    fun rejectsDuplicateNamesAfterNormalizingDirectorySeparatorsDuringOptimization() {
+        val duplicateArchive = rawStoredEntries(
+            "nested/file.txt" to "first".toByteArray(),
+            "nested\\file.txt" to "second".toByteArray()
+        )
+
+        assertThrows(ZipException::class.java) {
+            optimizer.optimize(duplicateArchive.inputStream(), ByteArrayOutputStream(), OptimizeMode.SAFE, NeverCancelled) {}
+        }
+    }
+
+    @Test
+    fun rejectsDuplicateNamesAfterNormalizingDirectorySeparatorsDuringVerification() {
+        val duplicateArchive = rawStoredEntries(
+            "nested/file.txt" to "first".toByteArray(),
+            "nested\\file.txt" to "second".toByteArray()
+        )
+
+        assertThrows(ZipException::class.java) {
+            optimizer.verify(duplicateArchive.inputStream(), NeverCancelled)
+        }
+    }
+
+    @Test
     fun invokesCancellationBeforePayloadTransfer() {
         val zip = zipBytes(fileEntry("large.bin", ByteArray(40 * 1024) { it.toByte() }))
         var checks = 0
@@ -119,6 +174,55 @@ class StreamingZipOptimizerTest {
         assertThrows(TestCancellation::class.java) {
             optimizer.optimize(zip.inputStream(), ByteArrayOutputStream(), OptimizeMode.SAFE, cancellation) {}
         }
+    }
+
+    @Test
+    fun rechecksCancellationAfterReadBeforeWritingOrReportingPayload() {
+        val source = storedZipBytes("payload.bin", "payload".toByteArray())
+        var cancelled = false
+        val input = CancellingPayloadInputStream(source, firstLocalPayloadOffset(source)) { cancelled = true }
+        var callbackBytes = 0L
+        val output = ByteArrayOutputStream()
+        val cancellation = CancellationToken {
+            if (cancelled) throw TestCancellation()
+        }
+
+        assertThrows(TestCancellation::class.java) {
+            optimizer.optimize(input, output, OptimizeMode.SAFE, cancellation) {
+                callbackBytes += it
+            }
+        }
+        assertEquals(0L, callbackBytes)
+        assertArrayEquals(byteArrayOf(), readEntries(output.toByteArray()).single().contents)
+    }
+
+    @Test
+    fun usesAggressiveDeflateLevelAndReportsItInTheSummaryNote() {
+        val output = ByteArrayOutputStream()
+
+        val summary = optimizer.optimize(
+            zipBytes(fileEntry("mode.txt", "payload".toByteArray())).inputStream(),
+            output,
+            OptimizeMode.AGGRESSIVE,
+            NeverCancelled
+        ) {}
+
+        assertEquals("Recompressed ZIP container at deflate level 9. Entry comments are best-effort with forward-only input.", summary.note)
+    }
+
+    @Test
+    fun preservesEntryTimestamp() {
+        val timestamp = 1_700_000_000_000L
+        val output = ByteArrayOutputStream()
+
+        optimizer.optimize(
+            zipBytes(fileEntry("dated.txt", "payload".toByteArray(), time = timestamp)).inputStream(),
+            output,
+            OptimizeMode.SAFE,
+            NeverCancelled
+        ) {}
+
+        assertEquals(timestamp, readEntries(output.toByteArray()).single().time)
     }
 
     @Test
@@ -139,20 +243,21 @@ class StreamingZipOptimizerTest {
         val contents: ByteArray,
         val isDirectory: Boolean = false,
         val extra: ByteArray? = null,
-        val comment: String? = null
+        val time: Long? = null
     )
 
     private data class ReadEntry(
         val name: String,
         val contents: ByteArray,
         val isDirectory: Boolean,
-        val extra: ByteArray?
+        val extra: ByteArray?,
+        val time: Long
     )
 
     private fun directoryEntry(name: String) = EntryFixture(name, byteArrayOf(), isDirectory = true)
 
-    private fun fileEntry(name: String, contents: ByteArray, extra: ByteArray? = null, comment: String? = null) =
-        EntryFixture(name, contents, extra = extra, comment = comment)
+    private fun fileEntry(name: String, contents: ByteArray, extra: ByteArray? = null, time: Long? = null) =
+        EntryFixture(name, contents, extra = extra, time = time)
 
     private fun zipBytes(vararg entries: EntryFixture): ByteArray {
         val output = ByteArrayOutputStream()
@@ -160,7 +265,7 @@ class StreamingZipOptimizerTest {
             entries.forEach { fixture ->
                 zip.putNextEntry(ZipEntry(fixture.name).apply {
                     fixture.extra?.let { extra = it }
-                    comment = fixture.comment
+                    fixture.time?.let { time = it }
                 })
                 if (!fixture.isDirectory) zip.write(fixture.contents)
                 zip.closeEntry()
@@ -212,7 +317,7 @@ class StreamingZipOptimizerTest {
         ZipInputStream(bytes.inputStream()).use { zip ->
             while (true) {
                 val entry = zip.nextEntry ?: break
-                entries += ReadEntry(entry.name, zip.readBytes(), entry.isDirectory, entry.extra)
+                entries += ReadEntry(entry.name, zip.readBytes(), entry.isDirectory, entry.extra, entry.time)
                 zip.closeEntry()
             }
         }
@@ -247,9 +352,33 @@ class StreamingZipOptimizerTest {
             super.read(buffer, offset, minOf(length, 8 * 1024))
     }
 
+    private class CancellingPayloadInputStream(
+        private val source: ByteArray,
+        private val payloadOffset: Int,
+        private val cancel: () -> Unit
+    ) : InputStream() {
+        private var position = 0
+
+        override fun read(): Int {
+            val oneByte = ByteArray(1)
+            return if (read(oneByte, 0, 1) < 0) -1 else oneByte[0].toInt() and 0xff
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            if (position >= source.size) return -1
+            if (position >= payloadOffset) cancel()
+            val beforePayload = if (position < payloadOffset) payloadOffset - position else 1
+            val count = minOf(length, beforePayload, source.size - position)
+            System.arraycopy(source, position, buffer, offset, count)
+            position += count
+            return count
+        }
+    }
+
     private class TestCancellation : RuntimeException()
 
     private companion object {
+        const val EOCD_BYTES = 22
         val testExtra = byteArrayOf(0x34, 0x12, 0x01, 0x00, 0x7f)
     }
 }

@@ -50,6 +50,7 @@ Workflow implemented:
 ## Known limitations
 
 - This MVP uses a 300 MB per-file memory guard. Large streaming optimization should be added before processing huge archives or videos.
+- The forward-only streaming ZIP engine preserves entry names, timestamps, and extras. ZIP entry comments are best-effort only: normal comments live in the central directory and cannot be guaranteed before payload output without archive-sized seekable spooling.
 - It does not optimize video/audio formats because most are already compressed and same-type lossless recompression rarely helps.
 - PDF optimization is intentionally minimal. A deeper PDF optimizer would require a proper PDF library or bundled native tool such as qpdf/mutool.
 - JPEG optimization is metadata-only and does not recompress pixels.
