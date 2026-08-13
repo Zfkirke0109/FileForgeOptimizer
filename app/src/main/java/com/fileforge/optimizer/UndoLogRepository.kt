@@ -225,28 +225,30 @@ class UndoLogRepository {
     private class JsonObjectParser(private val text: String) {
         private var index = 0
 
-        fun parse(): Map<String, JsonField>? = try {
-            skipWhitespace()
-            expect('{')
-            skipWhitespace()
-            val fields = linkedMapOf<String, JsonField>()
-            if (consume('}')) return fields
-            while (true) {
+        fun parse(): Map<String, JsonField>? {
+            return try {
                 skipWhitespace()
-                val key = string()
+                expect('{')
                 skipWhitespace()
-                expect(':')
+                val fields = linkedMapOf<String, JsonField>()
+                if (consume('}')) return fields
+                while (true) {
+                    skipWhitespace()
+                    val key = string()
+                    skipWhitespace()
+                    expect(':')
+                    skipWhitespace()
+                    val value = if (peek() == '"') JsonField(string(), quoted = true) else JsonField(number(), quoted = false)
+                    if (fields.put(key, value) != null) return null
+                    skipWhitespace()
+                    if (consume('}')) break
+                    expect(',')
+                }
                 skipWhitespace()
-                val value = if (peek() == '"') JsonField(string(), quoted = true) else JsonField(number(), quoted = false)
-                if (fields.put(key, value) != null) return null
-                skipWhitespace()
-                if (consume('}')) break
-                expect(',')
+                if (index != text.length) null else fields
+            } catch (_: IllegalArgumentException) {
+                null
             }
-            skipWhitespace()
-            if (index != text.length) null else fields
-        } catch (_: IllegalArgumentException) {
-            null
         }
 
         private fun string(): String {
