@@ -57,8 +57,13 @@ class RunStateRepository(private val storage: RunStateStorage) {
             subscriptions += subscription
             current
         }
-        subscription.replay(replay)
-        return subscription
+        return try {
+            subscription.replay(replay)
+            subscription
+        } catch (failure: Throwable) {
+            subscription.close()
+            throw failure
+        }
     }
 
     fun publish(state: RunState) {
