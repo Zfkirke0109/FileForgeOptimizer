@@ -37,6 +37,7 @@ class RestoreCoordinatorTest {
         assertEquals(backupBefore.toList(), gateway.contents("docs/a.zip").toList())
         assertEquals("untouched", gateway.contents("FileForge_Undo_v2_run-1.jsonl").decodeToString())
         assertEquals("FileForge_Restore_run-1_20260813T200000Z.jsonl", receipt.names.single())
+        assertEquals(receipt.names.single(), report.receiptName)
         assertTrue(receipt.contents.single().trim().startsWith("{"))
         assertEquals(run, report.run)
     }

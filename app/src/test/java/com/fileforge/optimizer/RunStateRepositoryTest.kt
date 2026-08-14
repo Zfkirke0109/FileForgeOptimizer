@@ -17,6 +17,41 @@ import java.util.concurrent.atomic.AtomicReference
 
 class RunStateRepositoryTest {
     @Test
+    fun restoreReceiptNamePersistsExactlyAndVersionTwoTerminalsMigrateWithoutAnInferredReceipt() {
+        val storage = RecordingRunStateStorage()
+        RunStateRepository(storage).publish(
+            RunState.Terminal(
+                OptimizationReport(
+                    scanned = 1,
+                    optimized = 1,
+                    status = RunStatus.COMPLETED,
+                    restoreReceiptName = "FileForge_Restore_actual-run_20260813T200000Z-1.jsonl"
+                ),
+                dryRun = false,
+                operationKind = RunOperationKind.RESTORE
+            )
+        )
+        val restored = mutableListOf<RunState>()
+        RunStateRepository(storage).observe(restored::add).close()
+
+        assertEquals(
+            "FileForge_Restore_actual-run_20260813T200000Z-1.jsonl",
+            (restored.single() as RunState.Terminal).report.restoreReceiptName
+        )
+
+        val versionTwoWithoutReceipt = """{
+            "version":2,"dryRun":false,"operationKind":"RESTORE","report":{
+            "scanned":1,"optimized":0,"skipped":1,"errors":1,"savedBytes":0,"candidates":0,
+            "potentialSavingsBytes":0,"bytesRead":0,"bytesWritten":0,"status":"COMPLETED_WITH_ERRORS",
+            "skipsByReason":{},"terminalError":null,"terminalFailures":["legacy failure"],"rollbackFailure":null
+            }}""".trimIndent()
+        val migrated = mutableListOf<RunState>()
+        RunStateRepository(RecordingRunStateStorage(versionTwoWithoutReceipt)).observe(migrated::add).close()
+
+        assertEquals(null, (migrated.single() as RunState.Terminal).report.restoreReceiptName)
+    }
+
+    @Test
     fun observationImmediatelyReplaysCurrentStateThenPublishesUntilClosed() {
         val repository = RunStateRepository(RecordingRunStateStorage())
         val observed = mutableListOf<RunState>()
