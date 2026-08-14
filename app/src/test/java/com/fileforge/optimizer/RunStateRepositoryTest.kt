@@ -1,9 +1,17 @@
 package com.fileforge.optimizer
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 class RunStateRepositoryTest {
     @Test
@@ -19,7 +27,7 @@ class RunStateRepositoryTest {
             )
         )
         subscription.close()
-        repository.publish(RunState.Terminal(OptimizationReport(status = RunStatus.COMPLETED)))
+        repository.publish(RunState.Terminal(OptimizationReport(status = RunStatus.COMPLETED), dryRun = false))
 
         assertEquals(2, observed.size)
         assertEquals(RunState.Idle, observed[0])
@@ -56,7 +64,7 @@ class RunStateRepositoryTest {
             terminalFailures = terminalFailures,
             rollbackFailure = null
         )
-        val terminal = RunState.Terminal(sourceReport)
+        val terminal = RunState.Terminal(sourceReport, dryRun = false)
         sourceReport.optimized = 99
         reportSkips[SkipReason.UNSUPPORTED] = 99
         terminalFailures += "late mutation"
@@ -102,11 +110,14 @@ class RunStateRepositoryTest {
                 rollbackFailure = if (status == RunStatus.FAILED) "rollback failed" else null
             )
 
-            repository.publish(RunState.Terminal(report))
+            val dryRun = status == RunStatus.CANCELLED
+            repository.publish(RunState.Terminal(report, dryRun = dryRun))
 
             val restored = mutableListOf<RunState>()
             RunStateRepository(storage).observe(restored::add).close()
-            val restoredReport = (restored.single() as RunState.Terminal).report
+            val restoredTerminal = restored.single() as RunState.Terminal
+            val restoredReport = restoredTerminal.report
+            assertEquals(dryRun, restoredTerminal.dryRun)
             assertEquals(status, restoredReport.status)
             assertEquals(report.scanned, restoredReport.scanned)
             assertEquals(report.optimized, restoredReport.optimized)
@@ -143,14 +154,158 @@ class RunStateRepositoryTest {
     }
 
     @Test
+    fun structurallyValidJsonWithUnknownOrWrongTypedReportDataIsRejectedWhole() {
+        val validStorage = RecordingRunStateStorage()
+        RunStateRepository(validStorage).publish(
+            RunState.Terminal(
+                OptimizationReport(
+                    scanned = 5,
+                    status = RunStatus.COMPLETED,
+                    skipsByReason = mapOf(SkipReason.NO_GAIN to 1)
+                ),
+                dryRun = false
+            )
+        )
+        val valid = checkNotNull(validStorage.value)
+        val invalidDocuments = listOf(
+            valid.replaceFirst(Regex("""(\"status\"\s*:\s*\")[^\"]*(\")""")) { match ->
+                "${match.groupValues[1]}FUTURE_STATUS${match.groupValues[2]}"
+            },
+            valid.replace(Regex("""(\"scanned\"\s*:\s*)5""")) { match ->
+                "${match.groupValues[1]}\"five\""
+            },
+            valid.replace(Regex("""(\"skipsByReason\"\s*:\s*)\{[^{}]*}""")) { match ->
+                "${match.groupValues[1]}[]"
+            },
+            valid.replaceFirst(
+                Regex("""(\"skipsByReason\"\s*:\s*\{\s*\")[^\"]*(\")""")
+            ) { match ->
+                "${match.groupValues[1]}FUTURE_SKIP_REASON${match.groupValues[2]}"
+            }
+        )
+        invalidDocuments.forEach { invalid ->
+            assertNotEquals(valid, invalid)
+            val observed = mutableListOf<RunState>()
+
+            RunStateRepository(RecordingRunStateStorage(invalid)).observe(observed::add).close()
+
+            assertEquals(listOf(RunState.Idle), observed)
+        }
+    }
+
+    @Test
+    fun independentSubscriptionsAreThreadSafeIdempotentAndStopBeforeLaterPublications() {
+        val repository = RunStateRepository(RecordingRunStateStorage())
+        val firstStates = Collections.synchronizedList(mutableListOf<RunState>())
+        val secondStates = Collections.synchronizedList(mutableListOf<RunState>())
+        val firstSubscription = AtomicReference<AutoCloseable>()
+        val replayThread = AtomicReference<Thread>()
+        val observed = CountDownLatch(1)
+        val observerThread = Thread {
+            firstSubscription.set(repository.observe { state ->
+                firstStates += state
+                if (state == RunState.Idle) replayThread.set(Thread.currentThread())
+            })
+            observed.countDown()
+        }
+        observerThread.start()
+        assertTrue(observed.await(2, TimeUnit.SECONDS))
+        observerThread.join(2_000)
+        assertEquals(observerThread, replayThread.get())
+        val secondSubscription = repository.observe(secondStates::add)
+
+        val publisherThread = Thread {
+            repository.publish(
+                RunState.Running(ProgressSnapshot(phase = "optimizing"), dryRun = false)
+            )
+        }
+        publisherThread.start()
+        publisherThread.join(2_000)
+        assertFalse(publisherThread.isAlive)
+
+        val closed = CountDownLatch(1)
+        val closeThread = Thread {
+            firstSubscription.get().close()
+            firstSubscription.get().close()
+            closed.countDown()
+        }
+        closeThread.start()
+        assertTrue(closed.await(2, TimeUnit.SECONDS))
+        closeThread.join(2_000)
+        repository.publish(
+            RunState.Terminal(OptimizationReport(status = RunStatus.COMPLETED), dryRun = false)
+        )
+        secondSubscription.close()
+
+        assertEquals(listOf(RunState.Idle::class, RunState.Running::class), firstStates.map { it::class })
+        assertEquals(
+            listOf(RunState.Idle::class, RunState.Running::class, RunState.Terminal::class),
+            secondStates.map { it::class }
+        )
+    }
+
+    @Test
+    fun listenersRunSynchronouslyOutsideLocksCanCloseThemselvesAndCannotBlockPeersWithFailures() {
+        val repository = RunStateRepository(RecordingRunStateStorage())
+        val subscription = AtomicReference<AutoCloseable>()
+        val closeCompletedInsideCallback = AtomicBoolean(false)
+        val selfClosedListenerSawTerminal = AtomicBoolean(false)
+        val closeThread = AtomicReference<Thread>()
+        val callbackThread = AtomicReference<Thread>()
+        subscription.set(repository.observe { state ->
+            if (state is RunState.Running) {
+                callbackThread.set(Thread.currentThread())
+                val closed = CountDownLatch(1)
+                closeThread.set(Thread {
+                    repository.observe { }.close()
+                    closed.countDown()
+                }.apply { start() })
+                closeCompletedInsideCallback.set(closed.await(2, TimeUnit.SECONDS))
+                subscription.get().close()
+            }
+            if (state is RunState.Terminal) selfClosedListenerSawTerminal.set(true)
+        })
+        repository.observe { state ->
+            if (state is RunState.Terminal) throw IllegalStateException("listener failure")
+        }
+        val healthyTerminal = CountDownLatch(1)
+        repository.observe { state -> if (state is RunState.Terminal) healthyTerminal.countDown() }
+        val publisherFailure = AtomicReference<Throwable?>()
+        val publishingThread = Thread {
+            try {
+                repository.publish(
+                    RunState.Running(ProgressSnapshot(phase = "optimizing"), dryRun = false)
+                )
+                repository.publish(
+                    RunState.Terminal(OptimizationReport(status = RunStatus.COMPLETED), dryRun = false)
+                )
+            } catch (failure: Throwable) {
+                publisherFailure.set(failure)
+            }
+        }
+
+        publishingThread.start()
+        publishingThread.join(3_000)
+        closeThread.get()?.join(2_000)
+
+        assertFalse(publishingThread.isAlive)
+        assertTrue(closeCompletedInsideCallback.get())
+        assertFalse(selfClosedListenerSawTerminal.get())
+        assertEquals(publishingThread, callbackThread.get())
+        assertTrue(healthyTerminal.await(2, TimeUnit.SECONDS))
+        assertNull(publisherFailure.get())
+    }
+
+    @Test
     fun terminalStateRejectsRunningReport() {
         assertThrows(IllegalArgumentException::class.java) {
-            RunState.Terminal(OptimizationReport(status = RunStatus.RUNNING))
+            RunState.Terminal(OptimizationReport(status = RunStatus.RUNNING), dryRun = false)
         }
     }
 
     private class RecordingRunStateStorage(initialValue: String? = null) : RunStateStorage {
-        private var value: String? = initialValue
+        var value: String? = initialValue
+            private set
         val writes = mutableListOf<String>()
 
         override fun read(): String? = value

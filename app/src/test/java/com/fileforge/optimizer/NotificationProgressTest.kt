@@ -22,7 +22,7 @@ class NotificationProgressTest {
 
         assertEquals("Analyzing files", spec.title)
         assertTrue(spec.text.contains("potential", ignoreCase = true))
-        assertTrue(spec.hasCancelAction)
+        assertEquals(1, spec.actions.size)
     }
 
     @Test
@@ -41,7 +41,7 @@ class NotificationProgressTest {
 
         assertEquals("Optimizing files", spec.title)
         assertTrue(spec.text.contains("saved", ignoreCase = true))
-        assertTrue(spec.hasCancelAction)
+        assertEquals(1, spec.actions.size)
     }
 
     @Test
@@ -66,8 +66,14 @@ class NotificationProgressTest {
     }
 
     @Test
-    fun terminalNotificationNeverOffersCancelOrRunningProgress() {
-        RunStatus.entries.filter { it != RunStatus.RUNNING }.forEach { status ->
+    fun everyTerminalStatusHasMeaningfulSummaryAndNeverOffersCancelOrRunningProgress() {
+        val statusTokens = mapOf(
+            RunStatus.COMPLETED to "complete",
+            RunStatus.COMPLETED_WITH_ERRORS to "error",
+            RunStatus.CANCELLED to "cancel",
+            RunStatus.FAILED to "fail"
+        )
+        statusTokens.forEach { (status, statusToken) ->
             val spec = OptimizationNotification.render(
                 RunState.Terminal(
                     OptimizationReport(
@@ -75,11 +81,18 @@ class NotificationProgressTest {
                         optimized = 4,
                         savedBytes = 8_192,
                         status = status
-                    )
+                    ),
+                    dryRun = false
                 )
             )
 
-            assertFalse("status=$status", spec.hasCancelAction)
+            assertTrue(
+                "status=$status",
+                "${spec.title} ${spec.text}".contains(statusToken, ignoreCase = true)
+            )
+            assertTrue("status=$status", spec.text.contains("10"))
+            assertTrue("status=$status", spec.text.contains("saved", ignoreCase = true))
+            assertTrue("status=$status", spec.actions.isEmpty())
             assertFalse("status=$status", spec.isIndeterminate)
             assertNull(spec.progressMax)
             assertNull(spec.progressCurrent)
@@ -87,10 +100,28 @@ class NotificationProgressTest {
     }
 
     @Test
+    fun dryRunTerminalReportsPotentialSavingsWithoutClaimingSavedWrites() {
+        val spec = OptimizationNotification.render(
+            RunState.Terminal(
+                OptimizationReport(
+                    scanned = 6,
+                    candidates = 2,
+                    potentialSavingsBytes = 4_096,
+                    status = RunStatus.COMPLETED
+                ),
+                dryRun = true
+            )
+        )
+
+        assertTrue(spec.text.contains("potential", ignoreCase = true))
+        assertFalse(spec.text.contains("saved", ignoreCase = true))
+    }
+
+    @Test
     fun notificationUsesStableChannelAndNotificationIdentifiers() {
         val running = OptimizationNotification.render(running(totalWork = null, filesProcessed = 0))
         val terminal = OptimizationNotification.render(
-            RunState.Terminal(OptimizationReport(status = RunStatus.COMPLETED))
+            RunState.Terminal(OptimizationReport(status = RunStatus.COMPLETED), dryRun = false)
         )
 
         assertEquals("fileforge_optimization", OptimizationNotification.CHANNEL_ID)
@@ -103,8 +134,29 @@ class NotificationProgressTest {
     }
 
     @Test
+    fun channelIsLowAndSilentAndRunningHasOneSafeServiceCancelAction() {
+        val channel = OptimizationNotification.channelSpec
+        val running = OptimizationNotification.render(running(totalWork = null, filesProcessed = 0))
+        val terminal = OptimizationNotification.render(
+            RunState.Terminal(OptimizationReport(status = RunStatus.CANCELLED), dryRun = false)
+        )
+
+        assertEquals(OptimizationNotification.CHANNEL_ID, channel.id)
+        assertEquals(OptimizationNotification.CHANNEL_NAME, channel.name)
+        assertEquals(ChannelImportance.LOW, channel.importance)
+        assertFalse(channel.hasSound)
+        val cancel = running.actions.single()
+        assertEquals("Cancel", cancel.title)
+        assertEquals("com.fileforge.optimizer.action.CANCEL", OptimizationServiceActions.ACTION_CANCEL)
+        assertEquals(OptimizationServiceActions.ACTION_CANCEL, cancel.serviceAction)
+        assertTrue(cancel.isImmutable)
+        assertTrue(cancel.updateCurrent)
+        assertTrue(terminal.actions.isEmpty())
+    }
+
+    @Test
     fun runningUpdatesAreLimitedToFourPerSecondWhileTerminalAlwaysDelivers() {
-        val clock = RecordingMonotonicClock(nowMillis = 1_000)
+        val clock = RecordingMonotonicClock(nowMillis = 0)
         val throttle = NotificationUpdateThrottle(clock)
         val running = running(totalWork = null, filesProcessed = 0)
 
@@ -115,7 +167,10 @@ class NotificationProgressTest {
         assertTrue(throttle.shouldDeliver(running))
         assertFalse(throttle.shouldDeliver(running))
 
-        val terminal = RunState.Terminal(OptimizationReport(status = RunStatus.COMPLETED))
+        val terminal = RunState.Terminal(
+            OptimizationReport(status = RunStatus.COMPLETED),
+            dryRun = false
+        )
         assertTrue(throttle.shouldDeliver(terminal))
         assertTrue(throttle.shouldDeliver(terminal))
     }
