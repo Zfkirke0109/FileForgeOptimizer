@@ -85,7 +85,7 @@ class OptimizeUiStateProjectorTest {
         assertTrue(projection.progressIndeterminate)
         assertNull(projection.progressMax)
         assertNull(projection.progressCurrent)
-        assertEquals(4_096, projection.potentialSavingsBytes)
+        assertEquals(4_096L, projection.potentialSavingsBytes)
     }
 
     @Test
