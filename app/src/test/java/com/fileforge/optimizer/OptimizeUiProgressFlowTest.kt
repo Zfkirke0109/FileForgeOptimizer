@@ -146,6 +146,63 @@ class OptimizeUiProgressFlowTest {
     }
 
     @Test
+    fun rebindReplayOfSameStaleTerminalDoesNotReleasePendingDispatch() {
+        val gate = OptimizeStartDispatchGate()
+        val staleTerminal = RunState.Terminal(
+            OptimizationReport(
+                scanned = 4,
+                status = RunStatus.COMPLETED
+            ),
+            dryRun = false
+        )
+        gate.onObservedState(staleTerminal, sequence = 1)
+        assertTrue(gate.beginDispatch(observationWatermark = 1))
+
+        gate.awaitReplay()
+        gate.onObservedState(
+            RunState.Terminal(staleTerminal.report, dryRun = false),
+            sequence = 2
+        )
+
+        assertTrue(gate.isReplayReady)
+        assertTrue(gate.isPending)
+        gate.onObservedState(
+            RunState.Running(ProgressSnapshot(phase = "optimizing"), dryRun = false),
+            sequence = 3
+        )
+        assertFalse(gate.isPending)
+    }
+
+    @Test
+    fun changedSetupFailureTerminalAfterStaleRebindReplayReleasesDispatch() {
+        val gate = OptimizeStartDispatchGate()
+        val staleTerminal = RunState.Terminal(
+            OptimizationReport(status = RunStatus.COMPLETED),
+            dryRun = false
+        )
+        gate.onObservedState(staleTerminal, sequence = 1)
+        assertTrue(gate.beginDispatch(observationWatermark = 1))
+        gate.awaitReplay()
+        gate.onObservedState(
+            RunState.Terminal(staleTerminal.report, dryRun = false),
+            sequence = 2
+        )
+
+        gate.onObservedState(
+            RunState.Terminal(
+                OptimizationReport(
+                    status = RunStatus.FAILED,
+                    terminalError = "foreground entry failed"
+                ),
+                dryRun = false
+            ),
+            sequence = 3
+        )
+
+        assertFalse(gate.isPending)
+    }
+
+    @Test
     fun runStateObservationSequencerNumbersSubmissionOrderAndExposesWatermark() {
         val sequencer = RunStateObservationSequencer()
 
