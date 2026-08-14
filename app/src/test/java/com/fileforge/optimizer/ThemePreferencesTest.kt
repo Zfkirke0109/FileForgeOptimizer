@@ -74,6 +74,44 @@ class ThemePreferencesTest {
         }
     }
 
+    @Test
+    fun liveSelectionPersistsAndAppliesButExplicitlyRecreatesOnlyBetweenDarkAndAmoled() {
+        val expectedApplications = mapOf(
+            ThemeMode.SYSTEM to ThemeApplication(ThemeNightMode.FOLLOW_SYSTEM, amoledOverlay = false),
+            ThemeMode.LIGHT to ThemeApplication(ThemeNightMode.FORCE_LIGHT, amoledOverlay = false),
+            ThemeMode.DARK to ThemeApplication(ThemeNightMode.FORCE_DARK, amoledOverlay = false),
+            ThemeMode.AMOLED to ThemeApplication(ThemeNightMode.FORCE_DARK, amoledOverlay = true)
+        )
+
+        ThemeMode.entries.forEach { previous ->
+            ThemeMode.entries.forEach { selected ->
+                val storage = RecordingThemeModeStorage()
+                ThemePreferences(storage, RecordingThemeRuntime()).save(previous)
+                val runtime = RecordingThemeRuntime()
+                val preferences = ThemePreferences(storage, runtime)
+
+                preferences.select(selected)
+
+                val restartedPreferences = ThemePreferences(storage, RecordingThemeRuntime())
+                assertEquals("persisted $previous -> $selected", selected, restartedPreferences.read())
+                assertEquals(
+                    "applied $previous -> $selected",
+                    listOf(expectedApplications.getValue(selected)),
+                    runtime.applications
+                )
+                val expectedRecreations = if (
+                    (previous == ThemeMode.DARK && selected == ThemeMode.AMOLED) ||
+                    (previous == ThemeMode.AMOLED && selected == ThemeMode.DARK)
+                ) 1 else 0
+                assertEquals(
+                    "explicit recreation $previous -> $selected",
+                    expectedRecreations,
+                    runtime.recreationRequests
+                )
+            }
+        }
+    }
+
     private class RecordingThemeModeStorage(initialValue: String? = null) : ThemeModeStorage {
         var value: String? = initialValue
 
@@ -86,9 +124,14 @@ class ThemePreferencesTest {
 
     private class RecordingThemeRuntime : ThemeRuntime {
         val applications = mutableListOf<ThemeApplication>()
+        var recreationRequests = 0
 
         override fun apply(nightMode: ThemeNightMode, amoledOverlay: Boolean) {
             applications += ThemeApplication(nightMode, amoledOverlay)
+        }
+
+        override fun requestRecreation() {
+            recreationRequests++
         }
     }
 
