@@ -12,6 +12,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class RunStateRepositoryTest {
@@ -358,6 +359,37 @@ class RunStateRepositoryTest {
         assertFalse(observeThread.isAlive)
         assertNull(observeFailure.get())
         assertEquals(listOf("idle", "running:1"), observed)
+    }
+
+    @Test
+    fun vmFatalImmediateReplayRemovesUnreachableSubscriptionBeforeRethrowing() {
+        val repository = RunStateRepository(RecordingRunStateStorage())
+        val syntheticFatal = OutOfMemoryError("synthetic replay fatal")
+        val failedListenerCalls = AtomicInteger()
+
+        val propagated = assertThrows(OutOfMemoryError::class.java) {
+            repository.observe {
+                failedListenerCalls.incrementAndGet()
+                throw syntheticFatal
+            }
+        }
+
+        assertSame(syntheticFatal, propagated)
+        assertEquals(1, failedListenerCalls.get())
+        val healthyReceivedRunning = AtomicBoolean(false)
+        val healthySubscription = repository.observe { state ->
+            if (state is RunState.Running && state.snapshot.filesProcessed == 1) {
+                healthyReceivedRunning.set(true)
+            }
+        }
+        val publishFailure = runCatching {
+            repository.publish(runningState(sequence = 1))
+        }.exceptionOrNull()
+        healthySubscription.close()
+
+        assertNull(publishFailure)
+        assertEquals(1, failedListenerCalls.get())
+        assertTrue(healthyReceivedRunning.get())
     }
 
     @Test
