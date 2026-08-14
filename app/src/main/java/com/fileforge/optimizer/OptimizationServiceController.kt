@@ -98,7 +98,7 @@ object OptimizationServiceRequestCodec {
         val serialized = extras[OptimizationServiceContract.EXTRA_RUN_INTENT] as? String
             ?: return null
         val value = parseObject(serialized) ?: return null
-        if (value.keySet() != RUN_INTENT_KEYS) return null
+        if (value.strictKeySet() != RUN_INTENT_KEYS) return null
         val modeName = value.strictString("mode") ?: return null
         val mode = OptimizeMode.entries.firstOrNull { it.name == modeName } ?: return null
         return ServiceRunRequest.Optimize(
@@ -124,11 +124,11 @@ object OptimizationServiceRequestCodec {
         val value = parseObject(serialized) ?: return null
         val selection = when (value.strictString("kind")) {
             SELECTION_ALL -> {
-                if (value.keySet() != ALL_SELECTION_KEYS) return null
+                if (value.strictKeySet() != ALL_SELECTION_KEYS) return null
                 RestoreSelection.All
             }
             SELECTION_ENTRIES -> {
-                if (value.keySet() != ENTRY_SELECTION_KEYS) return null
+                if (value.strictKeySet() != ENTRY_SELECTION_KEYS) return null
                 val encodedPaths = value.opt("relativePaths") as? JSONArray ?: return null
                 val paths = linkedSetOf<String>()
                 for (index in 0 until encodedPaths.length()) {
@@ -166,6 +166,10 @@ object OptimizationServiceRequestCodec {
 
     private fun JSONObject.strictString(name: String): String? = opt(name) as? String
     private fun JSONObject.strictBoolean(name: String): Boolean? = opt(name) as? Boolean
+    private fun JSONObject.strictKeySet(): Set<String> = buildSet {
+        val iterator = keys()
+        while (iterator.hasNext()) add(iterator.next())
+    }
 
     private val OPTIMIZE_EXTRA_KEYS = setOf(
         OptimizationServiceContract.EXTRA_TREE_URI,

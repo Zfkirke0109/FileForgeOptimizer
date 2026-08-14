@@ -622,6 +622,73 @@ class OptimizationServiceControllerTest {
     }
 
     @Test
+    fun api35TimeoutStopsBeforeItsOwnTerminalObserverReturnsAndRetainsTerminalNotification() {
+        val fixture = Fixture(recordPersistenceEvents = true)
+        val terminalDeliveryEntered = CountDownLatch(1)
+        val releaseTerminalDelivery = CountDownLatch(1)
+        val terminalDeliveryCompleted = CountDownLatch(1)
+        val observed = Collections.synchronizedList(mutableListOf<RunState>())
+        fixture.controller.binding.addListener { state ->
+            observed += state
+            if (state is RunState.Terminal) {
+                terminalDeliveryEntered.countDown()
+                releaseTerminalDelivery.await(3, TimeUnit.SECONDS)
+                terminalDeliveryCompleted.countDown()
+            }
+        }
+        fixture.controller.onStartCommand(optimizeRequest())
+        val timeoutReturned = CountDownLatch(1)
+        val timeoutFailure = AtomicReference<Throwable?>()
+        val timeoutThread = Thread {
+            try {
+                fixture.controller.onTimeout()
+            } catch (failure: Throwable) {
+                timeoutFailure.set(failure)
+            } finally {
+                timeoutReturned.countDown()
+            }
+        }.apply { isDaemon = true }
+        timeoutThread.start()
+
+        assertTrue("terminal delivery did not start", terminalDeliveryEntered.await(2, TimeUnit.SECONDS))
+        val returnedPromptly = timeoutReturned.await(1, TimeUnit.SECONDS)
+        try {
+            assertTrue("timeout waited for its terminal observer", returnedPromptly)
+            assertNull(timeoutFailure.get())
+            assertEquals(
+                RunStatus.CANCELLED,
+                (fixture.repository.currentState as RunState.Terminal).report.status
+            )
+            assertEquals(1, fixture.storage.writes.size)
+            assertTrue(fixture.events.indexOf("persist") < fixture.events.indexOf("stop"))
+            assertEquals(1, fixture.events.count { it == "stop" })
+            assertEquals(1, fixture.runtime.timeoutTerminalNotifications.size)
+            assertTrue(
+                fixture.events.indexOf("timeout-notification") < fixture.events.indexOf("stop")
+            )
+            assertActionableTimeout(fixture.runtime.timeoutTerminalNotifications.single())
+
+            // Service destruction may close the observer while its independent delivery unwinds;
+            // the already-rendered terminal notification must remain authoritative.
+            fixture.controller.close()
+            assertEquals(1, fixture.runtime.timeoutTerminalNotifications.size)
+        } finally {
+            releaseTerminalDelivery.countDown()
+        }
+
+        assertTrue(terminalDeliveryCompleted.await(2, TimeUnit.SECONDS))
+        timeoutThread.join(2_000)
+        fixture.runtime.timeoutDeliveryThread.get()?.join(2_000)
+        fixture.runtime.runNext()
+
+        assertFalse(timeoutThread.isAlive)
+        assertNull(fixture.runtime.timeoutDeliveryFailure.get())
+        assertEquals(1, observed.count { it is RunState.Terminal })
+        assertEquals(1, fixture.runtime.timeoutTerminalNotifications.size)
+        assertEquals(1, fixture.events.count { it == "stop" })
+    }
+
+    @Test
     fun api35TimeoutWithoutActiveRunIsNoOp() {
         val fixture = Fixture()
         val observed = mutableListOf<RunState>()
@@ -711,6 +778,31 @@ class OptimizationServiceControllerTest {
 
         override fun stopForegroundAndSelf() {
             events += "stop"
+        }
+
+        val timeoutTerminalNotifications = Collections.synchronizedList(
+            mutableListOf<RunState.Terminal>()
+        )
+        val timeoutDeliveryThread = AtomicReference<Thread?>()
+        val timeoutDeliveryFailure = AtomicReference<Throwable?>()
+
+        override fun deliverTimeoutTerminal(
+            terminal: RunState.Terminal,
+            deliverObservers: () -> Unit
+        ) {
+            timeoutTerminalNotifications += terminal
+            events += "timeout-notification"
+            Thread {
+                try {
+                    deliverObservers()
+                } catch (failure: Throwable) {
+                    timeoutDeliveryFailure.set(failure)
+                }
+            }.apply {
+                isDaemon = true
+                timeoutDeliveryThread.set(this)
+                start()
+            }
         }
 
         fun runNext() {

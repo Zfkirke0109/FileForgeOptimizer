@@ -165,6 +165,61 @@ class RunStateRepositoryTest {
     }
 
     @Test
+    fun legacyVersionOneTerminalDefaultsToOptimizeWhileNewWritesUseVersionTwoOperationKind() {
+        val legacyVersionOne = """{
+            "version":1,
+            "dryRun":false,
+            "report":{
+                "scanned":5,
+                "optimized":2,
+                "skipped":2,
+                "errors":1,
+                "savedBytes":2048,
+                "candidates":3,
+                "potentialSavingsBytes":3072,
+                "bytesRead":8192,
+                "bytesWritten":6144,
+                "status":"COMPLETED_WITH_ERRORS",
+                "skipsByReason":{"NO_GAIN":2},
+                "terminalError":null,
+                "terminalFailures":["legacy receipt warning"],
+                "rollbackFailure":null
+            }
+        }""".trimIndent()
+        val restoredLegacy = mutableListOf<RunState>()
+
+        RunStateRepository(RecordingRunStateStorage(legacyVersionOne))
+            .observe(restoredLegacy::add)
+            .close()
+
+        val legacyTerminal = restoredLegacy.single() as RunState.Terminal
+        assertEquals(RunOperationKind.OPTIMIZE, legacyTerminal.operationKind)
+        assertEquals(RunStatus.COMPLETED_WITH_ERRORS, legacyTerminal.report.status)
+        assertEquals(5, legacyTerminal.report.scanned)
+        assertEquals(listOf("legacy receipt warning"), legacyTerminal.report.terminalFailures)
+
+        val versionTwoStorage = RecordingRunStateStorage()
+        RunStateRepository(versionTwoStorage).publish(
+            RunState.Terminal(
+                OptimizationReport(scanned = 2, optimized = 2, status = RunStatus.COMPLETED),
+                dryRun = false,
+                operationKind = RunOperationKind.RESTORE
+            )
+        )
+        val encodedVersionTwo = checkNotNull(versionTwoStorage.value)
+        assertTrue(encodedVersionTwo.contains("\"version\":2"))
+        assertTrue(encodedVersionTwo.contains("\"operationKind\":\"RESTORE\""))
+        val restoredVersionTwo = mutableListOf<RunState>()
+        RunStateRepository(RecordingRunStateStorage(encodedVersionTwo))
+            .observe(restoredVersionTwo::add)
+            .close()
+        assertEquals(
+            RunOperationKind.RESTORE,
+            (restoredVersionTwo.single() as RunState.Terminal).operationKind
+        )
+    }
+
+    @Test
     fun missingInvalidOrNonTerminalStoredJsonFallsBackToIdle() {
         listOf<String?>(
             null,
