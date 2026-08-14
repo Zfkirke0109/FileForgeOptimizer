@@ -324,6 +324,63 @@ class OptimizeUiProgressFlowTest {
     }
 
     @Test
+    fun serviceFinishAfterEquivalentReplayReleasesOwnershipAndNotifiesVisibleUi() {
+        val ownership = OptimizeDispatchOwnership()
+        var completionNotifications = 0
+        val subscription = ownership.observeServiceFinished {
+            completionNotifications += 1
+        }
+        val terminal = RunState.Terminal(
+            OptimizationReport(
+                status = RunStatus.FAILED,
+                terminalError = "foreground entry failed"
+            ),
+            dryRun = false
+        )
+        val original = OptimizeStartDispatchGate(ownership)
+        original.onObservedState(terminal, sequence = 1)
+        assertTrue(original.beginDispatch(observationWatermark = 1))
+        val serviceClaim = requireNotNull(ownership.current())
+
+        val recreated = OptimizeStartDispatchGate(ownership)
+        recreated.awaitReplay()
+        recreated.onObservedState(terminal, sequence = 2)
+        assertTrue(recreated.isPending)
+
+        ownership.onServiceFinished(serviceClaim)
+
+        assertFalse(recreated.isPending)
+        assertTrue(recreated.allowsStart(baseStartEnabled = true))
+        assertEquals(1, completionNotifications)
+        subscription.close()
+    }
+
+    @Test
+    fun lateFinishFromPreviousServiceCannotReleaseNewerDispatchClaim() {
+        val ownership = OptimizeDispatchOwnership()
+        val gate = OptimizeStartDispatchGate(ownership)
+        val terminal = RunState.Terminal(
+            OptimizationReport(status = RunStatus.COMPLETED),
+            dryRun = false
+        )
+        gate.onObservedState(terminal, sequence = 1)
+        assertTrue(gate.beginDispatch(observationWatermark = 1))
+        val previousServiceClaim = requireNotNull(ownership.current())
+        gate.onObservedState(
+            RunState.Running(ProgressSnapshot(phase = "optimizing"), dryRun = false),
+            sequence = 2
+        )
+        gate.onObservedState(terminal, sequence = 3)
+        assertTrue(gate.beginDispatch(observationWatermark = 3))
+        val newerClaim = requireNotNull(ownership.current())
+
+        ownership.onServiceFinished(previousServiceClaim)
+
+        assertEquals(newerClaim, ownership.current())
+        assertTrue(gate.isPending)
+    }
+
+    @Test
     fun synchronousDispatchFailureClearsProcessOwnershipForNextController() {
         val ownership = OptimizeDispatchOwnership()
         val original = OptimizeStartDispatchGate(ownership)
