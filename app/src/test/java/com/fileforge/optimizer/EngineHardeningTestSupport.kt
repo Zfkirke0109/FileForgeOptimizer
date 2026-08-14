@@ -8,7 +8,7 @@ import java.io.OutputStream
 import java.io.Writer
 import java.util.concurrent.CountDownLatch
 
-internal enum class UndoFault { WRITE, FLUSH, CLOSE_AFTER_FLUSH }
+internal enum class UndoFault { WRITE, MID_LINE_WRITE, FLUSH, FLUSH_AFTER_DELEGATE, CLOSE_AFTER_FLUSH }
 
 internal open class FaultInjectingEngineGateway : DocumentGateway {
     val root = DocumentNode("root", "selected", isDirectory = true, length = 0)
@@ -18,6 +18,11 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
     var exactCreationFault: ExactCreationFault? = null
     var blockFirstList: CountDownLatch? = null
     var firstListEntered: CountDownLatch? = null
+    var listFailure: Throwable? = null
+    var readFailure: Throwable? = null
+    var finalizeFailure: AssertionError? = null
+    var undoWritesAfterPoison = 0
+    var undoCloses = 0
 
     protected val nodes = linkedMapOf(root.id to root)
     protected val children = linkedMapOf(root.id to linkedMapOf<String, String>())
@@ -60,6 +65,7 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
 
     override fun openRead(node: DocumentNode): InputStream {
         readPaths += path(node)
+        readFailure?.let { throw it }
         return ByteArrayInputStream(bytes[node.id] ?: throw IOException("Not a file: ${node.id}"))
     }
 
@@ -70,30 +76,46 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
         return object : OutputStream() {
             private var flushes = 0
             private var flushFailed = false
+            private var poisoned = false
             override fun write(value: Int) {
-                if (undo && undoFault == UndoFault.WRITE && flushes >= 1) throw IOException("undo append write failed")
-                output.write(value)
+                write(byteArrayOf(value.toByte()), 0, 1)
             }
             override fun write(source: ByteArray, offset: Int, length: Int) {
+                if (undo && poisoned) undoWritesAfterPoison++
                 if (undo && undoFault == UndoFault.WRITE && flushes >= 1) throw IOException("undo append write failed")
+                if (undo && undoFault == UndoFault.MID_LINE_WRITE && flushes >= 1) {
+                    val prefix = maxOf(1, length / 3)
+                    output.write(source, offset, prefix)
+                    persist(node, output)
+                    poisoned = true
+                    throw IOException("undo append failed after a durable line prefix")
+                }
                 output.write(source, offset, length)
             }
             override fun flush() {
                 flushes++
                 if (undo && undoFault == UndoFault.FLUSH && flushes >= 2) {
                     flushFailed = true
+                    poisoned = true
                     throw IOException("undo append flush failed")
                 }
                 persist(node, output)
+                if (undo && undoFault == UndoFault.FLUSH_AFTER_DELEGATE && flushes >= 2) {
+                    poisoned = true
+                    throw IOException("undo append failed after delegate flush")
+                }
             }
             override fun close() {
+                if (undo) undoCloses++
                 if (!flushFailed) persist(node, output)
                 if (undo && undoFault == UndoFault.CLOSE_AFTER_FLUSH) throw IOException("undo close failed after flush")
+                finalizeFailure?.let { throw it }
             }
         }
     }
 
     open override fun list(node: DocumentNode): List<DocumentNode> {
+        listFailure?.let { throw it }
         if (node == root && blockFirstList != null) {
             firstListEntered?.countDown()
             blockFirstList?.await()

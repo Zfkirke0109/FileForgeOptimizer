@@ -19,6 +19,88 @@ import java.util.zip.ZipOutputStream
 
 class OptimizerEngineTransactionHardeningTest {
     @Test
+    fun poisonedUndoWriteOrAmbiguousFlushAbortsBeforeSecondFileAndNeverFinalizesWriter() {
+        listOf(UndoFault.MID_LINE_WRITE, UndoFault.FLUSH_AFTER_DELEGATE).forEach { fault ->
+            withEngine(realRun) { gateway, engine, _ ->
+                gateway.put("a-first.zip", zipFixture)
+                gateway.put("b-second.zip", zipFixture)
+                gateway.undoFault = fault
+
+                val report = engine.run(NeverCancelled) {}
+                val durable = gateway.readDurableUndo()
+
+                assertEquals(RunStatus.FAILED, report.status)
+                assertArrayEquals(zipFixture, gateway.contents("a-first.zip"))
+                assertArrayEquals(zipFixture, gateway.contents("b-second.zip"))
+                assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.zip") })
+                assertTrue(gateway.mutations.none { it == "open-write:b-second.zip" })
+                assertEquals(0, gateway.undoWritesAfterPoison)
+                assertEquals(1, gateway.undoCloses)
+                assertEquals(RunStatus.RUNNING, durable.status)
+                assertEquals(null, durable.terminal)
+            }
+        }
+    }
+
+    @Test
+    fun recoverableAssertionErrorFromListProducesFailedReportAndBestEffortFailedTerminal() = withEngine(realRun) { gateway, engine, _ ->
+        gateway.put("unknown.bin", byteArrayOf(1))
+        gateway.listFailure = AssertionError("provider list assertion")
+
+        val report = engine.run(NeverCancelled) {}
+        val durable = gateway.readDurableUndo()
+
+        assertEquals(RunStatus.FAILED, report.status)
+        assertTrue(report.terminalError!!.contains("provider list assertion"))
+        assertEquals(RunStatus.FAILED, durable.status)
+    }
+
+    @Test
+    fun recoverableAssertionErrorFromReadProducesFailedReportAndBestEffortFailedTerminal() = withEngine(realRun) { gateway, engine, _ ->
+        gateway.put("unknown.bin", byteArrayOf(1))
+        gateway.readFailure = AssertionError("provider read assertion")
+
+        val report = engine.run(NeverCancelled) {}
+        val durable = gateway.readDurableUndo()
+
+        assertEquals(RunStatus.FAILED, report.status)
+        assertTrue(report.terminalError!!.contains("provider read assertion"))
+        assertEquals(RunStatus.FAILED, durable.status)
+    }
+
+    @Test
+    fun finalizationAssertionErrorNeverMasksPrimaryRecoverableError() {
+        val cache = Files.createTempDirectory("fileforge-error-finality").toFile()
+        try {
+            val gateway = TransactionalEngineGateway().apply {
+                put("unknown.bin", byteArrayOf(1))
+                listFailure = AssertionError("primary provider failure")
+                finalizeFailure = AssertionError("secondary close failure")
+            }
+            val engine = OptimizerEngine(
+                documentGateway = gateway,
+                selectedRoot = gateway.root,
+                candidateStore = CandidateStore(cache, "error-run"),
+                runId = "error-run",
+                runIntent = realRun,
+                startedAt = { "start" },
+                completedAt = { throw AssertionError("secondary timestamp failure") },
+                appVersion = "test",
+                buildVariant = "standard-test"
+            )
+
+            val report = engine.run(NeverCancelled) {}
+
+            assertEquals(RunStatus.FAILED, report.status)
+            assertTrue(report.terminalError!!.contains("primary provider failure"))
+            assertTrue(report.terminalFailures.any { it.contains("secondary timestamp failure") })
+            assertTrue(report.terminalFailures.any { it.contains("secondary close failure") })
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
     fun zipUndoWriteOrFlushFailureRollsBackAndNeverCountsUnloggedReplacement() {
         listOf(UndoFault.WRITE, UndoFault.FLUSH).forEach { fault ->
             withEngine(realRun) { gateway, engine, _ ->
