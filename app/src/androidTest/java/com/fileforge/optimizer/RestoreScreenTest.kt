@@ -13,6 +13,7 @@ import androidx.test.espresso.matcher.ViewMatchers.withId
 import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.hamcrest.Matchers.not
+import org.hamcrest.Matchers.containsString
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Before
@@ -135,6 +136,67 @@ class RestoreScreenTest {
                 ),
                 launches
             )
+        }
+    }
+
+    @Test
+    fun restoreShowsLiveProgressAndTerminalSuccessCancellationAndParseFailures() {
+        RestoreScreenTestHooks.install(
+            selectedTree = SelectedTreeCapabilities.READ_WRITE_DIRECTORY,
+            discovery = RestoreDiscoveryResult(
+                restoreFixture().runs,
+                listOf(RestoreDiscoveryFailure("FileForge_Undo_v2_bad.jsonl", "Malformed entry"))
+            )
+        )
+        ActivityScenario.launch(MainActivity::class.java).use {
+            onView(withId(R.id.navigation_restore)).perform(click())
+            onView(withText(containsString("Could not read FileForge_Undo_v2_bad.jsonl"))).check(matches(isDisplayed()))
+            RunStateRepository.forAndroid(context).publish(
+                RunState.Running(
+                    ProgressSnapshot("restoring", "photos/holiday.jpg", filesDiscovered = 2, filesProcessed = 1),
+                    false,
+                    RunOperationKind.RESTORE
+                )
+            )
+            onView(withText("Restoring 1 of 2 • photos/holiday.jpg")).check(matches(isDisplayed()))
+            RunStateRepository.forAndroid(context).publish(
+                RunState.Terminal(OptimizationReport(scanned = 2, optimized = 2, status = RunStatus.COMPLETED), false, RunOperationKind.RESTORE)
+            )
+            onView(withText("Restored 2 of 2 files")).check(matches(isDisplayed()))
+            RunStateRepository.forAndroid(context).publish(
+                RunState.Terminal(OptimizationReport(scanned = 2, optimized = 1, skipped = 1, status = RunStatus.CANCELLED), false, RunOperationKind.RESTORE)
+            )
+            onView(withText("Restore cancelled")).check(matches(isDisplayed()))
+        }
+    }
+
+    @Test
+    fun unreadableAndReadOnlyTreesKeepRestoreDisabled() {
+        listOf(SelectedTreeCapabilities.NONE, SelectedTreeCapabilities.READ_ONLY_DIRECTORY).forEach { tree ->
+            RestoreScreenTestHooks.install(tree, restoreFixture())
+            ActivityScenario.launch(MainActivity::class.java).use {
+                onView(withId(R.id.navigation_restore)).perform(click())
+                onView(withContentDescription("Select photos/holiday.jpg")).perform(click())
+                onView(withId(R.id.restore_selected)).check(matches(not(isEnabled())))
+            }
+        }
+    }
+
+    @Test
+    fun selectAllTargetsTheChosenRunCardInsteadOfAlwaysTheFirstRun() {
+        val second = restoreFixture().runs.single().copy(
+            undoLogId = "FileForge_Undo_v2_second.jsonl",
+            run = restoreFixture().runs.single().run.copy(header = UndoHeader("second", "2026-08-13T20:00:00Z"))
+        )
+        RestoreScreenTestHooks.install(
+            SelectedTreeCapabilities.READ_WRITE_DIRECTORY,
+            RestoreDiscoveryResult(restoreFixture().runs + second, emptyList())
+        )
+        ActivityScenario.launch(MainActivity::class.java).use {
+            onView(withId(R.id.navigation_restore)).perform(click())
+            onView(withContentDescription("Select all from second")).perform(click())
+            onView(withId(R.id.restore_selected)).perform(click())
+            onView(withText("Restore 2 files?")).check(matches(isDisplayed()))
         }
     }
 

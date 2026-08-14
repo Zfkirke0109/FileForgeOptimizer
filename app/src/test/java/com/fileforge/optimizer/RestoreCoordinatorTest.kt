@@ -7,6 +7,27 @@ import org.junit.Test
 
 class RestoreCoordinatorTest {
     @Test
+    fun cancellationKeepsTheSelectedDenominatorAndMarksUnprocessedEntriesWithoutInventingWrites() = withRestore(
+        entries = listOf(entry("docs/a.zip"), entry("docs/b.zip"))
+    ) { gateway, coordinator, _, run ->
+        gateway.put("docs/b.zip", byteArrayOf(7))
+        gateway.put("FileForge_Backups_run-1/docs/b.zip", backupB)
+        val cancellation = CancellationToken {
+            if (gateway.events.any { it == "write-closed:root/docs/a.zip" }) {
+                throw OptimizationCancelledException("stop after first entry")
+            }
+        }
+
+        val report = coordinator.restore(run, RestoreSelection.All, cancellation)
+
+        assertEquals(2, report.selectedCount)
+        assertEquals(1, report.restoredCount)
+        assertEquals(1, report.failedCount)
+        assertEquals(RestoreEntryStatus.UNPROCESSED_CANCELLED, report.entries.last().status)
+        assertFalse(gateway.events.any { it == "write:root/docs/b.zip" })
+    }
+
+    @Test
     fun uppercaseV2UndoHashIsAcceptedAndRestoresAgainstLowercaseIntegrityDigest() = withRestore {
             _, coordinator, _, _ ->
         val uppercaseEntry = entry("docs/a.zip").copy(originalSha256 = backupA.sha256().uppercase())

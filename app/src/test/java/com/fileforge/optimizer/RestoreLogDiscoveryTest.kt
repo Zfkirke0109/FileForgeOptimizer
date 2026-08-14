@@ -4,6 +4,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.InputStream
+import java.io.StringReader
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Guards the Restore destination's read-only, selected-root-only discovery boundary.
@@ -52,6 +56,71 @@ class RestoreLogDiscoveryTest {
             result.failures.map { it.undoLogId }.toSet()
         )
         assertFalse(gateway.events.any { it.startsWith("write:") || it.startsWith("create-file:") || it.startsWith("mkdir:") })
+    }
+
+    @Test
+    fun strictDiscoveryRejectsAnOtherwiseValidV2LogWithOneMalformedRecord() {
+        val gateway = RecordingDocumentGateway().apply {
+            put(
+                "FileForge_Undo_v2_partially-malformed.jsonl",
+                (v2Header("partially-malformed") + "\n" +
+                    "{\"schemaVersion\":2,\"recordType\":\"entry\"}\n" +
+                    v2Log("partially-malformed", "docs/valid.txt", 4, 2).decodeToString()
+                        .substringAfter('\n')).encodeToByteArray()
+            )
+            events.clear()
+        }
+
+        val result = RestoreLogDiscovery(gateway, gateway.root).discover()
+
+        assertTrue(result.runs.isEmpty())
+        assertEquals(listOf("FileForge_Undo_v2_partially-malformed.jsonl"), result.failures.map { it.undoLogId })
+    }
+
+    @Test
+    fun strictStreamingReadHonorsCancellationAndLineCeilingWithoutMaterializingTheWholeLog() {
+        val repository = UndoLogRepository()
+        val cancelled = CancellationToken { throw OptimizationCancelledException("test cancellation") }
+
+        try {
+            repository.readStrictForRestore(StringReader(v2Header("cancelled") + "\n"), cancelled)
+            throw AssertionError("Expected cancellation")
+        } catch (_: OptimizationCancelledException) {
+            // The reader is checked before consuming the first record.
+        }
+        try {
+            repository.readStrictForRestore(StringReader("x".repeat(UndoLogRepository.RESTORE_MAX_LINE_CHARS + 1)))
+            throw AssertionError("Expected an oversized-record rejection")
+        } catch (_: IllegalArgumentException) {
+            // Bounded restore parsing rejects before allocating an unbounded record.
+        }
+    }
+
+    @Test
+    fun closingDiscoveryPromptlyClosesAnActiveRecognizedLogStream() {
+        val delegate = RecordingDocumentGateway()
+        val stream = BlockingInputStream()
+        val log = DocumentNode("blocked", "FileForge_Undo_v2_blocked.jsonl", isDirectory = false, length = 0)
+        val gateway = object : DocumentGateway by delegate {
+            override fun list(node: DocumentNode): List<DocumentNode> = listOf(log)
+            override fun openRead(node: DocumentNode): InputStream = stream
+        }
+        val discovery = RestoreLogDiscovery(gateway, delegate.root)
+        val worker = Thread {
+            try {
+                discovery.discover()
+            } catch (_: OptimizationCancelledException) {
+                // Closing the screen cancels this read rather than waiting for user-controlled bytes.
+            }
+        }
+        worker.start()
+        assertTrue(stream.started.await(1, TimeUnit.SECONDS))
+
+        discovery.close()
+
+        assertTrue("active stream was not closed", stream.closed.await(1, TimeUnit.SECONDS))
+        worker.join(1_000)
+        assertFalse(worker.isAlive)
     }
 
     @Test
@@ -117,4 +186,21 @@ class RestoreLogDiscoveryTest {
 
         $path | $originalBytes | $optimizedBytes | FileForge_Backups_$stamp/$path | legacy backup
     """.trimIndent().plus("\n").encodeToByteArray()
+
+    private class BlockingInputStream : InputStream() {
+        val started = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        private val released = CountDownLatch(1)
+
+        override fun read(): Int {
+            started.countDown()
+            released.await(5, TimeUnit.SECONDS)
+            return -1
+        }
+
+        override fun close() {
+            closed.countDown()
+            released.countDown()
+        }
+    }
 }
