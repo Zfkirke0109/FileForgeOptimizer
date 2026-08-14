@@ -22,6 +22,9 @@ data class RunIntent(
 
 enum class RunStatus { RUNNING, COMPLETED, COMPLETED_WITH_ERRORS, CANCELLED, FAILED }
 
+/** Signals a run-wide provider or orchestration invariant that cannot be isolated to one file. */
+class RunInvariantException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
 enum class SkipReason { UNSUPPORTED, NO_CHANGE, NO_GAIN, APK_GUARD, MEMORY_LIMIT, VERIFICATION_FAILED }
 
 class ProgressSnapshot(
@@ -61,7 +64,8 @@ data class OptimizationReport(
     var bytesRead: Long = 0,
     var bytesWritten: Long = 0,
     var status: RunStatus = RunStatus.RUNNING,
-    var skipsByReason: Map<SkipReason, Int> = emptyMap()
+    var skipsByReason: Map<SkipReason, Int> = emptyMap(),
+    var terminalError: String? = null
 )
 
 enum class FileKind {

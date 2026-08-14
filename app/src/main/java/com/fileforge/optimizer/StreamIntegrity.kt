@@ -1,10 +1,40 @@
 package com.fileforge.optimizer
 
+import java.io.FilterInputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.security.MessageDigest
 
 internal data class StreamIntegrity(val bytes: Long, val sha256: String)
+
+/** Counts and hashes the raw source bytes observed by a streaming processor. */
+internal class IntegrityTrackingInputStream(input: InputStream) : FilterInputStream(input) {
+    private val digest = MessageDigest.getInstance("SHA-256")
+    private var bytes = 0L
+    private var finished: StreamIntegrity? = null
+
+    override fun read(): Int {
+        val value = super.read()
+        if (value >= 0) record(byteArrayOf(value.toByte()), 0, 1)
+        return value
+    }
+
+    override fun read(target: ByteArray, offset: Int, length: Int): Int {
+        val read = super.read(target, offset, length)
+        if (read > 0) record(target, offset, read)
+        return read
+    }
+
+    fun finish(): StreamIntegrity = finished ?: StreamIntegrity(bytes, digest.digest().toHex()).also { finished = it }
+
+    private fun record(source: ByteArray, offset: Int, length: Int) {
+        check(finished == null) { "Source integrity was already finalized" }
+        bytes = StreamIntegrityChecker.checkedAdd(bytes, length)
+        digest.update(source, offset, length)
+    }
+
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+}
 
 /** Shared bounded streaming primitives for SAF reads and writes. */
 internal object StreamIntegrityChecker {

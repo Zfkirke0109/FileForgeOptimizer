@@ -154,33 +154,64 @@ class OptimizationCoordinator(
         runIntent: RunIntent,
         cancellation: CancellationToken
     ): FileOutcome {
-        val oldBytes = documentGateway.length(node)
-        createCandidate().use { candidate ->
-            documentGateway.openRead(node).use { source ->
-                candidate.openOutputStream().use { output ->
-                    zipCandidateProcessor.optimize(source, output, runIntent.mode, cancellation)
-                }
-            }
-
-            cancellation.throwIfCancelled()
-            candidate.openInputStream().use { optimized ->
-                zipCandidateProcessor.verify(optimized, cancellation)
-            }
-            cancellation.throwIfCancelled()
-            val newBytes = candidate.length
-            if (newBytes >= oldBytes) {
-                return FileOutcome.Skipped(relativePath, SkipReason.NO_GAIN)
-            }
-
-            val note = "${STREAMING_ZIP_TOOL}: candidate verified."
-            return if (runIntent.dryRun) {
-                FileOutcome.WouldOptimize(relativePath, oldBytes, newBytes, STREAMING_ZIP_TOOL, note)
+        val candidate = createCandidate()
+        var outcome: FileOutcome? = null
+        var processingFailure: Throwable? = null
+        try {
+            outcome = processZipCandidate(node, relativePath, kind, runIntent, cancellation, candidate)
+        } catch (failure: Throwable) {
+            processingFailure = failure
+        }
+        try {
+            candidate.close()
+        } catch (cleanup: CandidateCleanupException) {
+            val primary = processingFailure
+            if (primary != null) primary.addSuppressed(cleanup)
+            else if (outcome is FileOutcome.Optimized) {
+                val committed = outcome as FileOutcome.Optimized
+                outcome = committed.copy(note = "${committed.note} Candidate cleanup warning: ${cleanup.message}")
             } else {
-                cancellation.throwIfCancelled()
-                commitContext?.let { context ->
-                    commitCandidate(node, relativePath, kind, oldBytes, candidate, context, cancellation)
-                } ?: FileOutcome.Failed(relativePath, "Replacement is unavailable until the backup transaction is installed.")
+                processingFailure = cleanup
             }
+        }
+        processingFailure?.let { throw it }
+        return checkNotNull(outcome)
+    }
+
+    private fun processZipCandidate(
+        node: DocumentNode,
+        relativePath: String,
+        kind: FileKind,
+        runIntent: RunIntent,
+        cancellation: CancellationToken,
+        candidate: CandidateFile
+    ): FileOutcome {
+        val sourceIntegrity = documentGateway.openRead(node).use { source ->
+            val tracked = IntegrityTrackingInputStream(source)
+            candidate.openOutputStream().use { output ->
+                zipCandidateProcessor.optimize(tracked, output, runIntent.mode, cancellation)
+            }
+            tracked.finish()
+        }
+
+        cancellation.throwIfCancelled()
+        candidate.openInputStream().use { optimized ->
+            zipCandidateProcessor.verify(optimized, cancellation)
+        }
+        cancellation.throwIfCancelled()
+        val newBytes = candidate.length
+        if (newBytes >= sourceIntegrity.bytes) {
+            return FileOutcome.Skipped(relativePath, SkipReason.NO_GAIN)
+        }
+
+        val note = "${STREAMING_ZIP_TOOL}: candidate verified."
+        return if (runIntent.dryRun) {
+            FileOutcome.WouldOptimize(relativePath, sourceIntegrity.bytes, newBytes, STREAMING_ZIP_TOOL, note)
+        } else {
+            cancellation.throwIfCancelled()
+            commitContext?.let { context ->
+                commitCandidate(node, relativePath, kind, sourceIntegrity, candidate, context, cancellation)
+            } ?: FileOutcome.Failed(relativePath, "Replacement is unavailable until the backup transaction is installed.")
         }
     }
 
@@ -188,7 +219,7 @@ class OptimizationCoordinator(
         original: DocumentNode,
         relativePath: String,
         kind: FileKind,
-        oldBytes: Long,
+        candidateSource: StreamIntegrity,
         candidate: CandidateFile,
         context: CommitContext,
         cancellation: CancellationToken
@@ -196,7 +227,7 @@ class OptimizationCoordinator(
         var backup: DocumentNode? = null
         var originalIntegrity: StreamIntegrity? = null
         var originalMutationStarted = false
-        var originalVerified = false
+        var transactionDurable = false
         return try {
             val backupPath = backupPath(context.runId, relativePath)
             val backupNode = createBackup(context.selectedRoot, backupPath)
@@ -207,15 +238,15 @@ class OptimizationCoordinator(
             originalIntegrity = originalSnapshot
             val verifiedBackup = documentGateway.openRead(backupNode).use { StreamIntegrityChecker.hash(it, cancellation) }
             check(verifiedBackup == originalSnapshot) { "Backup verification failed" }
-            check(originalSnapshot.bytes == oldBytes) { "Original size changed during backup" }
+            check(originalSnapshot == candidateSource) { "Original changed after candidate generation" }
 
+            cancellation.throwIfCancelled()
             originalMutationStarted = true
             val writtenCandidate = candidate.openInputStream().use { source ->
                 documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, cancellation) }
             }
             val verifiedOriginal = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, cancellation) }
             check(verifiedOriginal == writtenCandidate) { "Optimized document verification failed" }
-            originalVerified = true
 
             context.undoEntrySink.appendAndFlush(
                 UndoEntry(
@@ -231,11 +262,12 @@ class OptimizationCoordinator(
                     completedAt = context.completedAt()
                 )
             )
+            transactionDurable = true
             FileOutcome.Optimized(relativePath, originalSnapshot.bytes, writtenCandidate.bytes, STREAMING_ZIP_TOOL, "${STREAMING_ZIP_TOOL}: candidate verified.")
         } catch (cancelled: OptimizationCancelledException) {
             val rollbackBackup = backup
             val rollbackIntegrity = originalIntegrity
-            if (originalMutationStarted && !originalVerified && rollbackBackup != null && rollbackIntegrity != null) {
+            if (originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null) {
                 val rollback = restoreBackup(original, rollbackBackup, rollbackIntegrity)
                 if (rollback is RollbackResult.Failed) cancelled.addSuppressed(rollback.cause)
             }
@@ -243,7 +275,7 @@ class OptimizationCoordinator(
         } catch (failure: Exception) {
             val rollbackBackup = backup
             val rollbackIntegrity = originalIntegrity
-            val rollback = if (originalMutationStarted && !originalVerified && rollbackBackup != null && rollbackIntegrity != null) {
+            val rollback = if (originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null) {
                 restoreBackup(original, rollbackBackup, rollbackIntegrity)
             } else {
                 RollbackResult.NotNeeded
@@ -275,14 +307,14 @@ class OptimizationCoordinator(
         segments.dropLast(1).forEach { name ->
             val existing = documentGateway.resolve(parent, name)
             parent = when {
-                existing == null -> documentGateway.createDirectory(parent, name)
+                existing == null -> documentGateway.createDirectoryExact(parent, name)
                 existing.isDirectory -> existing
                 else -> throw IllegalStateException("Backup path component is not a directory: $name")
             }
         }
         val name = segments.last()
         check(documentGateway.resolve(parent, name) == null) { "Backup already exists: $backupPath" }
-        return documentGateway.createFile(parent, "application/octet-stream", name)
+        return documentGateway.createFileExact(parent, "application/octet-stream", name)
     }
 
     private fun readHeader(node: DocumentNode, cancellation: CancellationToken): ByteArray {

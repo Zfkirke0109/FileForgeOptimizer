@@ -39,7 +39,26 @@ class SafDocumentGateway(
                 ?: throw IllegalStateException("Cannot create file $name")
         )
 
+    override fun createDirectoryExact(parent: DocumentNode, name: String): DocumentNode {
+        check(resolve(parent, name) == null) { "Document already exists: $name" }
+        return requireExact(parent, name, directory = true, createDirectory(parent, name))
+    }
+
+    override fun createFileExact(parent: DocumentNode, mimeType: String, name: String): DocumentNode {
+        check(resolve(parent, name) == null) { "Document already exists: $name" }
+        return requireExact(parent, name, directory = false, createFile(parent, mimeType, name))
+    }
+
     override fun length(node: DocumentNode): Long = document(node).length()
+
+    private fun requireExact(parent: DocumentNode, name: String, directory: Boolean, created: DocumentNode): DocumentNode {
+        check(created.name == name && created.isDirectory == directory) { "Provider did not create exact document: $name" }
+        val resolved = resolve(parent, name)
+        check(resolved?.id == created.id && resolved.isDirectory == directory) {
+            "Provider-created document is not reachable at its exact name: $name"
+        }
+        return created
+    }
 
     private fun document(node: DocumentNode): DocumentFile =
         documents[node.id] ?: throw IllegalArgumentException("Unknown document node: ${node.id}")

@@ -38,9 +38,6 @@ class ByteArrayOptimizerAdapter(
         cancellation: CancellationToken
     ): FileOutcome {
         require(kind != FileKind.ZIP_LIKE && kind != FileKind.APK) { "ZIP-family input must use strict streaming" }
-        if (documentGateway.length(node) > maxInputBytes) {
-            return FileOutcome.Skipped(relativePath, SkipReason.MEMORY_LIMIT, "Input exceeds the $maxInputBytes-byte in-memory limit.")
-        }
         return try {
             cancellation.throwIfCancelled()
             val original = readBounded(node, cancellation)
@@ -104,7 +101,7 @@ class ByteArrayOptimizerAdapter(
         var backup: DocumentNode? = null
         var originalIntegrity: StreamIntegrity? = null
         var originalMutationStarted = false
-        var originalVerified = false
+        var transactionDurable = false
         return try {
             val expectedOriginal = originalBytes.inputStream().use { StreamIntegrityChecker.hash(it, cancellation) }
             val backupPath = backupPath(context.runId, relativePath)
@@ -129,7 +126,6 @@ class ByteArrayOptimizerAdapter(
             }
             val verifiedOriginal = documentGateway.openRead(originalNode).use { StreamIntegrityChecker.hash(it, cancellation) }
             check(verifiedOriginal == writtenCandidate) { "Optimized document verification failed" }
-            originalVerified = true
 
             context.undoEntrySink.appendAndFlush(
                 UndoEntry(
@@ -145,11 +141,12 @@ class ByteArrayOptimizerAdapter(
                     completedAt = context.completedAt()
                 )
             )
+            transactionDurable = true
             FileOutcome.Optimized(relativePath, expectedOriginal.bytes, writtenCandidate.bytes, TOOL_ID, result.note)
         } catch (cancelled: OptimizationCancelledException) {
             val rollbackBackup = backup
             val rollbackIntegrity = originalIntegrity
-            if (originalMutationStarted && !originalVerified && rollbackBackup != null && rollbackIntegrity != null) {
+            if (originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null) {
                 val rollback = restoreBackup(originalNode, rollbackBackup, rollbackIntegrity)
                 if (rollback is RollbackResult.Failed) cancelled.addSuppressed(rollback.cause)
             }
@@ -157,7 +154,7 @@ class ByteArrayOptimizerAdapter(
         } catch (failure: Exception) {
             val rollbackBackup = backup
             val rollbackIntegrity = originalIntegrity
-            val rollback = if (originalMutationStarted && !originalVerified && rollbackBackup != null && rollbackIntegrity != null) {
+            val rollback = if (originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null) {
                 restoreBackup(originalNode, rollbackBackup, rollbackIntegrity)
             } else {
                 RollbackResult.NotNeeded
@@ -178,14 +175,14 @@ class ByteArrayOptimizerAdapter(
         segments.dropLast(1).forEach { name ->
             val existing = documentGateway.resolve(parent, name)
             parent = when {
-                existing == null -> documentGateway.createDirectory(parent, name)
+                existing == null -> documentGateway.createDirectoryExact(parent, name)
                 existing.isDirectory -> existing
                 else -> throw IOException("Backup path component is not a directory: $name")
             }
         }
         val name = segments.last()
         check(documentGateway.resolve(parent, name) == null) { "Backup already exists: $backupPath" }
-        return documentGateway.createFile(parent, "application/octet-stream", name)
+        return documentGateway.createFileExact(parent, "application/octet-stream", name)
     }
 
     private fun restoreBackup(original: DocumentNode, backup: DocumentNode, expected: StreamIntegrity): RollbackResult = try {

@@ -7,6 +7,7 @@ import java.io.Writer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Android-free orchestration for one selected-tree optimization run. */
 class OptimizerEngine(
@@ -21,6 +22,7 @@ class OptimizerEngine(
     private val buildVariant: String
 ) {
     private val undoRepository = UndoLogRepository()
+    private val runClaimed = AtomicBoolean(false)
     private var compatibilityLogger: ((String) -> Unit)? = null
 
     init {
@@ -77,6 +79,7 @@ class OptimizerEngine(
         cancellation: CancellationToken,
         onProgress: (ProgressSnapshot) -> Unit
     ): OptimizationReport {
+        check(runClaimed.compareAndSet(false, true)) { "An OptimizerEngine instance can run only once" }
         val report = OptimizationReport()
         var filesDiscovered = 0
         var filesProcessed = 0
@@ -98,7 +101,7 @@ class OptimizerEngine(
                         bytesWritten = report.bytesWritten,
                         savedBytes = report.savedBytes,
                         potentialSavingsBytes = report.potentialSavingsBytes,
-                        totalWork = filesDiscovered.takeIf { it > 0 }
+                        totalWork = null
                     )
                 )
             } catch (_: Exception) {
@@ -108,11 +111,6 @@ class OptimizerEngine(
 
         try {
             if (!runIntent.dryRun) undo = openUndoSession()
-            progress(if (runIntent.dryRun) "analyzing" else "discovering")
-            val files = scan(cancellation) {
-                report.errors = checkedIncrement(report.errors)
-            }
-            filesDiscovered = files.size
             progress(if (runIntent.dryRun) "analyzing" else "optimizing")
 
             val commitContext = undo?.let { session ->
@@ -138,8 +136,11 @@ class OptimizerEngine(
             }
             val byteArrayAdapter = ByteArrayOptimizerAdapter(documentGateway, commitContext)
 
-            for (file in files) {
+            val files = TreeCursor(cancellation) { report.errors = checkedIncrement(report.errors) }
+            while (true) {
                 cancellation.throwIfCancelled()
+                val file = files.next() ?: break
+                filesDiscovered = checkedIncrement(filesDiscovered)
                 report.scanned = checkedIncrement(report.scanned)
                 progress(if (runIntent.dryRun) "analyzing" else "optimizing", file.relativePath)
                 val outcome = process(file, streamingCoordinator, byteArrayAdapter, cancellation)
@@ -150,23 +151,34 @@ class OptimizerEngine(
             report.status = if (report.errors == 0) RunStatus.COMPLETED else RunStatus.COMPLETED_WITH_ERRORS
         } catch (_: OptimizationCancelledException) {
             report.status = RunStatus.CANCELLED
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
             report.errors = checkedIncrement(report.errors)
             report.status = RunStatus.FAILED
+            report.terminalError = failure.message ?: failure.javaClass.name
         } finally {
+            if (report.status == RunStatus.RUNNING) {
+                report.errors = checkedIncrement(report.errors)
+                report.status = RunStatus.FAILED
+                report.terminalError = report.terminalError ?: "Run ended without a terminal status"
+            }
             val session = undo
             if (session != null) {
+                var terminalDurable = false
                 try {
                     undoRepository.appendTerminal(session.writer, report.toTerminal(session.entriesCommitted, completedAt()))
-                } catch (_: Exception) {
+                    terminalDurable = true
+                } catch (failure: Exception) {
                     report.errors = checkedIncrement(report.errors)
                     report.status = RunStatus.FAILED
+                    report.terminalError = failure.message ?: failure.javaClass.name
                 } finally {
                     try {
                         session.writer.close()
-                    } catch (_: Exception) {
-                        report.errors = checkedIncrement(report.errors)
-                        report.status = RunStatus.FAILED
+                    } catch (failure: Exception) {
+                        if (!terminalDurable) {
+                            report.status = RunStatus.FAILED
+                            report.terminalError = report.terminalError ?: (failure.message ?: failure.javaClass.name)
+                        }
                     }
                 }
             }
@@ -204,29 +216,57 @@ class OptimizerEngine(
         FileOutcome.Failed(file.relativePath, failure.message ?: failure.javaClass.name, failure)
     }
 
-    private fun scan(cancellation: CancellationToken, onError: () -> Unit): List<ScannedFile> {
-        val files = mutableListOf<ScannedFile>()
-        fun visit(directory: DocumentNode, relativeDirectory: String) {
-            cancellation.throwIfCancelled()
-            val children = try {
-                documentGateway.list(directory)
-            } catch (_: Exception) {
-                onError()
-                return
-            }.sortedWith(compareBy<DocumentNode>({ it.name }, { it.id }))
+    private inner class TreeCursor(
+        private val cancellation: CancellationToken,
+        private val onListError: () -> Unit
+    ) {
+        private val frames = ArrayDeque<DirectoryFrame>()
+        private val directorySegments = ArrayDeque<String>()
 
-            for (child in children) {
+        init {
+            frames.addLast(DirectoryFrame(children(selectedRoot)))
+        }
+
+        fun next(): ScannedFile? {
+            while (frames.isNotEmpty()) {
                 cancellation.throwIfCancelled()
-                if (isManagedArtifact(child.name)) continue
-                val relativePath = if (relativeDirectory.isEmpty()) child.name else "$relativeDirectory/${child.name}"
-                when {
-                    child.isDirectory -> visit(child, relativePath)
-                    else -> files += ScannedFile(child, relativePath)
+                val frame = frames.last()
+                if (!frame.children.hasNext()) {
+                    frames.removeLast()
+                    if (directorySegments.isNotEmpty()) directorySegments.removeLast()
+                    continue
+                }
+                val child = frame.children.next()
+                if (child.isDirectory) {
+                    val childIterator = children(child)
+                    directorySegments.addLast(child.name)
+                    frames.addLast(DirectoryFrame(childIterator))
+                } else {
+                    val relativePath = buildString {
+                        directorySegments.forEach { segment -> append(segment).append('/') }
+                        append(child.name)
+                    }
+                    return ScannedFile(child, relativePath)
                 }
             }
+            return null
         }
-        visit(selectedRoot, "")
-        return files
+
+        private fun children(directory: DocumentNode): Iterator<DocumentNode> {
+            cancellation.throwIfCancelled()
+            val listed = try {
+                documentGateway.list(directory)
+            } catch (invariant: RunInvariantException) {
+                throw invariant
+            } catch (_: Exception) {
+                onListError()
+                emptyList()
+            }
+            return listed.asSequence()
+                .filterNot { isManagedArtifact(it.name) }
+                .sortedWith(compareBy<DocumentNode>({ it.isDirectory }, { it.name }, { it.id }))
+                .iterator()
+        }
     }
 
     private fun readHeader(node: DocumentNode, cancellation: CancellationToken): ByteArray {
@@ -270,8 +310,7 @@ class OptimizerEngine(
 
     private fun openUndoSession(): UndoSession {
         val name = "FileForge_Undo_v2_$runId.jsonl"
-        check(documentGateway.resolve(selectedRoot, name) == null) { "Undo log already exists: $name" }
-        val node = documentGateway.createFile(selectedRoot, "application/x-ndjson", name)
+        val node = documentGateway.createFileExact(selectedRoot, "application/x-ndjson", name)
         val writer = OutputStreamWriter(documentGateway.openWrite(node), Charsets.UTF_8)
         return try {
             undoRepository.start(
@@ -314,6 +353,7 @@ class OptimizerEngine(
     private fun checkedAdd(left: Long, right: Long): Long = Math.addExact(left, right)
 
     private data class ScannedFile(val node: DocumentNode, val relativePath: String)
+    private data class DirectoryFrame(val children: Iterator<DocumentNode>)
     private data class UndoSession(val writer: Writer, var entriesCommitted: Int = 0)
 
     private class AndroidBridge(context: Context, root: DocumentFile) {
