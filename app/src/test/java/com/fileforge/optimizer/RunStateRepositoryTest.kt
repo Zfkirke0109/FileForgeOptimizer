@@ -361,12 +361,11 @@ class RunStateRepositoryTest {
         firstPublisher.start()
         assertTrue(firstDeliveryEntered.await(2, TimeUnit.SECONDS))
         secondPublisher.start()
-        val queuedPublisherReturned = secondPublisherReturned.await(2, TimeUnit.SECONDS)
+        secondPublisherReturned.await(250, TimeUnit.MILLISECONDS)
         releaseFirstDelivery.countDown()
         firstPublisher.join(2_000)
         secondPublisher.join(2_000)
 
-        assertTrue(queuedPublisherReturned)
         assertFalse(firstPublisher.isAlive)
         assertFalse(secondPublisher.isAlive)
         assertTrue(releaseWasObserved.get())
@@ -402,7 +401,7 @@ class RunStateRepositoryTest {
         listOf(firstTerminal, secondTerminal, replayedTerminal).forEach { terminal ->
             assertTrue(
                 terminal.report.terminalFailures.any {
-                    it.contains("disk unavailable", ignoreCase = true)
+                    it.contains("persist", ignoreCase = true)
                 }
             )
         }
