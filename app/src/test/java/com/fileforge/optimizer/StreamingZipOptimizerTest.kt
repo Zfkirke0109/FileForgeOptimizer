@@ -120,6 +120,55 @@ class StreamingZipOptimizerTest {
     }
 
     @Test
+    fun verificationAcceptsOptionalDigitalSignatureAfterAllCentralFileHeaders() {
+        val archive = appendToCentralDirectory(
+            zipBytes(fileEntry("signed.txt", "payload".toByteArray())),
+            digitalSignature(byteArrayOf(0x12, 0x34, 0x56))
+        )
+
+        val verification = optimizer.verify(archive.inputStream(), NeverCancelled)
+
+        assertEquals(1, verification.entries)
+        assertEquals(7L, verification.bytesRead)
+    }
+
+    @Test
+    fun verificationRejectsDigitalSignatureWhoseDeclaredDataLengthExceedsCentralDirectory() {
+        val malformed = appendToCentralDirectory(
+            zipBytes(fileEntry("signed.txt", "payload".toByteArray())),
+            digitalSignature(byteArrayOf(0x12), declaredLength = 2)
+        )
+
+        assertCentralDirectoryFailure(malformed)
+    }
+
+    @Test
+    fun verificationRejectsBytesAfterDigitalSignatureInsideCentralDirectory() {
+        val malformed = appendToCentralDirectory(
+            zipBytes(fileEntry("signed.txt", "payload".toByteArray())),
+            digitalSignature(byteArrayOf(0x12)) + byteArrayOf(0x7f)
+        )
+
+        assertCentralDirectoryFailure(malformed)
+    }
+
+    @Test
+    fun verificationRejectsDigitalSignatureBeforeAllCentralFileHeaders() {
+        val archive = zipBytes(
+            fileEntry("first.txt", "first".toByteArray()),
+            fileEntry("second.txt", "second".toByteArray())
+        )
+        val malformed = transformCentralDirectory(archive) { centralDirectory ->
+            val firstRecordSize = centralDirectoryRecordSize(centralDirectory, 0)
+            centralDirectory.copyOfRange(0, firstRecordSize) +
+                digitalSignature(byteArrayOf(0x12)) +
+                centralDirectory.copyOfRange(firstRecordSize, centralDirectory.size)
+        }
+
+        assertCentralDirectoryFailure(malformed)
+    }
+
+    @Test
     fun verificationRejectsArchiveTruncatedBeforeEocd() {
         val complete = zipBytes(fileEntry("truncated.txt", "content".toByteArray()))
         val truncated = complete.copyOfRange(0, complete.size - EOCD_BYTES)
@@ -485,6 +534,35 @@ class StreamingZipOptimizerTest {
         return validArchive.copyOfRange(offset, offset + size)
     }
 
+    private fun appendToCentralDirectory(archive: ByteArray, suffix: ByteArray): ByteArray =
+        transformCentralDirectory(archive) { it + suffix }
+
+    private fun transformCentralDirectory(archive: ByteArray, transform: (ByteArray) -> ByteArray): ByteArray {
+        val oldEocd = eocdOffset(archive)
+        val centralOffset = littleEndianInt(archive, oldEocd + 16)
+        val centralSize = littleEndianInt(archive, oldEocd + 12)
+        val transformed = transform(archive.copyOfRange(centralOffset, centralOffset + centralSize))
+        val output = ByteArrayOutputStream()
+        output.write(archive, 0, centralOffset)
+        output.write(transformed)
+        output.write(archive, oldEocd, archive.size - oldEocd)
+        return output.toByteArray().also { rebuilt ->
+            val newEocd = centralOffset + transformed.size
+            writeInt(rebuilt, newEocd + 12, transformed.size.toLong())
+        }
+    }
+
+    private fun centralDirectoryRecordSize(bytes: ByteArray, offset: Int): Int =
+        CENTRAL_DIRECTORY_FIXED_BYTES + littleEndianShort(bytes, offset + 28) +
+            littleEndianShort(bytes, offset + 30) + littleEndianShort(bytes, offset + 32)
+
+    private fun digitalSignature(data: ByteArray, declaredLength: Int = data.size): ByteArray =
+        ByteArrayOutputStream().also { output ->
+            writeInt(output, CENTRAL_DIRECTORY_DIGITAL_SIGNATURE)
+            writeShort(output, declaredLength)
+            output.write(data)
+        }.toByteArray()
+
     private fun eocdOffset(bytes: ByteArray): Int = bytes.size - EOCD_BYTES
 
     private fun assertCentralDirectoryFailure(archive: ByteArray) {
@@ -540,6 +618,7 @@ class StreamingZipOptimizerTest {
         const val EOCD_BYTES = 22
         const val CENTRAL_DIRECTORY_FIXED_BYTES = 46
         const val CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50L
+        const val CENTRAL_DIRECTORY_DIGITAL_SIGNATURE = 0x05054b50L
         const val EOCD_SIGNATURE = 0x06054b50L
         const val ZIP64_SENTINEL = 0xffffffffL
         val testExtra = byteArrayOf(0x34, 0x12, 0x01, 0x00, 0x7f)

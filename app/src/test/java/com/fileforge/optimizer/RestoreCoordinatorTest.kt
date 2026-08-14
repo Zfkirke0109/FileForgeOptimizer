@@ -7,6 +7,22 @@ import org.junit.Test
 
 class RestoreCoordinatorTest {
     @Test
+    fun uppercaseV2UndoHashIsAcceptedAndRestoresAgainstLowercaseIntegrityDigest() = withRestore {
+            _, coordinator, _, _ ->
+        val uppercaseEntry = entry("docs/a.zip").copy(originalSha256 = backupA.sha256().uppercase())
+        val undoText = java.io.StringWriter().also { writer ->
+            UndoLogRepository().start(writer, UndoHeader("run-1", "2026-08-13T19:00:00Z"))
+            UndoLogRepository().appendEntry(writer, uppercaseEntry)
+        }.toString()
+        val parsed = UndoLogRepository().read(undoText.reader())
+
+        val report = coordinator.restore(parsed, RestoreSelection.All, NeverCancelled)
+
+        assertEquals(backupA.sha256().uppercase(), parsed.entries.single().originalSha256)
+        assertEquals(RestoreEntryStatus.RESTORED, report.entries.single().status)
+    }
+
+    @Test
     fun v2EntryStreamsVerifiedBackupToOriginalAndWritesTimestampedJsonlReceiptWithoutMutatingBackupOrUndo() = withRestore {
             gateway, coordinator, receipt, run ->
         val backupBefore = gateway.contents("FileForge_Backups_run-1/docs/a.zip")
