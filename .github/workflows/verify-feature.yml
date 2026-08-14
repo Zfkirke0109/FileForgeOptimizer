@@ -53,7 +53,7 @@ jobs:
 
           echo "FILEFORGE_RUN_LARGE_STREAMING_TEST=$run_large_streaming_test" >> "$GITHUB_ENV"
       - name: Test, lint, and assemble debug APK
-        run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+        run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleDebugAndroidTest
       - name: Report large streaming metrics
         if: env.FILEFORGE_RUN_LARGE_STREAMING_TEST == 'true'
         run: |

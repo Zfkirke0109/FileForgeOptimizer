@@ -153,14 +153,21 @@ object OptimizationNotification {
     private fun renderRunning(state: RunState.Running): NotificationSpec {
         val snapshot = state.snapshot
         val total = snapshot.totalWork?.takeIf { it > 0 }
-        val text = if (state.dryRun) {
-            "${snapshot.filesProcessed} files analyzed • " +
-                "${formatBytes(snapshot.potentialSavingsBytes)} potential savings"
-        } else {
-            "${snapshot.filesProcessed} files processed • ${formatBytes(snapshot.savedBytes)} saved"
+        val (title, text) = when {
+            state.operationKind == RunOperationKind.RESTORE ->
+                "Restoring files" to
+                    "${snapshot.filesProcessed} files processed • ${snapshot.optimized} restored"
+            state.dryRun ->
+                "Analyzing files" to
+                    ("${snapshot.filesProcessed} files analyzed • " +
+                        "${formatBytes(snapshot.potentialSavingsBytes)} potential savings")
+            else ->
+                "Optimizing files" to
+                    ("${snapshot.filesProcessed} files processed • " +
+                        "${formatBytes(snapshot.savedBytes)} saved")
         }
         return NotificationSpec(
-            title = if (state.dryRun) "Analyzing files" else "Optimizing files",
+            title = title,
             text = text,
             channelId = CHANNEL_ID,
             notificationId = NOTIFICATION_ID,
@@ -173,7 +180,15 @@ object OptimizationNotification {
 
     private fun renderTerminal(state: RunState.Terminal): NotificationSpec {
         val report = state.report
-        val title = if (state.dryRun) {
+        val title = if (state.operationKind == RunOperationKind.RESTORE) {
+            when (report.status) {
+                RunStatus.COMPLETED -> "Restore complete"
+                RunStatus.COMPLETED_WITH_ERRORS -> "Restore completed with errors"
+                RunStatus.CANCELLED -> "Restore cancelled"
+                RunStatus.FAILED -> "Restore failed"
+                RunStatus.RUNNING -> error("Terminal state cannot contain a running report")
+            }
+        } else if (state.dryRun) {
             when (report.status) {
                 RunStatus.COMPLETED -> "Analysis complete"
                 RunStatus.COMPLETED_WITH_ERRORS -> "Analysis completed with errors"
@@ -190,7 +205,9 @@ object OptimizationNotification {
                 RunStatus.RUNNING -> error("Terminal state cannot contain a running report")
             }
         }
-        val text = if (state.dryRun) {
+        val text = if (state.operationKind == RunOperationKind.RESTORE) {
+            "${report.optimized} of ${report.scanned} files restored"
+        } else if (state.dryRun) {
             "${report.scanned} files analyzed • " +
                 "${formatBytes(report.potentialSavingsBytes)} potential savings"
         } else {

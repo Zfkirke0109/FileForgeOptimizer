@@ -11,14 +11,24 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
+enum class RunOperationKind { OPTIMIZE, RESTORE }
+
 sealed interface RunState {
     object Idle : RunState
 
-    class Running(snapshot: ProgressSnapshot, val dryRun: Boolean) : RunState {
+    class Running(
+        snapshot: ProgressSnapshot,
+        val dryRun: Boolean,
+        val operationKind: RunOperationKind = RunOperationKind.OPTIMIZE
+    ) : RunState {
         val snapshot: ProgressSnapshot = snapshot.defensiveCopy()
     }
 
-    class Terminal(report: OptimizationReport, val dryRun: Boolean) : RunState {
+    class Terminal(
+        report: OptimizationReport,
+        val dryRun: Boolean,
+        val operationKind: RunOperationKind = RunOperationKind.OPTIMIZE
+    ) : RunState {
         private val snapshot: OptimizationReport
 
         init {
@@ -45,6 +55,12 @@ class RunStateRepository(private val storage: RunStateStorage) {
     private var drainOwned = false
     private var current: RunState = restoreTerminal(storage) ?: RunState.Idle
 
+    val currentState: RunState
+        get() = synchronized(lock) { current.defensiveCopy() }
+
+    internal val activeObserverCount: Int
+        get() = synchronized(lock) { subscriptions.size }
+
     /**
      * Immediately replays on the caller thread. Publications are delivered in commit order. An
      * uncontended publisher drains on its own thread before returning; a concurrent or reentrant
@@ -67,6 +83,15 @@ class RunStateRepository(private val storage: RunStateStorage) {
     }
 
     fun publish(state: RunState) {
+        commit(state).deliver()
+    }
+
+    /**
+     * Atomically persists/commits and enqueues [state] without invoking observers. The caller may
+     * safely release its own transaction/finality lock before [RunStateCommit.deliver] drains the
+     * shared ordered publication queue.
+     */
+    internal fun commit(state: RunState): RunStateCommit {
         val ownedState = state.defensiveCopy()
         val shouldDrain = synchronized(lock) {
             val committedState = persistOrDiagnose(ownedState)
@@ -81,7 +106,7 @@ class RunStateRepository(private val storage: RunStateStorage) {
                 true
             }
         }
-        if (shouldDrain) drainPublications()
+        return RunStateCommit(this, shouldDrain)
     }
 
     private fun persistOrDiagnose(state: RunState): RunState {
@@ -116,6 +141,20 @@ class RunStateRepository(private val storage: RunStateStorage) {
             }
             throw failure
         }
+    }
+
+    internal class RunStateCommit internal constructor(
+        private val repository: RunStateRepository,
+        private val ownsDrain: Boolean
+    ) {
+        private val delivered = AtomicBoolean(false)
+
+        fun deliver() {
+            if (ownsDrain && delivered.compareAndSet(false, true)) {
+                repository.drainPublications()
+            }
+        }
+
     }
 
     private inner class Subscription(
@@ -253,17 +292,22 @@ private object RunStateJsonCodec {
         return JSONObject()
             .put("version", VERSION)
             .put("dryRun", state.dryRun)
+            .put("operationKind", state.operationKind.name)
             .put("report", encodedReport)
             .toString()
     }
 
     fun decode(json: String): RunState.Terminal? {
         return try {
+            if (!StrictServiceJsonSyntax.isObject(json)) return null
             val tokenizer = JSONTokener(json)
             val root = tokenizer.nextValue() as? JSONObject ?: return null
             if (tokenizer.nextClean().code != 0) return null
             if (root.requiredInt("version") != VERSION) return null
             val dryRun = root.requiredBoolean("dryRun") ?: return null
+            val operationName = root.requiredString("operationKind") ?: return null
+            val operationKind = RunOperationKind.entries.firstOrNull { it.name == operationName }
+                ?: return null
             val reportObject = root.requiredObject("report") ?: return null
             val statusName = reportObject.requiredString("status") ?: return null
             val status = RunStatus.entries.firstOrNull { it.name == statusName } ?: return null
@@ -287,7 +331,7 @@ private object RunStateJsonCodec {
                 terminalFailures = reportObject.requiredStringList("terminalFailures") ?: return null,
                 rollbackFailure = rollbackFailure.value
             )
-            RunState.Terminal(report, dryRun)
+            RunState.Terminal(report, dryRun, operationKind)
         } catch (failure: Throwable) {
             if (failure.isVmFatal()) throw failure
             null
@@ -365,15 +409,15 @@ private object RunStateJsonCodec {
 
 private fun RunState.defensiveCopy(): RunState = when (this) {
     RunState.Idle -> RunState.Idle
-    is RunState.Running -> RunState.Running(snapshot, dryRun)
-    is RunState.Terminal -> RunState.Terminal(report, dryRun)
+    is RunState.Running -> RunState.Running(snapshot, dryRun, operationKind)
+    is RunState.Terminal -> RunState.Terminal(report, dryRun, operationKind)
 }
 
 private fun RunState.Terminal.withPersistenceFailure(): RunState.Terminal {
     val diagnosedReport = report
     diagnosedReport.terminalFailures =
         diagnosedReport.terminalFailures + RUN_STATE_PERSISTENCE_FAILURE
-    return RunState.Terminal(diagnosedReport, dryRun)
+    return RunState.Terminal(diagnosedReport, dryRun, operationKind)
 }
 
 private fun ProgressSnapshot.defensiveCopy(): ProgressSnapshot = ProgressSnapshot(

@@ -39,6 +39,19 @@ data class RestoreReport(
     val receiptError: String? = null
 )
 
+data class RestoreProgressSnapshot(
+    val totalEntries: Int,
+    val processedEntries: Int,
+    val restoredEntries: Int,
+    val lastResult: RestoreEntryResult? = null
+) {
+    init {
+        require(totalEntries >= 0)
+        require(processedEntries in 0..totalEntries)
+        require(restoredEntries in 0..processedEntries)
+    }
+}
+
 data class RestoreReceipt(val name: String, val writer: Writer)
 class ReceiptAlreadyExistsException(message: String) : IOException(message)
 
@@ -56,11 +69,13 @@ class RestoreCoordinator(
     private val documentGateway: DocumentGateway,
     private val selectedRoot: DocumentNode,
     private val receiptWriter: RestoreReceiptWriter,
+    private val onProgress: (RestoreProgressSnapshot) -> Unit = {},
     private val clock: () -> String
 ) {
     fun restore(run: UndoRun, selection: RestoreSelection, cancellation: CancellationToken): RestoreReport {
         val results = mutableListOf<RestoreEntryResult>()
         val selected = run.entries.filter { selection.includes(it.relativePath) }
+        publishProgress(selected.size, results, null)
         val safeRunId = try { DocumentPathPolicy.requireSafeSegment(run.header.runId) } catch (_: IllegalArgumentException) {
             return rejectedRunReport(run, selected)
         }
@@ -79,7 +94,7 @@ class RestoreCoordinator(
                     val attempt = restoreEntry(entry, safeRunId, cancellation) {
                         receipt ?: openReceipt(safeRunId, timestamp).also { receipt = it }
                     }
-                    results += attempt.result
+                    recordResult(selected.size, results, attempt.result)
                     if (receipt != null && attempt.attemptedWrite) {
                         try {
                             writeReceipt(receipt!!.writer, attempt.result)
@@ -96,7 +111,15 @@ class RestoreCoordinator(
                     status = RunStatus.CANCELLED
                     break
                 } catch (failure: ReceiptOpenException) {
-                    results += result(entry, RestoreEntryStatus.RECEIPT_FAILED, failure.message ?: "Receipt could not be opened")
+                    recordResult(
+                        selected.size,
+                        results,
+                        result(
+                            entry,
+                            RestoreEntryStatus.RECEIPT_FAILED,
+                            failure.message ?: "Receipt could not be opened"
+                        )
+                    )
                     receiptError = failure.message ?: failure.javaClass.name
                     stoppedForAudit = true
                 }
@@ -114,10 +137,44 @@ class RestoreCoordinator(
         return RestoreReport(run, results, status, results.count { it.status == RestoreEntryStatus.RESTORED }, receiptError)
     }
 
-    private fun rejectedRunReport(run: UndoRun, selected: List<UndoEntry>) = RestoreReport(
-        run, selected.map { result(it, RestoreEntryStatus.PATH_REJECTED, "Unsafe run ID or receipt timestamp") },
-        RunStatus.COMPLETED_WITH_ERRORS, 0
-    )
+    private fun rejectedRunReport(run: UndoRun, selected: List<UndoEntry>): RestoreReport {
+        val results = mutableListOf<RestoreEntryResult>()
+        selected.forEach { entry ->
+            recordResult(
+                selected.size,
+                results,
+                result(entry, RestoreEntryStatus.PATH_REJECTED, "Unsafe run ID or receipt timestamp")
+            )
+        }
+        return RestoreReport(run, results, RunStatus.COMPLETED_WITH_ERRORS, 0)
+    }
+
+    private fun recordResult(
+        totalEntries: Int,
+        results: MutableList<RestoreEntryResult>,
+        result: RestoreEntryResult
+    ) {
+        results += result
+        publishProgress(totalEntries, results, result)
+    }
+
+    private fun publishProgress(
+        totalEntries: Int,
+        results: List<RestoreEntryResult>,
+        lastResult: RestoreEntryResult?
+    ) {
+        val snapshot = RestoreProgressSnapshot(
+            totalEntries = totalEntries,
+            processedEntries = results.size,
+            restoredEntries = results.count { it.status == RestoreEntryStatus.RESTORED },
+            lastResult = lastResult
+        )
+        try {
+            onProgress(snapshot)
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) throw failure
+        }
+    }
 
     private fun restoreEntry(
         entry: UndoEntry,
