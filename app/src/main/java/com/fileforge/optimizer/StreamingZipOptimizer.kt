@@ -240,7 +240,7 @@ open class StreamingZipOptimizer {
             val end = start + size
             var cursor = start
             var records = 0
-            while (cursor < end) {
+            while (records < expectedEntries) {
                 if (end - cursor < CENTRAL_DIRECTORY_FIXED_BYTES ||
                     unsignedIntAt(cursor) != CENTRAL_DIRECTORY_SIGNATURE
                 ) {
@@ -255,6 +255,19 @@ open class StreamingZipOptimizer {
 
                 cursor += recordSize
                 records++
+            }
+            if (cursor < end) {
+                if (end - cursor < CENTRAL_DIRECTORY_DIGITAL_SIGNATURE_FIXED_BYTES ||
+                    unsignedIntAt(cursor) != CENTRAL_DIRECTORY_DIGITAL_SIGNATURE
+                ) {
+                    throw ZipException("Malformed central directory digital signature")
+                }
+                val dataLength = unsignedShortAt(cursor + 4)
+                val recordSize = CENTRAL_DIRECTORY_DIGITAL_SIGNATURE_FIXED_BYTES + dataLength
+                if (recordSize != end - cursor) {
+                    throw ZipException("Malformed central directory digital signature length")
+                }
+                cursor += recordSize
             }
             if (cursor != end || records != expectedEntries) {
                 throw ZipException("Central directory record count or size mismatch")
@@ -292,8 +305,10 @@ open class StreamingZipOptimizer {
         private companion object {
             const val EOCD_SIGNATURE = 0x06054b50L
             const val CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50L
+            const val CENTRAL_DIRECTORY_DIGITAL_SIGNATURE = 0x05054b50L
             const val EOCD_MIN_BYTES = 22
             const val CENTRAL_DIRECTORY_FIXED_BYTES = 46
+            const val CENTRAL_DIRECTORY_DIGITAL_SIGNATURE_FIXED_BYTES = 6
             const val MAX_EOCD_TAIL_BYTES = EOCD_MIN_BYTES + 0xffff
             const val ZIP64_SENTINEL = 0xffffffffL
         }

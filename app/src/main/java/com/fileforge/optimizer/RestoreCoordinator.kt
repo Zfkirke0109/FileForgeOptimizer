@@ -1,6 +1,7 @@
 package com.fileforge.optimizer
 
 import java.io.IOException
+import java.io.OutputStreamWriter
 import java.io.Writer
 
 sealed class RestoreSelection {
@@ -53,7 +54,7 @@ data class RestoreProgressSnapshot(
 }
 
 data class RestoreReceipt(val name: String, val writer: Writer)
-class ReceiptAlreadyExistsException(message: String) : IOException(message)
+class ReceiptAlreadyExistsException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
 fun interface RestoreReceiptWriter {
     fun open(name: String): Writer
@@ -63,6 +64,20 @@ fun interface RestoreReceiptWriter {
 interface ExclusiveRestoreReceiptWriter : RestoreReceiptWriter {
     fun openExclusive(name: String): RestoreReceipt
     override fun open(name: String): Writer = openExclusive(name).writer
+}
+
+class DocumentGatewayRestoreReceiptWriter(
+    private val documentGateway: DocumentGateway,
+    private val selectedRoot: DocumentNode
+) : ExclusiveRestoreReceiptWriter {
+    override fun openExclusive(name: String): RestoreReceipt {
+        val node = try {
+            documentGateway.createFileExact(selectedRoot, "application/x-ndjson", name)
+        } catch (collision: DocumentAlreadyExistsException) {
+            throw ReceiptAlreadyExistsException(collision.message ?: "Receipt already exists: $name", collision)
+        }
+        return RestoreReceipt(name, OutputStreamWriter(documentGateway.openWrite(node), Charsets.UTF_8))
+    }
 }
 
 class RestoreCoordinator(
@@ -207,7 +222,9 @@ class RestoreCoordinator(
             return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_MISSING, failure.message ?: "Backup cannot be read"))
         }
         if (backupIntegrity.bytes != entry.originalBytes) return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_SIZE_MISMATCH, "Backup size does not match undo record"))
-        if (entry.verificationLevel == UndoVerificationLevel.SHA_256 && backupIntegrity.sha256 != entry.originalSha256) {
+        if (entry.verificationLevel == UndoVerificationLevel.SHA_256 &&
+            !backupIntegrity.sha256.equals(entry.originalSha256, ignoreCase = true)
+        ) {
             return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_HASH_MISMATCH, "Backup SHA-256 does not match undo record"))
         }
         try { receiptForAttempt() } catch (failure: Exception) { throw ReceiptOpenException(failure) }
@@ -245,7 +262,8 @@ class RestoreCoordinator(
     private fun verifiedResult(entry: UndoEntry, restored: StreamIntegrity, verified: StreamIntegrity): RestoreEntryResult {
         val valid = restored.bytes == entry.originalBytes && verified.bytes == entry.originalBytes &&
             (entry.verificationLevel == UndoVerificationLevel.LEGACY_SIZE_ONLY ||
-                (restored.sha256 == entry.originalSha256 && verified.sha256 == entry.originalSha256))
+                (restored.sha256.equals(entry.originalSha256, ignoreCase = true) &&
+                    verified.sha256.equals(entry.originalSha256, ignoreCase = true)))
         return if (valid) result(entry, RestoreEntryStatus.RESTORED) else
             result(entry, RestoreEntryStatus.RESTORED_VERIFICATION_FAILED, "Restored document does not match undo record")
     }

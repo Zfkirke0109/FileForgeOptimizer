@@ -17,7 +17,6 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import java.io.InputStreamReader
-import java.io.OutputStreamWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -204,19 +203,7 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
             }
         }
         require(undoRun.header.runId.isNotBlank()) { "Undo log is not recognized" }
-        val receiptWriter = object : ExclusiveRestoreReceiptWriter {
-            override fun openExclusive(name: String): RestoreReceipt {
-                val node = gateway.createFileExact(
-                    gateway.rootNode,
-                    "application/x-ndjson",
-                    name
-                )
-                return RestoreReceipt(
-                    name,
-                    OutputStreamWriter(gateway.openWrite(node), Charsets.UTF_8)
-                )
-            }
-        }
+        val receiptWriter = DocumentGatewayRestoreReceiptWriter(gateway, gateway.rootNode)
         val restore = RestoreCoordinator(
             documentGateway = gateway,
             selectedRoot = gateway.rootNode,

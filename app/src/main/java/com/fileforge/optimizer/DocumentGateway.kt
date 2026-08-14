@@ -1,5 +1,6 @@
 package com.fileforge.optimizer
 
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -10,6 +11,8 @@ data class DocumentNode(
     val length: Long
 )
 
+class DocumentAlreadyExistsException(message: String) : IOException(message)
+
 interface DocumentGateway {
     fun openRead(node: DocumentNode): InputStream
     fun openWrite(node: DocumentNode): OutputStream
@@ -18,9 +21,11 @@ interface DocumentGateway {
     fun createDirectory(parent: DocumentNode, name: String): DocumentNode
     fun createFile(parent: DocumentNode, mimeType: String, name: String): DocumentNode
     fun createDirectoryExact(parent: DocumentNode, name: String): DocumentNode {
-        check(resolve(parent, name) == null) { "Document already exists: $name" }
+        if (resolve(parent, name) != null) throw DocumentAlreadyExistsException("Document already exists: $name")
         val created = createDirectory(parent, name)
-        check(created.name == name) { "Provider collision-renamed $name to ${created.name}" }
+        if (created.name != name) {
+            throw DocumentAlreadyExistsException("Provider collision-renamed $name to ${created.name}")
+        }
         check(created.isDirectory) { "Provider returned the wrong document type for $name" }
         val resolved = resolve(parent, name)
         check(resolved?.id == created.id && resolved.isDirectory) {
@@ -29,9 +34,11 @@ interface DocumentGateway {
         return created
     }
     fun createFileExact(parent: DocumentNode, mimeType: String, name: String): DocumentNode {
-        check(resolve(parent, name) == null) { "Document already exists: $name" }
+        if (resolve(parent, name) != null) throw DocumentAlreadyExistsException("Document already exists: $name")
         val created = createFile(parent, mimeType, name)
-        check(created.name == name) { "Provider collision-renamed $name to ${created.name}" }
+        if (created.name != name) {
+            throw DocumentAlreadyExistsException("Provider collision-renamed $name to ${created.name}")
+        }
         check(!created.isDirectory) { "Provider returned the wrong document type for $name" }
         val resolved = resolve(parent, name)
         check(resolved?.id == created.id && !resolved.isDirectory) {
