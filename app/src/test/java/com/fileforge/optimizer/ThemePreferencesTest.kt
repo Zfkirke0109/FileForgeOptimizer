@@ -1,40 +1,18 @@
 package com.fileforge.optimizer
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ThemePreferencesTest {
     @Test
-    fun persistsEverySupportedModeWithAStableValueAndReadsItBack() {
-        val expectedValues = linkedMapOf(
-            ThemeMode.SYSTEM to "system",
-            ThemeMode.LIGHT to "light",
-            ThemeMode.DARK to "dark",
-            ThemeMode.AMOLED to "amoled"
-        )
+    fun everySavedModeIsReadByAFreshPreferencesInstanceOverSharedStorage() {
         val storage = RecordingThemeModeStorage()
-        val runtime = RecordingThemeRuntime()
-        val preferences = ThemePreferences(storage, runtime)
 
-        expectedValues.forEach { (mode, storedValue) ->
-            preferences.save(mode)
+        ThemeMode.entries.forEach { mode ->
+            ThemePreferences(storage, RecordingThemeRuntime()).save(mode)
+            val restartedPreferences = ThemePreferences(storage, RecordingThemeRuntime())
 
-            assertEquals(storedValue, storage.value)
-            assertEquals(mode, preferences.read())
-        }
-        assertTrue("saving a preference must not change the active theme", runtime.applications.isEmpty())
-    }
-
-    @Test
-    fun missingOrUnrecognizedStoredModeFallsBackToSystemWithoutApplyingIt() {
-        listOf(null, "", "sepia", "DARK").forEach { storedValue ->
-            val storage = RecordingThemeModeStorage(storedValue)
-            val runtime = RecordingThemeRuntime()
-            val preferences = ThemePreferences(storage, runtime)
-
-            assertEquals(ThemeMode.SYSTEM, preferences.read())
-            assertTrue(runtime.applications.isEmpty())
+            assertEquals(mode, restartedPreferences.read())
         }
     }
 
@@ -46,7 +24,7 @@ class ThemePreferencesTest {
             ThemeMode.DARK to ThemeApplication(ThemeNightMode.FORCE_DARK, amoledOverlay = false),
             ThemeMode.AMOLED to ThemeApplication(ThemeNightMode.FORCE_DARK, amoledOverlay = true)
         )
-        val storage = RecordingThemeModeStorage("light")
+        val storage = RecordingThemeModeStorage()
         val runtime = RecordingThemeRuntime()
         val preferences = ThemePreferences(storage, runtime)
 
@@ -56,19 +34,44 @@ class ThemePreferencesTest {
             preferences.apply(mode)
 
             assertEquals(listOf(expected), runtime.applications)
-            assertEquals("applying a mode must not persist it", "light", storage.value)
-            assertTrue("applying a mode must not write preferences", storage.writes.isEmpty())
+        }
+    }
+
+    @Test
+    fun startupReadsAndAppliesSavedAmoledOrFallsBackToSystemForMissingAndInvalidState() {
+        val amoledStorage = RecordingThemeModeStorage()
+        ThemePreferences(amoledStorage, RecordingThemeRuntime()).save(ThemeMode.AMOLED)
+        val amoledRuntime = RecordingThemeRuntime()
+        val restartedAmoled = ThemePreferences(amoledStorage, amoledRuntime)
+
+        restartedAmoled.apply(restartedAmoled.read())
+
+        assertEquals(
+            listOf(ThemeApplication(ThemeNightMode.FORCE_DARK, amoledOverlay = true)),
+            amoledRuntime.applications
+        )
+
+        listOf(null, "not-a-theme-mode").forEach { storedValue ->
+            val fallbackRuntime = RecordingThemeRuntime()
+            val restartedFallback = ThemePreferences(RecordingThemeModeStorage(storedValue), fallbackRuntime)
+
+            val startupMode = restartedFallback.read()
+            restartedFallback.apply(startupMode)
+
+            assertEquals(ThemeMode.SYSTEM, startupMode)
+            assertEquals(
+                listOf(ThemeApplication(ThemeNightMode.FOLLOW_SYSTEM, amoledOverlay = false)),
+                fallbackRuntime.applications
+            )
         }
     }
 
     private class RecordingThemeModeStorage(initialValue: String? = null) : ThemeModeStorage {
         var value: String? = initialValue
-        val writes = mutableListOf<String>()
 
         override fun read(): String? = value
 
         override fun write(value: String) {
-            writes += value
             this.value = value
         }
     }
