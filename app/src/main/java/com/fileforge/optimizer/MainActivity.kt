@@ -1,6 +1,5 @@
 package com.fileforge.optimizer
 
-import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -13,9 +12,10 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
 import androidx.documentfile.provider.DocumentFile
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
     private val requestTreeCode = 4107
     private lateinit var selectedFolderText: TextView
     private lateinit var logText: TextView
@@ -26,6 +26,7 @@ class MainActivity : Activity() {
     private var running = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        ThemePreferences.applyActivityThemeBeforeOnCreate(this)
         super.onCreate(savedInstanceState)
         selectedTreeUri = getPreferences(MODE_PRIVATE).getString("treeUri", null)?.let(Uri::parse)
         buildUi()

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.FileForge" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="colorPrimary">@color/fileforge_primary</item>
+        <item name="colorOnPrimary">@color/fileforge_on_primary</item>
+        <item name="colorSecondary">@color/fileforge_secondary</item>
+        <item name="colorOnSecondary">@color/fileforge_on_secondary</item>
+        <item name="android:colorBackground">@color/fileforge_background</item>
+        <item name="colorOnBackground">@color/fileforge_on_background</item>
+        <item name="colorSurface">@color/fileforge_surface</item>
+        <item name="colorSurfaceContainer">@color/fileforge_surface_container</item>
+        <item name="colorOnSurface">@color/fileforge_on_surface</item>
+        <item name="colorOutline">@color/fileforge_outline</item>
+        <item name="android:windowBackground">@color/fileforge_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@color/fileforge_surface</item>
+        <item name="dynamicColorThemeOverlay">@style/ThemeOverlay.FileForge.DynamicColors</item>
+    </style>
+
+    <style name="ThemeOverlay.FileForge.DynamicColors" parent="ThemeOverlay.Material3.DynamicColors.DayNight" />
+
+    <style name="ThemeOverlay.FileForge.Amoled" parent="">
+        <item name="android:colorBackground">@color/fileforge_amoled_background</item>
+        <item name="colorOnBackground">@color/fileforge_amoled_on_surface</item>
+        <item name="colorSurface">@color/fileforge_amoled_background</item>
+        <item name="colorSurfaceVariant">@color/fileforge_amoled_surface</item>
+        <item name="colorSurfaceContainerLowest">@color/fileforge_amoled_surface</item>
+        <item name="colorSurfaceContainerLow">@color/fileforge_amoled_surface</item>
+        <item name="colorSurfaceContainer">@color/fileforge_amoled_surface</item>
+        <item name="colorSurfaceContainerHigh">@color/fileforge_amoled_surface</item>
+        <item name="colorSurfaceContainerHighest">@color/fileforge_amoled_surface</item>
+        <item name="colorOnSurface">@color/fileforge_amoled_on_surface</item>
+        <item name="colorOnSurfaceVariant">@color/fileforge_amoled_on_surface</item>
+        <item name="android:windowBackground">@color/fileforge_amoled_background</item>
+        <item name="android:statusBarColor">@color/fileforge_amoled_background</item>
+        <item name="android:navigationBarColor">@color/fileforge_amoled_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+</resources>
