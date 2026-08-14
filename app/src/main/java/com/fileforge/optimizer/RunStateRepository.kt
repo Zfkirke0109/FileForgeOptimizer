@@ -133,11 +133,9 @@ class RunStateRepository(private val storage: RunStateStorage) {
                 }
             }
         } catch (failure: Throwable) {
-            if (failure.isVmFatal()) {
-                synchronized(lock) {
-                    pendingPublications.clear()
-                    drainOwned = false
-                }
+            synchronized(lock) {
+                pendingPublications.clear()
+                drainOwned = false
             }
             throw failure
         }
@@ -266,7 +264,8 @@ private class SharedPreferencesRunStateStorage(context: Context) : RunStateStora
 }
 
 private object RunStateJsonCodec {
-    private const val VERSION = 1
+    private const val LEGACY_VERSION = 1
+    private const val CURRENT_VERSION = 2
 
     fun encode(state: RunState.Terminal): String {
         val report = state.report
@@ -290,7 +289,7 @@ private object RunStateJsonCodec {
             .put("terminalFailures", terminalFailures)
             .put("rollbackFailure", report.rollbackFailure ?: JSONObject.NULL)
         return JSONObject()
-            .put("version", VERSION)
+            .put("version", CURRENT_VERSION)
             .put("dryRun", state.dryRun)
             .put("operationKind", state.operationKind.name)
             .put("report", encodedReport)
@@ -303,12 +302,22 @@ private object RunStateJsonCodec {
             val tokenizer = JSONTokener(json)
             val root = tokenizer.nextValue() as? JSONObject ?: return null
             if (tokenizer.nextClean().code != 0) return null
-            if (root.requiredInt("version") != VERSION) return null
+            val version = root.requiredInt("version") ?: return null
+            val operationKind = when (version) {
+                LEGACY_VERSION -> {
+                    if (root.strictKeySet() != LEGACY_ROOT_KEYS) return null
+                    RunOperationKind.OPTIMIZE
+                }
+                CURRENT_VERSION -> {
+                    if (root.strictKeySet() != CURRENT_ROOT_KEYS) return null
+                    val operationName = root.requiredString("operationKind") ?: return null
+                    RunOperationKind.entries.firstOrNull { it.name == operationName } ?: return null
+                }
+                else -> return null
+            }
             val dryRun = root.requiredBoolean("dryRun") ?: return null
-            val operationName = root.requiredString("operationKind") ?: return null
-            val operationKind = RunOperationKind.entries.firstOrNull { it.name == operationName }
-                ?: return null
             val reportObject = root.requiredObject("report") ?: return null
+            if (reportObject.strictKeySet() != REPORT_KEYS) return null
             val statusName = reportObject.requiredString("status") ?: return null
             val status = RunStatus.entries.firstOrNull { it.name == statusName } ?: return null
             if (status == RunStatus.RUNNING) return null
@@ -340,6 +349,11 @@ private object RunStateJsonCodec {
 
     private fun JSONObject.requiredObject(name: String): JSONObject? =
         takeIf { has(name) }?.opt(name) as? JSONObject
+
+    private fun JSONObject.strictKeySet(): Set<String> = buildSet {
+        val iterator = keys()
+        while (iterator.hasNext()) add(iterator.next())
+    }
 
     private fun JSONObject.requiredString(name: String): String? =
         takeIf { has(name) }?.opt(name) as? String
@@ -405,6 +419,25 @@ private object RunStateJsonCodec {
     }
 
     private data class NullableField<T>(val value: T?)
+
+    private val LEGACY_ROOT_KEYS = setOf("version", "dryRun", "report")
+    private val CURRENT_ROOT_KEYS = LEGACY_ROOT_KEYS + "operationKind"
+    private val REPORT_KEYS = setOf(
+        "scanned",
+        "optimized",
+        "skipped",
+        "errors",
+        "savedBytes",
+        "candidates",
+        "potentialSavingsBytes",
+        "bytesRead",
+        "bytesWritten",
+        "status",
+        "skipsByReason",
+        "terminalError",
+        "terminalFailures",
+        "rollbackFailure"
+    )
 }
 
 private fun RunState.defensiveCopy(): RunState = when (this) {

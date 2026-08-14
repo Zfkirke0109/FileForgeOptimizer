@@ -120,6 +120,42 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         is ServiceRunRequest.Restore -> runRestore(request, cancellation, onProgress)
     }
 
+    override fun deliverTimeoutTerminal(
+        terminal: RunState.Terminal,
+        deliverObservers: () -> Unit
+    ) {
+        var vmFatal: Throwable? = null
+        try {
+            updateTerminalNotification(terminal)
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) vmFatal = failure
+        }
+        try {
+            Thread(
+                {
+                    // Repository delivery resets its ownership before any escaping failure. VM
+                    // fatals remain uncaught on this independent thread by policy.
+                    deliverObservers()
+                },
+                TIMEOUT_DELIVERY_THREAD_NAME
+            ).apply {
+                isDaemon = true
+                start()
+            }
+        } catch (startFailure: Throwable) {
+            val primary = vmFatal
+            if (primary != null) {
+                if (startFailure !== primary) primary.addSuppressed(startFailure)
+            } else if (startFailure.isVmFatal()) {
+                vmFatal = startFailure
+            } else {
+                // A nonfatal thread-start rejection must not leave the repository drain owned.
+                deliverObservers()
+            }
+        }
+        vmFatal?.let { throw it }
+    }
+
     override fun stopForegroundAndSelf() {
         stopForeground(STOP_FOREGROUND_DETACH)
         foregroundNotificationActive = false
@@ -261,6 +297,16 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         )
     }
 
+    @SuppressLint("MissingPermission")
+    private fun updateTerminalNotification(state: RunState.Terminal) {
+        // The FGS notification exists even when drawer permission is denied. Updating the same ID
+        // before detach preserves an actionable terminal state in every visibility surface.
+        getSystemService(NotificationManager::class.java).notify(
+            OptimizationNotification.NOTIFICATION_ID,
+            OptimizationNotification.buildAndroidNotification(this, state)
+        )
+    }
+
     private fun hasNotificationPermission(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || ContextCompat.checkSelfPermission(
             this,
@@ -287,6 +333,7 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
 
     companion object {
         private const val INVALID_EXTRAS_MARKER = "com.fileforge.optimizer.extra.INVALID"
+        private const val TIMEOUT_DELIVERY_THREAD_NAME = "FileForge-Timeout-Terminal"
         const val ACTION_START = OptimizationServiceContract.ACTION_START
         const val ACTION_RESTORE = OptimizationServiceContract.ACTION_RESTORE
         const val ACTION_CANCEL = OptimizationServiceContract.ACTION_CANCEL

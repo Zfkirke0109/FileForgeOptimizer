@@ -485,14 +485,21 @@ class OptimizationServiceControllerTest {
 
         fixture.controller.onTimeout()
 
-        val terminal = observed.filterIsInstance<RunState.Terminal>().single()
+        val terminal = fixture.repository.currentState as RunState.Terminal
         assertActionableTimeout(terminal)
-        assertTrue(fixture.events.indexOf("terminal") < fixture.events.indexOf("stop"))
+        assertEquals(1, fixture.storage.writes.size)
+        assertEquals(1, fixture.runtime.timeoutTerminalNotifications.size)
+        assertActionableTimeout(fixture.runtime.timeoutTerminalNotifications.single())
+        assertTrue(
+            fixture.events.indexOf("timeout-notification") < fixture.events.indexOf("stop")
+        )
         assertFalse(fixture.controller.cancelActive())
         fixture.runtime.runNext()
+        fixture.runtime.timeoutDeliveryThread.get()?.join(2_000)
         subscription.close()
 
         assertTrue(fixture.runtime.requests.isEmpty())
+        assertNull(fixture.runtime.timeoutDeliveryFailure.get())
         assertEquals(1, observed.count { it is RunState.Terminal })
         assertEquals(1, fixture.events.count { it == "stop" })
     }
@@ -536,17 +543,24 @@ class OptimizationServiceControllerTest {
             assertTrue("timeout waited for active worker for $lateOutcome", timeoutReturned.await(1, TimeUnit.SECONDS))
             assertNull(timeoutFailure.get())
             assertTrue("worker unexpectedly returned before release for $lateOutcome", worker.isAlive)
-            val timeoutTerminal = observed.filterIsInstance<RunState.Terminal>().single()
+            val timeoutTerminal = fixture.repository.currentState as RunState.Terminal
             assertActionableTimeout(timeoutTerminal)
+            assertEquals(1, fixture.storage.writes.size)
+            assertEquals(1, fixture.runtime.timeoutTerminalNotifications.size)
+            assertActionableTimeout(fixture.runtime.timeoutTerminalNotifications.single())
             assertEquals(1, fixture.events.count { it == "stop" })
-            assertTrue(fixture.events.indexOf("terminal") < fixture.events.indexOf("stop"))
+            assertTrue(
+                fixture.events.indexOf("timeout-notification") < fixture.events.indexOf("stop")
+            )
 
             fixture.runtime.releaseRun.countDown()
             worker.join(2_000)
+            fixture.runtime.timeoutDeliveryThread.get()?.join(2_000)
             subscription.close()
 
             assertFalse("worker did not finish for $lateOutcome", worker.isAlive)
             assertNull(workerFailure.get())
+            assertNull(fixture.runtime.timeoutDeliveryFailure.get())
             assertEquals(1, observed.count { it is RunState.Terminal })
             assertEquals(1, fixture.events.count { it == "terminal" })
             assertEquals(1, fixture.events.count { it == "stop" })

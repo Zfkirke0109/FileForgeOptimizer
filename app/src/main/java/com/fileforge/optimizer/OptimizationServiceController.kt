@@ -367,6 +367,10 @@ interface OptimizationServiceRuntime {
         cancellation: CancellationToken,
         onProgress: (ProgressSnapshot) -> Unit
     ): RunState.Terminal
+    fun deliverTimeoutTerminal(
+        terminal: RunState.Terminal,
+        deliverObservers: () -> Unit
+    )
     fun stopForegroundAndSelf()
 }
 
@@ -474,7 +478,8 @@ class OptimizationServiceController(
                 ),
                 dryRun = claimed.dryRun,
                 operationKind = claimed.operationKind
-            )
+            ),
+            timeoutDelivery = true
         )
     }
 
@@ -533,7 +538,11 @@ class OptimizationServiceController(
         finish(claimed, failedTerminal(failure, claimed.dryRun, claimed.operationKind))
     }
 
-    private fun finish(claimed: ActiveRun, terminal: RunState.Terminal): Boolean {
+    private fun finish(
+        claimed: ActiveRun,
+        terminal: RunState.Terminal,
+        timeoutDelivery: Boolean = false
+    ): Boolean {
         var committed: RunStateRepository.RunStateCommit? = null
         var publicationFailure: Throwable? = null
         synchronized(claimed.finalityLock) {
@@ -552,7 +561,13 @@ class OptimizationServiceController(
         }
         try {
             try {
-                committed?.deliver()
+                committed?.let { receipt ->
+                    if (timeoutDelivery) {
+                        runtime.deliverTimeoutTerminal(terminal, receipt::deliver)
+                    } else {
+                        receipt.deliver()
+                    }
+                }
             } catch (deliveryFailure: Throwable) {
                 publicationFailure = deliveryFailure
             }
