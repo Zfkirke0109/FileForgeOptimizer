@@ -91,11 +91,13 @@ class OptimizerEngineTransactionHardeningTest {
         assertTrue(entered.await(5, TimeUnit.SECONDS))
         val mutationsDuringFirst = gateway.mutations.toList()
 
-        assertThrows(IllegalStateException::class.java) { engine.run(NeverCancelled) {} }
-
-        assertEquals(mutationsDuringFirst, gateway.mutations)
-        release.countDown()
-        first.join(5_000)
+        try {
+            assertThrows(IllegalStateException::class.java) { engine.run(NeverCancelled) {} }
+            assertEquals(mutationsDuringFirst, gateway.mutations)
+        } finally {
+            release.countDown()
+            first.join(5_000)
+        }
         assertFalse(first.isAlive)
     }
 
