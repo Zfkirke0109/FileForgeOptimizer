@@ -5,6 +5,14 @@ import org.junit.Test
 
 class ThemePreferencesTest {
     @Test
+    fun exposesExactlyTheFourProductThemeChoices() {
+        assertEquals(
+            setOf(ThemeMode.SYSTEM, ThemeMode.LIGHT, ThemeMode.DARK, ThemeMode.AMOLED),
+            ThemeMode.entries.toSet()
+        )
+    }
+
+    @Test
     fun everySavedModeIsReadByAFreshPreferencesInstanceOverSharedStorage() {
         val storage = RecordingThemeModeStorage()
 
