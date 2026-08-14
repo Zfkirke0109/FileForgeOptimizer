@@ -109,17 +109,47 @@ class RunStateObservationSequencer {
         SequencedRunState(sequence.incrementAndGet(), state)
 }
 
-class OptimizeStartDispatchGate {
+data class PersistedOptimizeDispatch(
+    val baselineStateKey: String
+)
+
+interface OptimizeDispatchStateStorage {
+    fun read(): PersistedOptimizeDispatch?
+    fun write(value: PersistedOptimizeDispatch)
+    fun clear()
+}
+
+private class MemoryOptimizeDispatchStateStorage : OptimizeDispatchStateStorage {
+    private var value: PersistedOptimizeDispatch? = null
+
+    override fun read(): PersistedOptimizeDispatch? = value
+
+    override fun write(value: PersistedOptimizeDispatch) {
+        this.value = value
+    }
+
+    override fun clear() {
+        value = null
+    }
+}
+
+class OptimizeStartDispatchGate(
+    private val storage: OptimizeDispatchStateStorage = MemoryOptimizeDispatchStateStorage()
+) {
     var isReplayReady: Boolean = false
         private set
-    var isPending: Boolean = false
+    private var pendingDispatch: PersistedOptimizeDispatch? = storage.read()
+    var isPending: Boolean = pendingDispatch != null
         private set
     private var releaseAfterSequence: Long = 0
-    private var lastObservedKey: Any? = null
-    private var suppressEquivalentReplay = false
+    private var lastObservedKey: String? = pendingDispatch?.baselineStateKey
 
     fun beginDispatch(observationWatermark: Long): Boolean {
         if (!isReplayReady || isPending) return false
+        val baselineStateKey = lastObservedKey ?: return false
+        val persisted = PersistedOptimizeDispatch(baselineStateKey)
+        storage.write(persisted)
+        pendingDispatch = persisted
         isPending = true
         releaseAfterSequence = observationWatermark
         return true
@@ -127,130 +157,119 @@ class OptimizeStartDispatchGate {
 
     fun awaitReplay() {
         isReplayReady = false
-        suppressEquivalentReplay = isPending
     }
 
     fun onObservedState(state: RunState, sequence: Long) {
         val stateKey = state.semanticKey()
-        val unchangedPendingReplay = !isReplayReady && suppressEquivalentReplay &&
-            stateKey == lastObservedKey
         if (!isReplayReady) {
             isReplayReady = true
         }
-        suppressEquivalentReplay = false
         lastObservedKey = stateKey
-        if (unchangedPendingReplay) {
-            releaseAfterSequence = maxOf(releaseAfterSequence, sequence)
-            return
+        val baselineStateKey = pendingDispatch?.baselineStateKey
+        val acknowledged = when (state) {
+            is RunState.Running -> true
+            is RunState.Terminal -> stateKey != baselineStateKey
+            RunState.Idle -> false
         }
-        if (isPending && sequence > releaseAfterSequence &&
-            (state is RunState.Running || state is RunState.Terminal)
-        ) {
-            isPending = false
+        if (isPending && sequence > releaseAfterSequence && acknowledged) {
+            clearPendingDispatch()
         }
     }
 
     fun onDispatchFailed() {
-        isPending = false
+        clearPendingDispatch()
     }
 
     fun allowsStart(baseStartEnabled: Boolean): Boolean =
         baseStartEnabled && isReplayReady && !isPending
+
+    private fun clearPendingDispatch() {
+        storage.clear()
+        pendingDispatch = null
+        isPending = false
+    }
 }
 
-private fun RunState.semanticKey(): Any = when (this) {
-    RunState.Idle -> IdleRunStateKey
-    is RunState.Running -> RunningRunStateKey(
-        dryRun = dryRun,
-        operationKind = operationKind,
-        snapshot = snapshot.toSemanticKey()
-    )
-    is RunState.Terminal -> TerminalRunStateKey(
-        dryRun = dryRun,
-        operationKind = operationKind,
-        report = report.toSemanticKey()
-    )
+private fun RunState.semanticKey(): String {
+    val state = this
+    return SemanticStateKeyWriter().apply {
+        when (state) {
+            RunState.Idle -> token("idle")
+            is RunState.Running -> {
+                token("running")
+                boolean(state.dryRun)
+                token(state.operationKind.name)
+                snapshot(state.snapshot)
+            }
+            is RunState.Terminal -> {
+                token("terminal")
+                boolean(state.dryRun)
+                token(state.operationKind.name)
+                report(state.report)
+            }
+        }
+    }.value()
 }
 
-private object IdleRunStateKey
+/** Length-prefixed state encoding: persisted equality is exact without hash collisions. */
+private class SemanticStateKeyWriter {
+    private val value = StringBuilder()
 
-private data class RunningRunStateKey(
-    val dryRun: Boolean,
-    val operationKind: RunOperationKind,
-    val snapshot: ProgressSnapshotKey
-)
+    fun value(): String = value.toString()
 
-private data class TerminalRunStateKey(
-    val dryRun: Boolean,
-    val operationKind: RunOperationKind,
-    val report: OptimizationReportKey
-)
+    fun token(token: String?) {
+        if (token == null) {
+            value.append("-1:")
+        } else {
+            value.append(token.length).append(':').append(token)
+        }
+    }
 
-private data class ProgressSnapshotKey(
-    val phase: String,
-    val currentRelativePath: String?,
-    val filesDiscovered: Int,
-    val filesProcessed: Int,
-    val candidates: Int,
-    val optimized: Int,
-    val skipsByReason: Map<SkipReason, Int>,
-    val errors: Int,
-    val bytesRead: Long,
-    val bytesWritten: Long,
-    val savedBytes: Long,
-    val potentialSavingsBytes: Long,
-    val totalWork: Int?
-)
+    fun boolean(value: Boolean) = token(if (value) "1" else "0")
+    fun number(value: Number?) = token(value?.toString())
 
-private data class OptimizationReportKey(
-    val scanned: Int,
-    val optimized: Int,
-    val skipped: Int,
-    val errors: Int,
-    val savedBytes: Long,
-    val candidates: Int,
-    val potentialSavingsBytes: Long,
-    val bytesRead: Long,
-    val bytesWritten: Long,
-    val status: RunStatus,
-    val skipsByReason: Map<SkipReason, Int>,
-    val terminalError: String?,
-    val terminalFailures: List<String>,
-    val rollbackFailure: String?
-)
+    fun snapshot(snapshot: ProgressSnapshot) {
+        token(snapshot.phase)
+        token(snapshot.currentRelativePath)
+        number(snapshot.filesDiscovered)
+        number(snapshot.filesProcessed)
+        number(snapshot.candidates)
+        number(snapshot.optimized)
+        skips(snapshot.skipsByReason)
+        number(snapshot.errors)
+        number(snapshot.bytesRead)
+        number(snapshot.bytesWritten)
+        number(snapshot.savedBytes)
+        number(snapshot.potentialSavingsBytes)
+        number(snapshot.totalWork)
+    }
 
-private fun ProgressSnapshot.toSemanticKey() = ProgressSnapshotKey(
-    phase = phase,
-    currentRelativePath = currentRelativePath,
-    filesDiscovered = filesDiscovered,
-    filesProcessed = filesProcessed,
-    candidates = candidates,
-    optimized = optimized,
-    skipsByReason = skipsByReason.toMap(),
-    errors = errors,
-    bytesRead = bytesRead,
-    bytesWritten = bytesWritten,
-    savedBytes = savedBytes,
-    potentialSavingsBytes = potentialSavingsBytes,
-    totalWork = totalWork
-)
+    fun report(report: OptimizationReport) {
+        number(report.scanned)
+        number(report.optimized)
+        number(report.skipped)
+        number(report.errors)
+        number(report.savedBytes)
+        number(report.candidates)
+        number(report.potentialSavingsBytes)
+        number(report.bytesRead)
+        number(report.bytesWritten)
+        token(report.status.name)
+        skips(report.skipsByReason)
+        token(report.terminalError)
+        number(report.terminalFailures.size)
+        report.terminalFailures.forEach(::token)
+        token(report.rollbackFailure)
+    }
 
-private fun OptimizationReport.toSemanticKey() = OptimizationReportKey(
-    scanned = scanned,
-    optimized = optimized,
-    skipped = skipped,
-    errors = errors,
-    savedBytes = savedBytes,
-    candidates = candidates,
-    potentialSavingsBytes = potentialSavingsBytes,
-    bytesRead = bytesRead,
-    bytesWritten = bytesWritten,
-    status = status,
-    skipsByReason = skipsByReason.toMap(),
-    terminalError = terminalError,
-    terminalFailures = terminalFailures.toList(),
-    rollbackFailure = rollbackFailure
-)
+    private fun skips(skips: Map<SkipReason, Int>) {
+        number(skips.size)
+        skips.entries.sortedBy { it.key.ordinal }.forEach { (reason, count) ->
+            token(reason.name)
+            number(count)
+        }
+    }
+}
 
 data class PendingOptimizeLaunch(
     val request: ServiceRunRequest.Optimize,
@@ -266,6 +285,113 @@ interface PendingOptimizeLaunchStorage {
     fun read(): PendingOptimizeLaunch?
     fun write(value: PendingOptimizeLaunch)
     fun clear()
+}
+
+interface PendingOptimizeLaunchRecordStore {
+    fun read(): Map<String, Any?>
+    fun write(record: Map<String, Any?>)
+    fun clear()
+}
+
+class StrictPendingOptimizeLaunchStorage(
+    private val store: PendingOptimizeLaunchRecordStore
+) : PendingOptimizeLaunchStorage {
+    override fun read(): PendingOptimizeLaunch? = try {
+        val record = store.read()
+        if (record.isEmpty()) null
+        else PendingOptimizeLaunchRecordCodec.decode(record) ?: clearInvalid()
+    } catch (failure: Throwable) {
+        if (failure.isVmFatal()) throw failure
+        clearInvalid()
+    }
+
+    override fun write(value: PendingOptimizeLaunch) {
+        store.write(PendingOptimizeLaunchRecordCodec.encode(value))
+    }
+
+    override fun clear() {
+        store.clear()
+    }
+
+    private fun clearInvalid(): PendingOptimizeLaunch? {
+        try {
+            store.clear()
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) throw failure
+        }
+        return null
+    }
+}
+
+internal object PendingOptimizeLaunchRecordCodec {
+    const val KEY_PREFIX = "pending_launch_"
+    const val KEY_PRESENT = "pending_launch_present"
+    const val KEY_TREE_URI = "pending_launch_tree_uri"
+    const val KEY_MODE = "pending_launch_mode"
+    const val KEY_DRY_RUN = "pending_launch_dry_run"
+    const val KEY_APK_LAB = "pending_launch_apk_lab"
+    const val KEY_TEXT_MINIFY = "pending_launch_text_minify"
+    const val KEY_PERMISSION_RESULT = "pending_launch_permission_result"
+    private const val RESULT_PENDING = "pending"
+    private const val RESULT_GRANTED = "granted"
+    private const val RESULT_DENIED = "denied"
+
+    val keys: Set<String> = setOf(
+        KEY_PRESENT,
+        KEY_TREE_URI,
+        KEY_MODE,
+        KEY_DRY_RUN,
+        KEY_APK_LAB,
+        KEY_TEXT_MINIFY,
+        KEY_PERMISSION_RESULT
+    )
+
+    fun encode(value: PendingOptimizeLaunch): Map<String, Any?> = linkedMapOf(
+        KEY_PRESENT to true,
+        KEY_TREE_URI to value.request.treeUri,
+        KEY_MODE to value.request.runIntent.mode.name,
+        KEY_DRY_RUN to value.request.runIntent.dryRun,
+        KEY_APK_LAB to value.request.runIntent.apkLabMode,
+        KEY_TEXT_MINIFY to value.request.runIntent.textMinify,
+        KEY_PERMISSION_RESULT to when (value.permissionGranted) {
+            null -> RESULT_PENDING
+            true -> RESULT_GRANTED
+            false -> RESULT_DENIED
+        }
+    )
+
+    fun decode(record: Map<String, Any?>): PendingOptimizeLaunch? {
+        if (record.keys != keys || record[KEY_PRESENT] !is Boolean ||
+            record[KEY_PRESENT] != true
+        ) {
+            return null
+        }
+        val treeUri = record[KEY_TREE_URI] as? String ?: return null
+        if (treeUri.isBlank()) return null
+        val modeName = record[KEY_MODE] as? String ?: return null
+        val mode = OptimizeMode.entries.firstOrNull { it.name == modeName } ?: return null
+        val dryRun = record[KEY_DRY_RUN] as? Boolean ?: return null
+        val apkLabMode = record[KEY_APK_LAB] as? Boolean ?: return null
+        val textMinify = record[KEY_TEXT_MINIFY] as? Boolean ?: return null
+        val permissionGranted = when (record[KEY_PERMISSION_RESULT] as? String) {
+            RESULT_PENDING -> null
+            RESULT_GRANTED -> true
+            RESULT_DENIED -> false
+            else -> return null
+        }
+        return PendingOptimizeLaunch(
+            request = ServiceRunRequest.Optimize(
+                treeUri = treeUri,
+                runIntent = RunIntent(
+                    mode = mode,
+                    dryRun = dryRun,
+                    apkLabMode = apkLabMode,
+                    textMinify = textMinify
+                )
+            ),
+            permissionGranted = permissionGranted
+        )
+    }
 }
 
 class PendingOptimizeLaunchCoordinator(

@@ -187,10 +187,14 @@ class OptimizeScreenController(
     private var selectedTreeUri: Uri? = restoreSelectedTreeUri()
     private var latestRunState: RunState = RunState.Idle
     private val pendingLaunchCoordinator = PendingOptimizeLaunchCoordinator(
-        SharedPreferencesPendingOptimizeLaunchStorage(preferences)
+        StrictPendingOptimizeLaunchStorage(
+            SharedPreferencesPendingOptimizeLaunchRecordStore(preferences)
+        )
     )
     private val capabilityCache = SelectedTreeCapabilitiesCache(::readSelectedTreeCapabilities)
-    private val startDispatchGate = OptimizeStartDispatchGate()
+    private val startDispatchGate = OptimizeStartDispatchGate(
+        SharedPreferencesOptimizeDispatchStateStorage(preferences)
+    )
     private val progressPort: OptimizeProgressIndicator by lazy {
         object : OptimizeProgressIndicator {
             override val indeterminate: Boolean
@@ -716,84 +720,82 @@ class OptimizeScreenController(
     }
 }
 
-private class SharedPreferencesPendingOptimizeLaunchStorage(
+private class SharedPreferencesPendingOptimizeLaunchRecordStore(
     private val preferences: SharedPreferences
-) : PendingOptimizeLaunchStorage {
-    override fun read(): PendingOptimizeLaunch? {
-        if (!preferences.getBoolean(KEY_PRESENT, false)) return null
-        val treeUri = preferences.getString(KEY_TREE_URI, null) ?: return clearInvalid()
-        val mode = try {
-            OptimizeMode.valueOf(preferences.getString(KEY_MODE, null) ?: return clearInvalid())
-        } catch (_: IllegalArgumentException) {
-            return clearInvalid()
+) : PendingOptimizeLaunchRecordStore {
+    override fun read(): Map<String, Any?> = preferences.all
+        .filterKeys { it.startsWith(PendingOptimizeLaunchRecordCodec.KEY_PREFIX) }
+
+    override fun write(record: Map<String, Any?>) {
+        val editor = preferences.edit()
+        preferences.all.keys
+            .filter { it.startsWith(PendingOptimizeLaunchRecordCodec.KEY_PREFIX) }
+            .forEach { editor.remove(it) }
+        record.forEach { (key, value) ->
+            when (value) {
+                is Boolean -> editor.putBoolean(key, value)
+                is String -> editor.putString(key, value)
+                else -> throw IllegalArgumentException("Unsupported pending launch field: $key")
+            }
         }
-        val permissionGranted = when (preferences.getString(KEY_PERMISSION_RESULT, null)) {
-            RESULT_PENDING -> null
-            RESULT_GRANTED -> true
-            RESULT_DENIED -> false
-            else -> return clearInvalid()
-        }
-        return PendingOptimizeLaunch(
-            request = ServiceRunRequest.Optimize(
-                treeUri = treeUri,
-                runIntent = RunIntent(
-                    mode = mode,
-                    dryRun = preferences.getBoolean(KEY_DRY_RUN, false),
-                    apkLabMode = preferences.getBoolean(KEY_APK_LAB, false),
-                    textMinify = preferences.getBoolean(KEY_TEXT_MINIFY, false)
-                )
-            ),
-            permissionGranted = permissionGranted
-        )
+        editor.apply()
     }
 
-    override fun write(value: PendingOptimizeLaunch) {
-        val request = value.request
+    override fun clear() {
+        val editor = preferences.edit()
+        preferences.all.keys
+            .filter { it.startsWith(PendingOptimizeLaunchRecordCodec.KEY_PREFIX) }
+            .forEach { editor.remove(it) }
+        editor.apply()
+    }
+}
+
+private class SharedPreferencesOptimizeDispatchStateStorage(
+    private val preferences: SharedPreferences
+) : OptimizeDispatchStateStorage {
+    override fun read(): PersistedOptimizeDispatch? {
+        return try {
+            val values = preferences.all.filterKeys { it == KEY_PRESENT || it == KEY_BASELINE }
+            if (values.isEmpty()) {
+                null
+            } else {
+                val present = values[KEY_PRESENT] as? Boolean
+                val baseline = values[KEY_BASELINE] as? String
+                if (values.keys != KEYS || present != true || baseline.isNullOrEmpty()) {
+                    clear()
+                    null
+                } else {
+                    PersistedOptimizeDispatch(baseline)
+                }
+            }
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) throw failure
+            try {
+                clear()
+            } catch (clearFailure: Throwable) {
+                if (clearFailure.isVmFatal()) throw clearFailure
+            }
+            null
+        }
+    }
+
+    override fun write(value: PersistedOptimizeDispatch) {
         preferences.edit()
             .putBoolean(KEY_PRESENT, true)
-            .putString(KEY_TREE_URI, request.treeUri)
-            .putString(KEY_MODE, request.runIntent.mode.name)
-            .putBoolean(KEY_DRY_RUN, request.runIntent.dryRun)
-            .putBoolean(KEY_APK_LAB, request.runIntent.apkLabMode)
-            .putBoolean(KEY_TEXT_MINIFY, request.runIntent.textMinify)
-            .putString(
-                KEY_PERMISSION_RESULT,
-                when (value.permissionGranted) {
-                    null -> RESULT_PENDING
-                    true -> RESULT_GRANTED
-                    false -> RESULT_DENIED
-                }
-            )
+            .putString(KEY_BASELINE, value.baselineStateKey)
             .apply()
     }
 
     override fun clear() {
         preferences.edit()
             .remove(KEY_PRESENT)
-            .remove(KEY_TREE_URI)
-            .remove(KEY_MODE)
-            .remove(KEY_DRY_RUN)
-            .remove(KEY_APK_LAB)
-            .remove(KEY_TEXT_MINIFY)
-            .remove(KEY_PERMISSION_RESULT)
+            .remove(KEY_BASELINE)
             .apply()
     }
 
-    private fun clearInvalid(): PendingOptimizeLaunch? {
-        clear()
-        return null
-    }
-
     private companion object {
-        const val KEY_PRESENT = "pending_launch_present"
-        const val KEY_TREE_URI = "pending_launch_tree_uri"
-        const val KEY_MODE = "pending_launch_mode"
-        const val KEY_DRY_RUN = "pending_launch_dry_run"
-        const val KEY_APK_LAB = "pending_launch_apk_lab"
-        const val KEY_TEXT_MINIFY = "pending_launch_text_minify"
-        const val KEY_PERMISSION_RESULT = "pending_launch_permission_result"
-        const val RESULT_PENDING = "pending"
-        const val RESULT_GRANTED = "granted"
-        const val RESULT_DENIED = "denied"
+        const val KEY_PRESENT = "optimize_dispatch_present"
+        const val KEY_BASELINE = "optimize_dispatch_baseline"
+        val KEYS = setOf(KEY_PRESENT, KEY_BASELINE)
     }
 }
