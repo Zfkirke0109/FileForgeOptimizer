@@ -301,6 +301,29 @@ class OptimizeUiProgressFlowTest {
     }
 
     @Test
+    fun identicalTerminalReplayClearsWhenServiceFinishedWhileUiWasDetached() {
+        val ownership = OptimizeDispatchOwnership()
+        val original = OptimizeStartDispatchGate(ownership)
+        val terminal = RunState.Terminal(
+            OptimizationReport(
+                status = RunStatus.FAILED,
+                terminalError = "foreground entry failed"
+            ),
+            dryRun = false
+        )
+        original.onObservedState(terminal, sequence = 1)
+        assertTrue(original.beginDispatch(observationWatermark = 1))
+        ownership.onServiceFinished()
+
+        val recreated = OptimizeStartDispatchGate(ownership)
+        recreated.awaitReplay()
+        recreated.onObservedState(terminal, sequence = 1)
+
+        assertFalse(recreated.isPending)
+        assertTrue(recreated.allowsStart(baseStartEnabled = true))
+    }
+
+    @Test
     fun synchronousDispatchFailureClearsProcessOwnershipForNextController() {
         val ownership = OptimizeDispatchOwnership()
         val original = OptimizeStartDispatchGate(ownership)

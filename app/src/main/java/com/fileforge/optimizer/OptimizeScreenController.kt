@@ -189,11 +189,12 @@ class OptimizeScreenController(
     private val pendingLaunchCoordinator = PendingOptimizeLaunchCoordinator(
         StrictPendingOptimizeLaunchStorage(
             SharedPreferencesPendingOptimizeLaunchRecordStore(preferences)
-        )
+        ),
+        ::readTreeCapabilities
     )
     private val capabilityCache = SelectedTreeCapabilitiesCache(::readSelectedTreeCapabilities)
     private val startDispatchGate = OptimizeStartDispatchGate(
-        SharedPreferencesOptimizeDispatchStateStorage(preferences)
+        ProcessOptimizeDispatchOwnership.instance
     )
     private val progressPort: OptimizeProgressIndicator by lazy {
         object : OptimizeProgressIndicator {
@@ -589,15 +590,11 @@ class OptimizeScreenController(
     }
 
     private fun drainPendingPermissionLaunch() {
-        val pending = pendingLaunchCoordinator.pending() ?: return
-        val projection = OptimizeUiStateProjector.project(
-            latestRunState,
-            capabilityCache.current,
-            pending.request.runIntent.dryRun
-        )
         val launch = pendingLaunchCoordinator.takeReady(
             replayReady = startDispatchGate.isReplayReady,
-            startAllowed = startDispatchGate.allowsStart(projection.startEnabled)
+            dispatchAvailable = startDispatchGate.allowsStart(
+                baseStartEnabled = latestRunState !is RunState.Running
+            )
         ) ?: return
         if (launch.explainReducedVisibility) explainReducedNotificationVisibility()
         dispatchStart(launch.request)
@@ -605,8 +602,13 @@ class OptimizeScreenController(
 
     private fun readSelectedTreeCapabilities(): SelectedTreeCapabilities {
         val uri = selectedTreeUri ?: return SelectedTreeCapabilities.NONE
+        return readTreeCapabilities(uri.toString())
+    }
+
+    private fun readTreeCapabilities(treeUri: String): SelectedTreeCapabilities {
+        if (!ContentTreeUriValidator.isValid(treeUri)) return SelectedTreeCapabilities.NONE
         return try {
-            val root = DocumentFile.fromTreeUri(activity, uri)
+            val root = DocumentFile.fromTreeUri(activity, Uri.parse(treeUri))
                 ?: return SelectedTreeCapabilities.NONE
             SelectedTreeCapabilities(
                 exists = root.exists(),
@@ -747,55 +749,5 @@ private class SharedPreferencesPendingOptimizeLaunchRecordStore(
             .filter { it.startsWith(PendingOptimizeLaunchRecordCodec.KEY_PREFIX) }
             .forEach { editor.remove(it) }
         editor.apply()
-    }
-}
-
-private class SharedPreferencesOptimizeDispatchStateStorage(
-    private val preferences: SharedPreferences
-) : OptimizeDispatchStateStorage {
-    override fun read(): PersistedOptimizeDispatch? {
-        return try {
-            val values = preferences.all.filterKeys { it == KEY_PRESENT || it == KEY_BASELINE }
-            if (values.isEmpty()) {
-                null
-            } else {
-                val present = values[KEY_PRESENT] as? Boolean
-                val baseline = values[KEY_BASELINE] as? String
-                if (values.keys != KEYS || present != true || baseline.isNullOrEmpty()) {
-                    clear()
-                    null
-                } else {
-                    PersistedOptimizeDispatch(baseline)
-                }
-            }
-        } catch (failure: Throwable) {
-            if (failure.isVmFatal()) throw failure
-            try {
-                clear()
-            } catch (clearFailure: Throwable) {
-                if (clearFailure.isVmFatal()) throw clearFailure
-            }
-            null
-        }
-    }
-
-    override fun write(value: PersistedOptimizeDispatch) {
-        preferences.edit()
-            .putBoolean(KEY_PRESENT, true)
-            .putString(KEY_BASELINE, value.baselineStateKey)
-            .apply()
-    }
-
-    override fun clear() {
-        preferences.edit()
-            .remove(KEY_PRESENT)
-            .remove(KEY_BASELINE)
-            .apply()
-    }
-
-    private companion object {
-        const val KEY_PRESENT = "optimize_dispatch_present"
-        const val KEY_BASELINE = "optimize_dispatch_baseline"
-        val KEYS = setOf(KEY_PRESENT, KEY_BASELINE)
     }
 }

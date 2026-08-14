@@ -156,6 +156,7 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
     }
 
     override fun stopForegroundAndSelf() {
+        ProcessOptimizeDispatchOwnership.instance.onServiceFinished()
         stopForeground(STOP_FOREGROUND_DETACH)
         foregroundNotificationActive = false
         detailedNotificationUpdatesAllowed = false

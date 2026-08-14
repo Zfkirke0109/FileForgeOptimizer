@@ -1,5 +1,7 @@
 package com.fileforge.optimizer
 
+import java.net.URI
+import java.net.URISyntaxException
 import java.util.concurrent.atomic.AtomicLong
 
 interface OptimizeProgressIndicator {
@@ -109,85 +111,96 @@ class RunStateObservationSequencer {
         SequencedRunState(sequence.incrementAndGet(), state)
 }
 
-data class PersistedOptimizeDispatch(
-    val baselineStateKey: String
+internal data class OptimizeDispatchClaim(
+    val id: Long,
+    val baselineStateKey: String,
+    val serviceFinished: Boolean = false
 )
 
-interface OptimizeDispatchStateStorage {
-    fun read(): PersistedOptimizeDispatch?
-    fun write(value: PersistedOptimizeDispatch)
-    fun clear()
+/** Lives only as long as the process that can own the started service. */
+class OptimizeDispatchOwnership {
+    private val lock = Any()
+    private var nextId = 0L
+    private var claim: OptimizeDispatchClaim? = null
+
+    internal fun current(): OptimizeDispatchClaim? = synchronized(lock) { claim }
+
+    internal fun tryClaim(baselineStateKey: String): OptimizeDispatchClaim? =
+        synchronized(lock) {
+            if (claim != null) return@synchronized null
+            OptimizeDispatchClaim(++nextId, baselineStateKey).also { claim = it }
+        }
+
+    internal fun release(expected: OptimizeDispatchClaim) {
+        synchronized(lock) {
+            if (claim?.id == expected.id) claim = null
+        }
+    }
+
+    internal fun onServiceFinished() {
+        synchronized(lock) {
+            claim = claim?.copy(serviceFinished = true)
+        }
+    }
 }
 
-private class MemoryOptimizeDispatchStateStorage : OptimizeDispatchStateStorage {
-    private var value: PersistedOptimizeDispatch? = null
-
-    override fun read(): PersistedOptimizeDispatch? = value
-
-    override fun write(value: PersistedOptimizeDispatch) {
-        this.value = value
-    }
-
-    override fun clear() {
-        value = null
-    }
+internal object ProcessOptimizeDispatchOwnership {
+    val instance = OptimizeDispatchOwnership()
 }
 
 class OptimizeStartDispatchGate(
-    private val storage: OptimizeDispatchStateStorage = MemoryOptimizeDispatchStateStorage()
+    private val ownership: OptimizeDispatchOwnership = OptimizeDispatchOwnership()
 ) {
     var isReplayReady: Boolean = false
         private set
-    private var pendingDispatch: PersistedOptimizeDispatch? = storage.read()
-    var isPending: Boolean = pendingDispatch != null
-        private set
+    val isPending: Boolean
+        get() = ownership.current() != null
     private var releaseAfterSequence: Long = 0
-    private var lastObservedKey: String? = pendingDispatch?.baselineStateKey
+    private var lastObservedKey: String? = ownership.current()?.baselineStateKey
+    private var suppressEquivalentReplay = isPending
+    private var dispatchClaim: OptimizeDispatchClaim? = null
 
     fun beginDispatch(observationWatermark: Long): Boolean {
         if (!isReplayReady || isPending) return false
         val baselineStateKey = lastObservedKey ?: return false
-        val persisted = PersistedOptimizeDispatch(baselineStateKey)
-        storage.write(persisted)
-        pendingDispatch = persisted
-        isPending = true
+        dispatchClaim = ownership.tryClaim(baselineStateKey) ?: return false
         releaseAfterSequence = observationWatermark
         return true
     }
 
     fun awaitReplay() {
         isReplayReady = false
+        suppressEquivalentReplay = isPending
     }
 
     fun onObservedState(state: RunState, sequence: Long) {
         val stateKey = state.semanticKey()
+        val pending = ownership.current()
+        val unchangedPendingReplay = !isReplayReady && suppressEquivalentReplay &&
+            pending != null && !pending.serviceFinished && stateKey == pending.baselineStateKey
         if (!isReplayReady) {
             isReplayReady = true
         }
+        suppressEquivalentReplay = false
         lastObservedKey = stateKey
-        val baselineStateKey = pendingDispatch?.baselineStateKey
-        val acknowledged = when (state) {
-            is RunState.Running -> true
-            is RunState.Terminal -> stateKey != baselineStateKey
-            RunState.Idle -> false
+        if (unchangedPendingReplay) {
+            releaseAfterSequence = maxOf(releaseAfterSequence, sequence)
+            return
         }
-        if (isPending && sequence > releaseAfterSequence && acknowledged) {
-            clearPendingDispatch()
+        val acknowledged = state is RunState.Running || state is RunState.Terminal
+        if (pending != null && sequence > releaseAfterSequence && acknowledged) {
+            ownership.release(pending)
+            if (dispatchClaim?.id == pending.id) dispatchClaim = null
         }
     }
 
     fun onDispatchFailed() {
-        clearPendingDispatch()
+        dispatchClaim?.let(ownership::release)
+        dispatchClaim = null
     }
 
     fun allowsStart(baseStartEnabled: Boolean): Boolean =
         baseStartEnabled && isReplayReady && !isPending
-
-    private fun clearPendingDispatch() {
-        storage.clear()
-        pendingDispatch = null
-        isPending = false
-    }
 }
 
 private fun RunState.semanticKey(): String {
@@ -211,7 +224,7 @@ private fun RunState.semanticKey(): String {
     }.value()
 }
 
-/** Length-prefixed state encoding: persisted equality is exact without hash collisions. */
+/** Length-prefixed state encoding keeps equality exact without hash collisions. */
 private class SemanticStateKeyWriter {
     private val value = StringBuilder()
 
@@ -367,7 +380,7 @@ internal object PendingOptimizeLaunchRecordCodec {
             return null
         }
         val treeUri = record[KEY_TREE_URI] as? String ?: return null
-        if (treeUri.isBlank()) return null
+        if (!ContentTreeUriValidator.isValid(treeUri)) return null
         val modeName = record[KEY_MODE] as? String ?: return null
         val mode = OptimizeMode.entries.firstOrNull { it.name == modeName } ?: return null
         val dryRun = record[KEY_DRY_RUN] as? Boolean ?: return null
@@ -395,7 +408,8 @@ internal object PendingOptimizeLaunchRecordCodec {
 }
 
 class PendingOptimizeLaunchCoordinator(
-    private val storage: PendingOptimizeLaunchStorage
+    private val storage: PendingOptimizeLaunchStorage,
+    private val capabilitiesForTreeUri: (String) -> SelectedTreeCapabilities
 ) {
     fun beginPermissionRequest(request: ServiceRunRequest.Optimize) {
         storage.write(PendingOptimizeLaunch(request, permissionGranted = null))
@@ -406,17 +420,62 @@ class PendingOptimizeLaunchCoordinator(
         storage.write(current.copy(permissionGranted = granted))
     }
 
-    fun pending(): PendingOptimizeLaunch? = storage.read()
-
-    fun takeReady(replayReady: Boolean, startAllowed: Boolean): ReadyOptimizeLaunch? {
+    fun takeReady(replayReady: Boolean, dispatchAvailable: Boolean): ReadyOptimizeLaunch? {
         val current = storage.read() ?: return null
         val granted = current.permissionGranted ?: return null
-        if (!replayReady || !startAllowed) return null
+        if (!replayReady || !dispatchAvailable) return null
+        if (!ContentTreeUriValidator.isValid(current.request.treeUri)) {
+            storage.clear()
+            return null
+        }
+        val capabilities = try {
+            capabilitiesForTreeUri(current.request.treeUri)
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) throw failure
+            storage.clear()
+            return null
+        }
+        if (!OptimizeRequestAccessPolicy.allows(current.request, capabilities)) {
+            storage.clear()
+            return null
+        }
         storage.clear()
         return ReadyOptimizeLaunch(
             request = current.request,
             explainReducedVisibility = !granted
         )
+    }
+}
+
+internal object ContentTreeUriValidator {
+    fun isValid(value: String): Boolean {
+        if (value.isBlank() || value != value.trim()) return false
+        val uri = try {
+            URI(value)
+        } catch (_: URISyntaxException) {
+            return false
+        }
+        if (uri.scheme != "content" || uri.isOpaque || uri.rawAuthority.isNullOrBlank()) {
+            return false
+        }
+        if (uri.rawQuery != null || uri.rawFragment != null) return false
+        val pathSegments = uri.rawPath?.split('/') ?: return false
+        return pathSegments.size == 3 && pathSegments[0].isEmpty() &&
+            pathSegments[1] == "tree" && pathSegments[2].isNotBlank() &&
+            pathSegments[2] != "." && pathSegments[2] != ".."
+    }
+}
+
+private object OptimizeRequestAccessPolicy {
+    fun allows(
+        request: ServiceRunRequest.Optimize,
+        capabilities: SelectedTreeCapabilities
+    ): Boolean {
+        if (!ContentTreeUriValidator.isValid(request.treeUri)) return false
+        if (!capabilities.exists || !capabilities.isDirectory || !capabilities.canRead) {
+            return false
+        }
+        return request.runIntent.dryRun || capabilities.canWrite
     }
 }
 
