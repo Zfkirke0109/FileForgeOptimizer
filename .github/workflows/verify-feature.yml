@@ -43,15 +43,36 @@ jobs:
             run_large_streaming_test=true
           elif git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- \
             app/src/main/java/com/fileforge/optimizer/StreamingZipOptimizer.kt \
-            app/src/main/java/com/fileforge/optimizer/CancellationToken.kt | \
+            app/src/main/java/com/fileforge/optimizer/CancellationToken.kt \
+            app/src/test/java/com/fileforge/optimizer/LargeStreamingZipTest.kt | \
             grep -F -x -q -e app/src/main/java/com/fileforge/optimizer/StreamingZipOptimizer.kt \
-              -e app/src/main/java/com/fileforge/optimizer/CancellationToken.kt; then
+              -e app/src/main/java/com/fileforge/optimizer/CancellationToken.kt \
+              -e app/src/test/java/com/fileforge/optimizer/LargeStreamingZipTest.kt; then
             run_large_streaming_test=true
           fi
 
           echo "FILEFORGE_RUN_LARGE_STREAMING_TEST=$run_large_streaming_test" >> "$GITHUB_ENV"
       - name: Test, lint, and assemble debug APK
         run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+      - name: Report large streaming metrics
+        if: env.FILEFORGE_RUN_LARGE_STREAMING_TEST == 'true'
+        run: |
+          results_file=app/build/test-results/testDebugUnitTest/TEST-com.fileforge.optimizer.LargeStreamingZipTest.xml
+          if [[ ! -f "$results_file" ]]; then
+            echo "Large streaming test results were not produced" >&2
+            exit 1
+          fi
+
+          mapfile -t metrics < <(
+            grep -E -o \
+              'FILEFORGE_LARGE_STREAMING_METRICS payloadBytes=[0-9]+ wallTimeMillis=[0-9]+ maxHeapDeltaBytes=[0-9]+' \
+              "$results_file"
+          )
+          if [[ "${#metrics[@]}" -ne 1 ]]; then
+            echo "Expected exactly one large streaming metrics line, found ${#metrics[@]}" >&2
+            exit 1
+          fi
+          echo "${metrics[0]}"
       - name: Upload unsigned debug APK
         if: success()
         uses: actions/upload-artifact@v4

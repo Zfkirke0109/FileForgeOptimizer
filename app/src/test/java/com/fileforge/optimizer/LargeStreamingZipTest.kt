@@ -7,6 +7,8 @@ import org.junit.Test
 import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -24,21 +26,39 @@ class LargeStreamingZipTest {
         val output = Files.createTempFile("fileforge-301m-output", ".zip")
         try {
             write301MiBArchive(source)
-            val before = stabilizedUsedHeap()
-
-            Files.newInputStream(source).use { input ->
-                Files.newOutputStream(output).use { destination ->
-                    optimizer.optimize(input, destination, OptimizeMode.SAFE, NeverCancelled) {}
+            val baselineUsedHeap = stabilizedUsedHeap()
+            val heapSampler = UsedHeapSampler(baselineUsedHeap)
+            var wallTimeMillis = 0L
+            var maxHeapDeltaBytes = 0L
+            heapSampler.start()
+            val startedAtNanos = System.nanoTime()
+            try {
+                Files.newInputStream(source).use { input ->
+                    Files.newOutputStream(output).use { destination ->
+                        optimizer.optimize(input, destination, OptimizeMode.SAFE, NeverCancelled) {}
+                    }
                 }
-            }
 
-            val after = stabilizedUsedHeap()
-            Files.newInputStream(output).use { optimized ->
-                val verification = optimizer.verify(optimized, NeverCancelled)
-                assertEquals(1, verification.entries)
-                assertEquals(ARCHIVE_PAYLOAD_BYTES, verification.bytesRead)
+                Files.newInputStream(output).use { optimized ->
+                    val verification = optimizer.verify(optimized, NeverCancelled)
+                    assertEquals(1, verification.entries)
+                    assertEquals(ARCHIVE_PAYLOAD_BYTES, verification.bytesRead)
+                }
+            } finally {
+                heapSampler.sampleNow()
+                wallTimeMillis = (System.nanoTime() - startedAtNanos) / NANOS_PER_MILLISECOND
+                maxHeapDeltaBytes = heapSampler.stopAndGetMaxDeltaBytes()
+                println(
+                    "FILEFORGE_LARGE_STREAMING_METRICS " +
+                        "payloadBytes=$ARCHIVE_PAYLOAD_BYTES " +
+                        "wallTimeMillis=$wallTimeMillis " +
+                        "maxHeapDeltaBytes=$maxHeapDeltaBytes"
+                )
             }
-            assertTrue("heap growth was ${after - before} bytes", after - before < MAX_HEAP_GROWTH_BYTES)
+            assertTrue(
+                "sampled peak heap delta was $maxHeapDeltaBytes bytes over ${wallTimeMillis}ms",
+                maxHeapDeltaBytes < MAX_HEAP_GROWTH_BYTES
+            )
         } finally {
             Files.deleteIfExists(source)
             Files.deleteIfExists(output)
@@ -81,9 +101,62 @@ class LargeStreamingZipTest {
         return runtime.totalMemory() - runtime.freeMemory()
     }
 
+    private class UsedHeapSampler(private val baselineUsedHeap: Long) {
+        private val running = AtomicBoolean(false)
+        private val peakUsedHeap = AtomicLong(baselineUsedHeap)
+        private val thread = Thread({ sampleUntilStopped() }, "fileforge-large-streaming-heap-sampler").apply {
+            isDaemon = true
+        }
+
+        fun start() {
+            check(running.compareAndSet(false, true)) { "Heap sampler can only be started once" }
+            thread.start()
+        }
+
+        fun sampleNow() {
+            recordUsedHeap()
+        }
+
+        fun stopAndGetMaxDeltaBytes(): Long {
+            running.set(false)
+            thread.interrupt()
+            try {
+                thread.join(SAMPLER_JOIN_TIMEOUT_MILLIS)
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw AssertionError("Interrupted while stopping heap sampler", interrupted)
+            }
+            check(!thread.isAlive) { "Heap sampler did not stop" }
+            return maxOf(0L, peakUsedHeap.get() - baselineUsedHeap)
+        }
+
+        private fun sampleUntilStopped() {
+            while (running.get()) {
+                recordUsedHeap()
+                try {
+                    Thread.sleep(SAMPLE_INTERVAL_MILLIS)
+                } catch (_: InterruptedException) {
+                    // stopAndGetMaxDeltaBytes interrupts the sleep so the daemon can join promptly.
+                }
+            }
+        }
+
+        private fun recordUsedHeap() {
+            val runtime = Runtime.getRuntime()
+            val usedHeap = runtime.totalMemory() - runtime.freeMemory()
+            while (true) {
+                val previousPeak = peakUsedHeap.get()
+                if (usedHeap <= previousPeak || peakUsedHeap.compareAndSet(previousPeak, usedHeap)) return
+            }
+        }
+    }
+
     private companion object {
         const val BLOCK_BYTES = 8 * 1024
         const val ARCHIVE_PAYLOAD_BYTES = 301L * 1024L * 1024L
         const val MAX_HEAP_GROWTH_BYTES = 64L * 1024L * 1024L
+        const val SAMPLE_INTERVAL_MILLIS = 5L
+        const val SAMPLER_JOIN_TIMEOUT_MILLIS = 5_000L
+        const val NANOS_PER_MILLISECOND = 1_000_000L
     }
 }
