@@ -1,5 +1,6 @@
 package com.fileforge.optimizer
 
+import android.content.ComponentName
 import android.content.Context
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
@@ -15,6 +16,7 @@ import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.hamcrest.Matchers.allOf
 import org.hamcrest.Matchers.not
+import org.junit.Assert.assertEquals
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -98,6 +100,37 @@ class OptimizeScreenTest {
             scenario.recreate()
             assertRunningControlsVisible()
         }
+    }
+
+    @Test
+    fun visibleIdleScreenAcceptsUnknownTotalRunningStateWithoutProgressModeCrash() {
+        ActivityScenario.launch(MainActivity::class.java).use {
+            onView(withId(R.id.run_progress)).perform(scrollTo()).check(matches(isDisplayed()))
+
+            RunStateRepository.forAndroid(context).publish(
+                RunState.Running(
+                    ProgressSnapshot(
+                        phase = "discovering",
+                        currentRelativePath = "Documents/report.pdf",
+                        filesProcessed = 1,
+                        totalWork = null
+                    ),
+                    dryRun = true
+                )
+            )
+
+            onView(withText("Documents/report.pdf"))
+                .perform(scrollTo())
+                .check(matches(isDisplayed()))
+        }
+    }
+
+    @Test
+    fun cancelCommandTargetsOnlyTheOptimizationServiceActionBoundary() {
+        val intent = OptimizationService.cancelIntent(context)
+
+        assertEquals(OptimizationService.ACTION_CANCEL, intent.action)
+        assertEquals(ComponentName(context, OptimizationService::class.java), intent.component)
     }
 
     private fun assertRunningControlsVisible() {
