@@ -65,7 +65,8 @@ data class OptimizationReport(
     var bytesWritten: Long = 0,
     var status: RunStatus = RunStatus.RUNNING,
     var skipsByReason: Map<SkipReason, Int> = emptyMap(),
-    var terminalError: String? = null
+    var terminalError: String? = null,
+    var terminalFailures: List<String> = emptyList()
 )
 
 enum class FileKind {

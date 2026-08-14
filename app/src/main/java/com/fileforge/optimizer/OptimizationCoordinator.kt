@@ -24,6 +24,12 @@ data class CommitContext(
     }
 }
 
+class UndoDurabilityException(
+    message: String,
+    cause: Throwable,
+    val rollback: RollbackResult
+) : java.io.IOException(message, cause)
+
 internal interface ZipCandidateProcessor {
     fun optimize(
         input: InputStream,
@@ -142,6 +148,8 @@ class OptimizationCoordinator(
             }
         } catch (cancelled: OptimizationCancelledException) {
             throw cancelled
+        } catch (poisoned: UndoDurabilityException) {
+            throw poisoned
         } catch (failure: Exception) {
             FileOutcome.Failed(relativePath, failure.message ?: failure.javaClass.name, failure)
         }
@@ -228,6 +236,7 @@ class OptimizationCoordinator(
         var originalIntegrity: StreamIntegrity? = null
         var originalMutationStarted = false
         var transactionDurable = false
+        var undoAppendStarted = false
         return try {
             val backupPath = backupPath(context.runId, relativePath)
             val backupNode = createBackup(context.selectedRoot, backupPath)
@@ -248,6 +257,7 @@ class OptimizationCoordinator(
             val verifiedOriginal = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, cancellation) }
             check(verifiedOriginal == writtenCandidate) { "Optimized document verification failed" }
 
+            undoAppendStarted = true
             context.undoEntrySink.appendAndFlush(
                 UndoEntry(
                     relativePath = relativePath,
@@ -279,6 +289,11 @@ class OptimizationCoordinator(
                 restoreBackup(original, rollbackBackup, rollbackIntegrity)
             } else {
                 RollbackResult.NotNeeded
+            }
+            if (undoAppendStarted && !transactionDurable) {
+                throw UndoDurabilityException("Undo append/flush failed; the run log is poisoned", failure, rollback).also {
+                    if (rollback is RollbackResult.Failed) it.addSuppressed(rollback.cause)
+                }
             }
             FileOutcome.Failed(relativePath, failure.message ?: failure.javaClass.name, failure, rollback)
         }

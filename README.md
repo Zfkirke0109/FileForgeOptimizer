@@ -28,7 +28,11 @@ Each real run writes:
 - an append-only `FileForge_Undo_v2_<run-id>.jsonl` log;
 - one flushed header, one flushed record per committed replacement, and one terminal summary for completion, cancellation, or failure.
 
+FileForge verifies the name, type, and resolved identity returned by SAF creation calls and fails closed before original-file mutation when those checks disagree. Android's generic SAF API does not offer a universal atomic create-if-absent operation, so run identifiers include high-resolution time plus random entropy to make cross-process name collisions impractical rather than claiming provider-independent atomic exclusivity.
+
 The undo reader accepts both v2 JSONL and the legacy text format. V2 restores verify SHA-256 and size; legacy restores are clearly limited to size verification. Restore operations verify the backup before writing, verify the restored original afterward, and create independent `FileForge_Restore_*` audit receipts without deleting backups or undo logs.
+
+If an undo entry write or flush fails, FileForge treats that writer as poisoned: it restores the current original, stops the run, and leaves the log conservatively interrupted without appending more records. Recoverable provider and orchestration errors return a terminal failed report and attempt a failed terminal record when the writer is healthy. VM-fatal failures (`OutOfMemoryError`, `StackOverflowError`, and `ThreadDeath`) are rethrown after best-effort cleanup, with secondary finalization failures attached rather than masking the primary.
 
 ## Modes
 

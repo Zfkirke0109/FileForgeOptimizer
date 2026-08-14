@@ -60,6 +60,8 @@ class ByteArrayOptimizerAdapter(
             }
         } catch (cancelled: OptimizationCancelledException) {
             throw cancelled
+        } catch (poisoned: UndoDurabilityException) {
+            throw poisoned
         } catch (_: InputLimitExceededException) {
             FileOutcome.Skipped(relativePath, SkipReason.MEMORY_LIMIT, "Input exceeded the $maxInputBytes-byte in-memory limit while reading.")
         } catch (failure: Exception) {
@@ -102,6 +104,7 @@ class ByteArrayOptimizerAdapter(
         var originalIntegrity: StreamIntegrity? = null
         var originalMutationStarted = false
         var transactionDurable = false
+        var undoAppendStarted = false
         return try {
             val expectedOriginal = originalBytes.inputStream().use { StreamIntegrityChecker.hash(it, cancellation) }
             val backupPath = backupPath(context.runId, relativePath)
@@ -127,6 +130,7 @@ class ByteArrayOptimizerAdapter(
             val verifiedOriginal = documentGateway.openRead(originalNode).use { StreamIntegrityChecker.hash(it, cancellation) }
             check(verifiedOriginal == writtenCandidate) { "Optimized document verification failed" }
 
+            undoAppendStarted = true
             context.undoEntrySink.appendAndFlush(
                 UndoEntry(
                     relativePath = relativePath,
@@ -158,6 +162,11 @@ class ByteArrayOptimizerAdapter(
                 restoreBackup(originalNode, rollbackBackup, rollbackIntegrity)
             } else {
                 RollbackResult.NotNeeded
+            }
+            if (undoAppendStarted && !transactionDurable) {
+                throw UndoDurabilityException("Undo append/flush failed; the run log is poisoned", failure, rollback).also {
+                    if (rollback is RollbackResult.Failed) it.addSuppressed(rollback.cause)
+                }
             }
             FileOutcome.Failed(relativePath, failure.message ?: failure.javaClass.name, failure, rollback)
         }

@@ -3,10 +3,12 @@ package com.fileforge.optimizer
 import android.content.Context
 import androidx.documentfile.provider.DocumentFile
 import java.io.OutputStreamWriter
+import java.io.OutputStream
 import java.io.Writer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Android-free orchestration for one selected-tree optimization run. */
@@ -84,6 +86,8 @@ class OptimizerEngine(
         var filesDiscovered = 0
         var filesProcessed = 0
         var undo: UndoSession? = null
+        var undoPoisoned = false
+        var vmFatal: Throwable? = null
 
         fun progress(phase: String, path: String? = null) {
             try {
@@ -104,7 +108,8 @@ class OptimizerEngine(
                         totalWork = null
                     )
                 )
-            } catch (_: Exception) {
+            } catch (failure: Throwable) {
+                if (failure.isVmFatal()) throw failure
                 // Observers (activities, services, or notifications) do not own engine state.
             }
         }
@@ -151,47 +156,65 @@ class OptimizerEngine(
             report.status = if (report.errors == 0) RunStatus.COMPLETED else RunStatus.COMPLETED_WITH_ERRORS
         } catch (_: OptimizationCancelledException) {
             report.status = RunStatus.CANCELLED
-        } catch (failure: Exception) {
-            report.errors = checkedIncrement(report.errors)
+        } catch (poisoned: UndoDurabilityException) {
+            undoPoisoned = true
+            report.errors = saturatingIncrement(report.errors)
+            report.status = RunStatus.FAILED
+            report.terminalError = poisoned.message ?: poisoned.javaClass.name
+        } catch (failure: Throwable) {
+            report.errors = saturatingIncrement(report.errors)
             report.status = RunStatus.FAILED
             report.terminalError = failure.message ?: failure.javaClass.name
+            if (failure.isVmFatal()) vmFatal = failure
         } finally {
             if (report.status == RunStatus.RUNNING) {
-                report.errors = checkedIncrement(report.errors)
+                report.errors = saturatingIncrement(report.errors)
                 report.status = RunStatus.FAILED
                 report.terminalError = report.terminalError ?: "Run ended without a terminal status"
             }
             val session = undo
             if (session != null) {
                 var terminalDurable = false
-                try {
+                if (!undoPoisoned) try {
                     undoRepository.appendTerminal(session.writer, report.toTerminal(session.entriesCommitted, completedAt()))
                     terminalDurable = true
-                } catch (failure: Exception) {
-                    report.errors = checkedIncrement(report.errors)
-                    report.status = RunStatus.FAILED
-                    report.terminalError = failure.message ?: failure.javaClass.name
-                } finally {
-                    try {
-                        session.writer.close()
-                    } catch (failure: Exception) {
-                        if (!terminalDurable) {
-                            report.status = RunStatus.FAILED
-                            report.terminalError = report.terminalError ?: (failure.message ?: failure.javaClass.name)
-                        }
+                } catch (failure: Throwable) {
+                    val primaryFatal = vmFatal
+                    when {
+                        primaryFatal != null -> if (failure !== primaryFatal) primaryFatal.addSuppressed(failure)
+                        failure.isVmFatal() -> vmFatal = failure
+                        else -> recordFinalizationFailure(report, failure, mutateStatus = true)
+                    }
+                }
+                try {
+                    if (undoPoisoned) session.output.close() else session.writer.close()
+                } catch (failure: Throwable) {
+                    val primaryFatal = vmFatal
+                    when {
+                        primaryFatal != null -> if (failure !== primaryFatal) primaryFatal.addSuppressed(failure)
+                        failure.isVmFatal() -> vmFatal = failure
+                        else -> recordFinalizationFailure(report, failure, mutateStatus = !terminalDurable && !undoPoisoned)
                     }
                 }
             }
-            progress(
-                when (report.status) {
-                    RunStatus.COMPLETED -> "completed"
-                    RunStatus.COMPLETED_WITH_ERRORS -> "completed-with-errors"
-                    RunStatus.CANCELLED -> "cancelled"
-                    RunStatus.FAILED -> "failed"
-                    RunStatus.RUNNING -> "running"
-                }
-            )
+            try {
+                progress(
+                    when (report.status) {
+                        RunStatus.COMPLETED -> "completed"
+                        RunStatus.COMPLETED_WITH_ERRORS -> "completed-with-errors"
+                        RunStatus.CANCELLED -> "cancelled"
+                        RunStatus.FAILED -> "failed"
+                        RunStatus.RUNNING -> "running"
+                    }
+                )
+            } catch (failure: Throwable) {
+                val primary = vmFatal
+                if (primary != null) {
+                    if (failure !== primary) primary.addSuppressed(failure)
+                } else throw failure
+            }
         }
+        vmFatal?.let { throw it }
         return report
     }
 
@@ -212,6 +235,8 @@ class OptimizerEngine(
         }
     } catch (cancelled: OptimizationCancelledException) {
         throw cancelled
+    } catch (poisoned: UndoDurabilityException) {
+        throw poisoned
     } catch (failure: Exception) {
         FileOutcome.Failed(file.relativePath, failure.message ?: failure.javaClass.name, failure)
     }
@@ -311,7 +336,8 @@ class OptimizerEngine(
     private fun openUndoSession(): UndoSession {
         val name = "FileForge_Undo_v2_$runId.jsonl"
         val node = documentGateway.createFileExact(selectedRoot, "application/x-ndjson", name)
-        val writer = OutputStreamWriter(documentGateway.openWrite(node), Charsets.UTF_8)
+        val output = documentGateway.openWrite(node)
+        val writer = OutputStreamWriter(output, Charsets.UTF_8)
         return try {
             undoRepository.start(
                 writer,
@@ -326,7 +352,7 @@ class OptimizerEngine(
                     buildVariant = buildVariant
                 )
             )
-            UndoSession(writer)
+            UndoSession(writer, output)
         } catch (failure: Exception) {
             try { writer.close() } catch (closeFailure: Exception) { failure.addSuppressed(closeFailure) }
             throw failure
@@ -352,13 +378,29 @@ class OptimizerEngine(
     private fun checkedIncrement(value: Int): Int = Math.addExact(value, 1)
     private fun checkedAdd(left: Long, right: Long): Long = Math.addExact(left, right)
 
+    private fun recordFinalizationFailure(report: OptimizationReport, failure: Throwable, mutateStatus: Boolean) {
+        val message = failure.message ?: failure.javaClass.name
+        report.terminalFailures = report.terminalFailures + message
+        if (mutateStatus) {
+            report.errors = saturatingIncrement(report.errors)
+            report.status = RunStatus.FAILED
+            report.terminalError = report.terminalError ?: message
+        }
+    }
+
+    private fun Throwable.isVmFatal(): Boolean =
+        this is OutOfMemoryError || this is StackOverflowError || this is ThreadDeath
+
+    private fun saturatingIncrement(value: Int): Int = if (value == Int.MAX_VALUE) value else value + 1
+
     private data class ScannedFile(val node: DocumentNode, val relativePath: String)
     private data class DirectoryFrame(val children: Iterator<DocumentNode>)
-    private data class UndoSession(val writer: Writer, var entriesCommitted: Int = 0)
+    private data class UndoSession(val writer: Writer, val output: OutputStream, var entriesCommitted: Int = 0)
 
     private class AndroidBridge(context: Context, root: DocumentFile) {
         val gateway = SafDocumentGateway(context, root)
-        val runId: String = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val runId: String = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) +
+            "_${UUID.randomUUID().toString().take(12)}"
         val candidateStore = CandidateStore(context.cacheDir, runId)
         val appVersion: String = try {
             context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
