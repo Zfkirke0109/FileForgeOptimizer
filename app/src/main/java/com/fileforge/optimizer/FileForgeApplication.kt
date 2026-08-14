@@ -8,5 +8,6 @@ class FileForgeApplication : Application() {
         super.onCreate()
         ThemePreferences.forAndroid(this).applySavedMode()
         DynamicColors.applyToActivitiesIfAvailable(this)
+        OptimizationNotification.createChannel(this)
     }
 }
