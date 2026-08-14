@@ -7,8 +7,9 @@ import org.json.JSONTokener
 import java.util.ArrayDeque
 import java.util.Collections
 import java.util.LinkedHashMap
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 sealed interface RunState {
     object Idle : RunState
@@ -90,15 +91,25 @@ class RunStateRepository(private val storage: RunStateStorage) {
     }
 
     private fun drainPublications() {
-        while (true) {
-            val publication = synchronized(lock) {
-                pendingPublications.pollFirst().also { next ->
-                    if (next == null) drainOwned = false
+        try {
+            while (true) {
+                val publication = synchronized(lock) {
+                    pendingPublications.pollFirst().also { next ->
+                        if (next == null) drainOwned = false
+                    }
+                } ?: return
+                publication.targets.forEach { subscription ->
+                    subscription.deliver(publication.state)
                 }
-            } ?: return
-            publication.targets.forEach { subscription ->
-                subscription.deliver(publication.state)
             }
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) {
+                synchronized(lock) {
+                    pendingPublications.clear()
+                    drainOwned = false
+                }
+            }
+            throw failure
         }
     }
 
@@ -106,19 +117,39 @@ class RunStateRepository(private val storage: RunStateStorage) {
         private val listener: (RunState) -> Unit
     ) : AutoCloseable {
         private val active = AtomicBoolean(true)
-        private val replayFinished = CountDownLatch(1)
+        private val deliveryLock = ReentrantLock()
+        private val replayComplete = deliveryLock.newCondition()
+        private val deferredStates = ArrayDeque<RunState>()
+        private var replayingOrFlushing = true
+        private var replayOwner: Thread? = Thread.currentThread()
 
         fun replay(state: RunState) {
             try {
                 deliverNow(state)
+                flushDeferredStates()
             } finally {
-                replayFinished.countDown()
+                deliveryLock.withLock {
+                    deferredStates.clear()
+                    replayingOrFlushing = false
+                    replayOwner = null
+                    replayComplete.signalAll()
+                }
             }
         }
 
         fun deliver(state: RunState) {
-            awaitReplay()
-            deliverNow(state)
+            val shouldDeliver = deliveryLock.withLock {
+                if (!replayingOrFlushing) {
+                    true
+                } else if (replayOwner === Thread.currentThread()) {
+                    deferredStates.addLast(state)
+                    false
+                } else {
+                    while (replayingOrFlushing) replayComplete.awaitUninterruptibly()
+                    true
+                }
+            }
+            if (shouldDeliver) deliverNow(state)
         }
 
         private fun deliverNow(state: RunState) {
@@ -130,17 +161,13 @@ class RunStateRepository(private val storage: RunStateStorage) {
             }
         }
 
-        private fun awaitReplay() {
-            var interrupted = false
+        private fun flushDeferredStates() {
             while (true) {
-                try {
-                    replayFinished.await()
-                    break
-                } catch (_: InterruptedException) {
-                    interrupted = true
-                }
+                val state = deliveryLock.withLock {
+                    deferredStates.pollFirst()
+                } ?: return
+                deliverNow(state)
             }
-            if (interrupted) Thread.currentThread().interrupt()
         }
 
         override fun close() {
