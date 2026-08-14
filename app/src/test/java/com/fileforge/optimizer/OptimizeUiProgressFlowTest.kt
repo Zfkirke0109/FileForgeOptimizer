@@ -91,20 +91,30 @@ class OptimizeUiProgressFlowTest {
     }
 
     @Test
-    fun preexistingTerminalDoesNotClearNewStartDispatchUntilNewServiceStateArrives() {
+    fun initialReplayAndSequenceWatermarkGateStartAgainstQueuedPredispatchState() {
         val gate = OptimizeStartDispatchGate()
+
+        assertFalse(gate.isReplayReady)
+        assertFalse(gate.allowsStart(baseStartEnabled = true))
+        assertFalse(gate.beginDispatch(observationWatermark = 0))
+
         val previous = RunState.Terminal(
             OptimizationReport(status = RunStatus.COMPLETED),
             dryRun = false
         )
-        gate.onObservedState(previous)
+        gate.onObservedState(previous, sequence = 1)
 
-        gate.beginDispatch()
+        assertTrue(gate.isReplayReady)
+        assertTrue(gate.allowsStart(baseStartEnabled = true))
+        assertTrue(gate.beginDispatch(observationWatermark = 2))
 
         assertTrue(gate.isPending)
         assertFalse(gate.allowsStart(baseStartEnabled = true))
+        gate.onObservedState(previous, sequence = 2)
+        assertTrue(gate.isPending)
         gate.onObservedState(
-            RunState.Running(ProgressSnapshot(phase = "optimizing"), dryRun = false)
+            RunState.Running(ProgressSnapshot(phase = "optimizing"), dryRun = false),
+            sequence = 3
         )
         assertFalse(gate.isPending)
     }
@@ -116,9 +126,10 @@ class OptimizeUiProgressFlowTest {
             RunState.Terminal(
                 OptimizationReport(status = RunStatus.COMPLETED),
                 dryRun = false
-            )
+            ),
+            sequence = 1
         )
-        gate.beginDispatch()
+        assertTrue(gate.beginDispatch(observationWatermark = 1))
 
         gate.onObservedState(
             RunState.Terminal(
@@ -127,10 +138,25 @@ class OptimizeUiProgressFlowTest {
                     terminalError = "foreground entry failed"
                 ),
                 dryRun = false
-            )
+            ),
+            sequence = 2
         )
 
         assertFalse(gate.isPending)
+    }
+
+    @Test
+    fun runStateObservationSequencerNumbersSubmissionOrderAndExposesWatermark() {
+        val sequencer = RunStateObservationSequencer()
+
+        val first = sequencer.next(RunState.Idle)
+        val second = sequencer.next(
+            RunState.Running(ProgressSnapshot(phase = "discovering"), dryRun = true)
+        )
+
+        assertEquals(1L, first.sequence)
+        assertEquals(2L, second.sequence)
+        assertEquals(2L, sequencer.watermark)
     }
 
     private class RecordingProgressIndicator(
