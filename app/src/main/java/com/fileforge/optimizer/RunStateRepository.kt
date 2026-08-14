@@ -4,6 +4,7 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
+import java.util.ArrayDeque
 import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.concurrent.CountDownLatch
@@ -39,11 +40,15 @@ interface RunStateStorage {
 class RunStateRepository(private val storage: RunStateStorage) {
     private val lock = Any()
     private val subscriptions = LinkedHashSet<Subscription>()
+    private val pendingPublications = ArrayDeque<CommittedPublication>()
+    private var drainOwned = false
     private var current: RunState = restoreTerminal(storage) ?: RunState.Idle
 
     /**
-     * Immediately replays on the caller thread. Later states are delivered synchronously on the
-     * publishing thread. Callbacks never run while the repository lock is held.
+     * Immediately replays on the caller thread. Publications are delivered in commit order. An
+     * uncontended publisher drains on its own thread before returning; a concurrent or reentrant
+     * publisher may enqueue and return while the existing drain owner performs its callbacks.
+     * Callbacks never run while the repository lock is held.
      */
     fun observe(listener: (RunState) -> Unit): AutoCloseable {
         val subscription = Subscription(listener)
@@ -57,14 +62,44 @@ class RunStateRepository(private val storage: RunStateStorage) {
 
     fun publish(state: RunState) {
         val ownedState = state.defensiveCopy()
-        val targets = synchronized(lock) {
-            if (ownedState is RunState.Terminal) {
-                storage.write(RunStateJsonCodec.encode(ownedState))
+        val shouldDrain = synchronized(lock) {
+            val committedState = persistOrDiagnose(ownedState)
+            current = committedState
+            pendingPublications.addLast(
+                CommittedPublication(committedState, subscriptions.toList())
+            )
+            if (drainOwned) {
+                false
+            } else {
+                drainOwned = true
+                true
             }
-            current = ownedState
-            subscriptions.toList()
         }
-        targets.forEach { subscription -> subscription.deliver(ownedState) }
+        if (shouldDrain) drainPublications()
+    }
+
+    private fun persistOrDiagnose(state: RunState): RunState {
+        if (state !is RunState.Terminal) return state
+        return try {
+            storage.write(RunStateJsonCodec.encode(state))
+            state
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) throw failure
+            state.withPersistenceFailure()
+        }
+    }
+
+    private fun drainPublications() {
+        while (true) {
+            val publication = synchronized(lock) {
+                pendingPublications.pollFirst().also { next ->
+                    if (next == null) drainOwned = false
+                }
+            } ?: return
+            publication.targets.forEach { subscription ->
+                subscription.deliver(publication.state)
+            }
+        }
     }
 
     private inner class Subscription(
@@ -115,6 +150,11 @@ class RunStateRepository(private val storage: RunStateStorage) {
             }
         }
     }
+
+    private class CommittedPublication(
+        val state: RunState,
+        val targets: List<Subscription>
+    )
 
     companion object {
         @Volatile
@@ -297,6 +337,13 @@ private fun RunState.defensiveCopy(): RunState = when (this) {
     is RunState.Terminal -> RunState.Terminal(report, dryRun)
 }
 
+private fun RunState.Terminal.withPersistenceFailure(): RunState.Terminal {
+    val diagnosedReport = report
+    diagnosedReport.terminalFailures =
+        diagnosedReport.terminalFailures + RUN_STATE_PERSISTENCE_FAILURE
+    return RunState.Terminal(diagnosedReport, dryRun)
+}
+
 private fun ProgressSnapshot.defensiveCopy(): ProgressSnapshot = ProgressSnapshot(
     phase = phase,
     currentRelativePath = currentRelativePath,
@@ -317,3 +364,5 @@ private fun OptimizationReport.defensiveCopy(): OptimizationReport = copy(
     skipsByReason = Collections.unmodifiableMap(LinkedHashMap(skipsByReason)),
     terminalFailures = Collections.unmodifiableList(ArrayList(terminalFailures))
 )
+
+private const val RUN_STATE_PERSISTENCE_FAILURE = "Run state persistence failed"

@@ -173,12 +173,22 @@ object OptimizationNotification {
 
     private fun renderTerminal(state: RunState.Terminal): NotificationSpec {
         val report = state.report
-        val title = when (report.status) {
-            RunStatus.COMPLETED -> "Optimization complete"
-            RunStatus.COMPLETED_WITH_ERRORS -> "Completed with errors"
-            RunStatus.CANCELLED -> "Optimization cancelled"
-            RunStatus.FAILED -> "Optimization failed"
-            RunStatus.RUNNING -> error("Terminal state cannot contain a running report")
+        val title = if (state.dryRun) {
+            when (report.status) {
+                RunStatus.COMPLETED -> "Analysis complete"
+                RunStatus.COMPLETED_WITH_ERRORS -> "Analysis completed with errors"
+                RunStatus.CANCELLED -> "Analysis cancelled"
+                RunStatus.FAILED -> "Analysis failed"
+                RunStatus.RUNNING -> error("Terminal state cannot contain a running report")
+            }
+        } else {
+            when (report.status) {
+                RunStatus.COMPLETED -> "Optimization complete"
+                RunStatus.COMPLETED_WITH_ERRORS -> "Completed with errors"
+                RunStatus.CANCELLED -> "Optimization cancelled"
+                RunStatus.FAILED -> "Optimization failed"
+                RunStatus.RUNNING -> error("Terminal state cannot contain a running report")
+            }
         }
         val text = if (state.dryRun) {
             "${report.scanned} files analyzed • " +
