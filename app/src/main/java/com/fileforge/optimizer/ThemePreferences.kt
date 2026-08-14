@@ -27,8 +27,9 @@ internal interface ThemeModeStorage {
     fun write(value: String)
 }
 
-internal fun interface ThemeRuntime {
+internal interface ThemeRuntime {
     fun apply(nightMode: ThemeNightMode, amoledOverlay: Boolean)
+    fun requestRecreation()
 }
 
 class ThemePreferences internal constructor(
@@ -50,18 +51,34 @@ class ThemePreferences internal constructor(
         }
     }
 
+    fun select(mode: ThemeMode) {
+        val previous = read()
+        save(mode)
+        apply(mode)
+        if (isAmoledOnlyTransition(previous, mode)) runtime.requestRecreation()
+    }
+
     internal fun applySavedMode(): ThemeMode = read().also(::apply)
+
+    private fun isAmoledOnlyTransition(previous: ThemeMode, selected: ThemeMode): Boolean =
+        (previous == ThemeMode.DARK && selected == ThemeMode.AMOLED) ||
+            (previous == ThemeMode.AMOLED && selected == ThemeMode.DARK)
 
     companion object {
         fun forAndroid(context: Context): ThemePreferences = ThemePreferences(
             SharedPreferencesThemeModeStorage(context.applicationContext),
-            AppCompatThemeRuntime
+            ApplicationThemeRuntime
+        )
+
+        fun forActivity(activity: Activity): ThemePreferences = ThemePreferences(
+            SharedPreferencesThemeModeStorage(activity.applicationContext),
+            ActivityThemeRuntime(activity)
         )
 
         /** Call at the start of Activity.onCreate, before super.onCreate and before inflating content. */
         fun applyActivityThemeBeforeOnCreate(activity: Activity): ThemeMode {
-            val mode = forAndroid(activity).applySavedMode()
-            if (AppCompatThemeRuntime.amoledOverlayEnabled) {
+            val mode = forActivity(activity).applySavedMode()
+            if (mode == ThemeMode.AMOLED) {
                 activity.theme.applyStyle(R.style.ThemeOverlay_FileForge_Amoled, true)
             }
             return mode
@@ -84,19 +101,30 @@ private class SharedPreferencesThemeModeStorage(context: Context) : ThemeModeSto
     }
 }
 
-private object AppCompatThemeRuntime : ThemeRuntime {
-    @Volatile
-    var amoledOverlayEnabled = false
-        private set
-
+private object ApplicationThemeRuntime : ThemeRuntime {
     override fun apply(nightMode: ThemeNightMode, amoledOverlay: Boolean) {
-        amoledOverlayEnabled = amoledOverlay
-        AppCompatDelegate.setDefaultNightMode(
-            when (nightMode) {
-                ThemeNightMode.FOLLOW_SYSTEM -> AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
-                ThemeNightMode.FORCE_LIGHT -> AppCompatDelegate.MODE_NIGHT_NO
-                ThemeNightMode.FORCE_DARK -> AppCompatDelegate.MODE_NIGHT_YES
-            }
-        )
+        applyAppCompatNightMode(nightMode)
     }
+
+    override fun requestRecreation() = Unit
+}
+
+private class ActivityThemeRuntime(private val activity: Activity) : ThemeRuntime {
+    override fun apply(nightMode: ThemeNightMode, amoledOverlay: Boolean) {
+        applyAppCompatNightMode(nightMode)
+    }
+
+    override fun requestRecreation() {
+        activity.recreate()
+    }
+}
+
+private fun applyAppCompatNightMode(nightMode: ThemeNightMode) {
+    AppCompatDelegate.setDefaultNightMode(
+        when (nightMode) {
+            ThemeNightMode.FOLLOW_SYSTEM -> AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
+            ThemeNightMode.FORCE_LIGHT -> AppCompatDelegate.MODE_NIGHT_NO
+            ThemeNightMode.FORCE_DARK -> AppCompatDelegate.MODE_NIGHT_YES
+        }
+    )
 }
