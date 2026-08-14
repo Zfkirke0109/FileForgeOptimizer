@@ -115,6 +115,8 @@ class OptimizeStartDispatchGate {
     var isPending: Boolean = false
         private set
     private var releaseAfterSequence: Long = 0
+    private var lastObservedKey: Any? = null
+    private var suppressEquivalentReplay = false
 
     fun beginDispatch(observationWatermark: Long): Boolean {
         if (!isReplayReady || isPending) return false
@@ -125,11 +127,21 @@ class OptimizeStartDispatchGate {
 
     fun awaitReplay() {
         isReplayReady = false
+        suppressEquivalentReplay = isPending
     }
 
     fun onObservedState(state: RunState, sequence: Long) {
+        val stateKey = state.semanticKey()
+        val unchangedPendingReplay = !isReplayReady && suppressEquivalentReplay &&
+            stateKey == lastObservedKey
         if (!isReplayReady) {
             isReplayReady = true
+        }
+        suppressEquivalentReplay = false
+        lastObservedKey = stateKey
+        if (unchangedPendingReplay) {
+            releaseAfterSequence = maxOf(releaseAfterSequence, sequence)
+            return
         }
         if (isPending && sequence > releaseAfterSequence &&
             (state is RunState.Running || state is RunState.Terminal)
@@ -144,6 +156,142 @@ class OptimizeStartDispatchGate {
 
     fun allowsStart(baseStartEnabled: Boolean): Boolean =
         baseStartEnabled && isReplayReady && !isPending
+}
+
+private fun RunState.semanticKey(): Any = when (this) {
+    RunState.Idle -> IdleRunStateKey
+    is RunState.Running -> RunningRunStateKey(
+        dryRun = dryRun,
+        operationKind = operationKind,
+        snapshot = snapshot.toSemanticKey()
+    )
+    is RunState.Terminal -> TerminalRunStateKey(
+        dryRun = dryRun,
+        operationKind = operationKind,
+        report = report.toSemanticKey()
+    )
+}
+
+private object IdleRunStateKey
+
+private data class RunningRunStateKey(
+    val dryRun: Boolean,
+    val operationKind: RunOperationKind,
+    val snapshot: ProgressSnapshotKey
+)
+
+private data class TerminalRunStateKey(
+    val dryRun: Boolean,
+    val operationKind: RunOperationKind,
+    val report: OptimizationReportKey
+)
+
+private data class ProgressSnapshotKey(
+    val phase: String,
+    val currentRelativePath: String?,
+    val filesDiscovered: Int,
+    val filesProcessed: Int,
+    val candidates: Int,
+    val optimized: Int,
+    val skipsByReason: Map<SkipReason, Int>,
+    val errors: Int,
+    val bytesRead: Long,
+    val bytesWritten: Long,
+    val savedBytes: Long,
+    val potentialSavingsBytes: Long,
+    val totalWork: Int?
+)
+
+private data class OptimizationReportKey(
+    val scanned: Int,
+    val optimized: Int,
+    val skipped: Int,
+    val errors: Int,
+    val savedBytes: Long,
+    val candidates: Int,
+    val potentialSavingsBytes: Long,
+    val bytesRead: Long,
+    val bytesWritten: Long,
+    val status: RunStatus,
+    val skipsByReason: Map<SkipReason, Int>,
+    val terminalError: String?,
+    val terminalFailures: List<String>,
+    val rollbackFailure: String?
+)
+
+private fun ProgressSnapshot.toSemanticKey() = ProgressSnapshotKey(
+    phase = phase,
+    currentRelativePath = currentRelativePath,
+    filesDiscovered = filesDiscovered,
+    filesProcessed = filesProcessed,
+    candidates = candidates,
+    optimized = optimized,
+    skipsByReason = skipsByReason.toMap(),
+    errors = errors,
+    bytesRead = bytesRead,
+    bytesWritten = bytesWritten,
+    savedBytes = savedBytes,
+    potentialSavingsBytes = potentialSavingsBytes,
+    totalWork = totalWork
+)
+
+private fun OptimizationReport.toSemanticKey() = OptimizationReportKey(
+    scanned = scanned,
+    optimized = optimized,
+    skipped = skipped,
+    errors = errors,
+    savedBytes = savedBytes,
+    candidates = candidates,
+    potentialSavingsBytes = potentialSavingsBytes,
+    bytesRead = bytesRead,
+    bytesWritten = bytesWritten,
+    status = status,
+    skipsByReason = skipsByReason.toMap(),
+    terminalError = terminalError,
+    terminalFailures = terminalFailures.toList(),
+    rollbackFailure = rollbackFailure
+)
+
+data class PendingOptimizeLaunch(
+    val request: ServiceRunRequest.Optimize,
+    val permissionGranted: Boolean?
+)
+
+data class ReadyOptimizeLaunch(
+    val request: ServiceRunRequest.Optimize,
+    val explainReducedVisibility: Boolean
+)
+
+interface PendingOptimizeLaunchStorage {
+    fun read(): PendingOptimizeLaunch?
+    fun write(value: PendingOptimizeLaunch)
+    fun clear()
+}
+
+class PendingOptimizeLaunchCoordinator(
+    private val storage: PendingOptimizeLaunchStorage
+) {
+    fun beginPermissionRequest(request: ServiceRunRequest.Optimize) {
+        storage.write(PendingOptimizeLaunch(request, permissionGranted = null))
+    }
+
+    fun recordPermissionResult(granted: Boolean) {
+        val current = storage.read() ?: return
+        storage.write(current.copy(permissionGranted = granted))
+    }
+
+    fun pending(): PendingOptimizeLaunch? = storage.read()
+
+    fun takeReady(replayReady: Boolean, startAllowed: Boolean): ReadyOptimizeLaunch? {
+        val current = storage.read() ?: return null
+        val granted = current.permissionGranted ?: return null
+        if (!replayReady || !startAllowed) return null
+        storage.clear()
+        return ReadyOptimizeLaunch(
+            request = current.request,
+            explainReducedVisibility = !granted
+        )
+    }
 }
 
 interface OptimizeServicePort {

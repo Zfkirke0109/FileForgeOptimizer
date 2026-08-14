@@ -3,6 +3,7 @@ package com.fileforge.optimizer
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -185,7 +186,9 @@ class OptimizeScreenController(
 
     private var selectedTreeUri: Uri? = restoreSelectedTreeUri()
     private var latestRunState: RunState = RunState.Idle
-    private var pendingRequest: ServiceRunRequest.Optimize? = null
+    private val pendingLaunchCoordinator = PendingOptimizeLaunchCoordinator(
+        SharedPreferencesPendingOptimizeLaunchStorage(preferences)
+    )
     private val capabilityCache = SelectedTreeCapabilitiesCache(::readSelectedTreeCapabilities)
     private val startDispatchGate = OptimizeStartDispatchGate()
     private val progressPort: OptimizeProgressIndicator by lazy {
@@ -224,16 +227,8 @@ class OptimizeScreenController(
     private val notificationPermission = activity.registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        val request = pendingRequest ?: buildRequestIfValid()
-        pendingRequest = null
-        when (NotificationPermissionFlow.afterPermissionResult(granted)) {
-            NotificationPermissionStep.RUN -> request?.let(::dispatchStart)
-            NotificationPermissionStep.RUN_WITH_REDUCED_VISIBILITY_EXPLANATION -> {
-                explainReducedNotificationVisibility()
-                request?.let(::dispatchStart)
-            }
-            NotificationPermissionStep.REQUEST_PERMISSION -> Unit
-        }
+        pendingLaunchCoordinator.recordPermissionResult(granted)
+        drainPendingPermissionLaunch()
     }
 
     init {
@@ -248,11 +243,13 @@ class OptimizeScreenController(
         latestRunState = observation.state
         startDispatchGate.onObservedState(observation.state, observation.sequence)
         renderCurrentState()
+        drainPendingPermissionLaunch()
     }
 
     fun refreshTreeCapabilities() {
         capabilityCache.refresh()
         renderCurrentState()
+        drainPendingPermissionLaunch()
     }
 
     fun awaitServiceReplay() {
@@ -534,7 +531,7 @@ class OptimizeScreenController(
             )
         ) {
             NotificationPermissionStep.REQUEST_PERMISSION -> {
-                pendingRequest = request
+                pendingLaunchCoordinator.beginPermissionRequest(request)
                 preferences.edit()
                     .putBoolean(KEY_NOTIFICATION_PERMISSION_REQUESTED, true)
                     .apply()
@@ -585,6 +582,21 @@ class OptimizeScreenController(
                 Snackbar.LENGTH_LONG
             ).show()
         }
+    }
+
+    private fun drainPendingPermissionLaunch() {
+        val pending = pendingLaunchCoordinator.pending() ?: return
+        val projection = OptimizeUiStateProjector.project(
+            latestRunState,
+            capabilityCache.current,
+            pending.request.runIntent.dryRun
+        )
+        val launch = pendingLaunchCoordinator.takeReady(
+            replayReady = startDispatchGate.isReplayReady,
+            startAllowed = startDispatchGate.allowsStart(projection.startEnabled)
+        ) ?: return
+        if (launch.explainReducedVisibility) explainReducedNotificationVisibility()
+        dispatchStart(launch.request)
     }
 
     private fun readSelectedTreeCapabilities(): SelectedTreeCapabilities {
@@ -701,5 +713,87 @@ class OptimizeScreenController(
         const val KEY_APK_LAB = "apk_lab"
         const val KEY_TEXT_MINIFY = "text_minify"
         const val KEY_NOTIFICATION_PERMISSION_REQUESTED = "notification_permission_requested"
+    }
+}
+
+private class SharedPreferencesPendingOptimizeLaunchStorage(
+    private val preferences: SharedPreferences
+) : PendingOptimizeLaunchStorage {
+    override fun read(): PendingOptimizeLaunch? {
+        if (!preferences.getBoolean(KEY_PRESENT, false)) return null
+        val treeUri = preferences.getString(KEY_TREE_URI, null) ?: return clearInvalid()
+        val mode = try {
+            OptimizeMode.valueOf(preferences.getString(KEY_MODE, null) ?: return clearInvalid())
+        } catch (_: IllegalArgumentException) {
+            return clearInvalid()
+        }
+        val permissionGranted = when (preferences.getString(KEY_PERMISSION_RESULT, null)) {
+            RESULT_PENDING -> null
+            RESULT_GRANTED -> true
+            RESULT_DENIED -> false
+            else -> return clearInvalid()
+        }
+        return PendingOptimizeLaunch(
+            request = ServiceRunRequest.Optimize(
+                treeUri = treeUri,
+                runIntent = RunIntent(
+                    mode = mode,
+                    dryRun = preferences.getBoolean(KEY_DRY_RUN, false),
+                    apkLabMode = preferences.getBoolean(KEY_APK_LAB, false),
+                    textMinify = preferences.getBoolean(KEY_TEXT_MINIFY, false)
+                )
+            ),
+            permissionGranted = permissionGranted
+        )
+    }
+
+    override fun write(value: PendingOptimizeLaunch) {
+        val request = value.request
+        preferences.edit()
+            .putBoolean(KEY_PRESENT, true)
+            .putString(KEY_TREE_URI, request.treeUri)
+            .putString(KEY_MODE, request.runIntent.mode.name)
+            .putBoolean(KEY_DRY_RUN, request.runIntent.dryRun)
+            .putBoolean(KEY_APK_LAB, request.runIntent.apkLabMode)
+            .putBoolean(KEY_TEXT_MINIFY, request.runIntent.textMinify)
+            .putString(
+                KEY_PERMISSION_RESULT,
+                when (value.permissionGranted) {
+                    null -> RESULT_PENDING
+                    true -> RESULT_GRANTED
+                    false -> RESULT_DENIED
+                }
+            )
+            .apply()
+    }
+
+    override fun clear() {
+        preferences.edit()
+            .remove(KEY_PRESENT)
+            .remove(KEY_TREE_URI)
+            .remove(KEY_MODE)
+            .remove(KEY_DRY_RUN)
+            .remove(KEY_APK_LAB)
+            .remove(KEY_TEXT_MINIFY)
+            .remove(KEY_PERMISSION_RESULT)
+            .apply()
+    }
+
+    private fun clearInvalid(): PendingOptimizeLaunch? {
+        clear()
+        return null
+    }
+
+    private companion object {
+        const val KEY_PRESENT = "pending_launch_present"
+        const val KEY_TREE_URI = "pending_launch_tree_uri"
+        const val KEY_MODE = "pending_launch_mode"
+        const val KEY_DRY_RUN = "pending_launch_dry_run"
+        const val KEY_APK_LAB = "pending_launch_apk_lab"
+        const val KEY_TEXT_MINIFY = "pending_launch_text_minify"
+        const val KEY_PERMISSION_RESULT = "pending_launch_permission_result"
+        const val RESULT_PENDING = "pending"
+        const val RESULT_GRANTED = "granted"
+        const val RESULT_DENIED = "denied"
     }
 }
