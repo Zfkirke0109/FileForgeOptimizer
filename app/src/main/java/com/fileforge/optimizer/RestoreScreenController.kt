@@ -43,7 +43,7 @@ class RestoreScreenController(
     private val selectedPaths = linkedSetOf<String>()
     private var latestRunState: RunState = RunState.Idle
     private var closed = false
-    private var launchPending = false
+    private val visibilityGate = RestoreDiscoveryVisibilityGate()
 
     private lateinit var discoveryStatus: TextView
     private lateinit var cards: LinearLayout
@@ -61,17 +61,18 @@ class RestoreScreenController(
 
     fun onVisible() {
         refreshSelectedTree()
-        if (!discoveryRequested && testFixture == null) discoverOffMainThread()
+        if (testFixture == null) discoverOffMainThread(visibilityGate.enterRestore())
         render()
     }
 
     fun onHidden() {
-        // The service retains restore ownership while this presentation is hidden.
+        visibilityGate.hideRestore()
+        discovery?.close()
+        discoveryLoading = false
     }
 
     fun render(observation: SequencedRunState) {
         latestRunState = observation.state
-        if (latestRunState !is RunState.Running) launchPending = false
         render()
     }
 
@@ -82,7 +83,7 @@ class RestoreScreenController(
         executor.shutdownNow()
     }
 
-    private fun discoverOffMainThread() {
+    private fun discoverOffMainThread(generation: RestoreDiscoveryVisibilityGate.Generation) {
         discoveryRequested = true
         if (!canReadTree()) {
             render()
@@ -107,7 +108,7 @@ class RestoreScreenController(
                 )
             }
             activity.runOnUiThread {
-                if (closed || treeUri != selectedTreeUri) return@runOnUiThread
+                if (closed || treeUri != selectedTreeUri || !visibilityGate.acceptCompletion(generation)) return@runOnUiThread
                 discoveryLoading = false
                 discoveryResult = result
                 render()
@@ -168,7 +169,7 @@ class RestoreScreenController(
             id = R.id.restore_select_all
             setText(R.string.restore_select_all)
             minHeight = dp(48)
-            setOnClickListener { selectAllFromFirstRun() }
+            setOnClickListener { selectAllForSelectedRun() }
         }, weightedLayout(endMargin = dp(4)))
         restoreButton = MaterialButton(activity).apply {
             id = R.id.restore_selected
@@ -191,7 +192,7 @@ class RestoreScreenController(
         if (closed) return
         renderDiscovery()
         val running = latestRunState is RunState.Running
-        restoreButton.isEnabled = !running && !launchPending && canWriteTree() && selectedPaths.isNotEmpty()
+        restoreButton.isEnabled = !running && ProcessRestoreLaunchOwnership.instance.current() == null && canWriteTree() && selectedPaths.isNotEmpty()
         cancelButton.visibility = if (running && (latestRunState as RunState.Running).operationKind == RunOperationKind.RESTORE) {
             View.VISIBLE
         } else {
@@ -239,6 +240,11 @@ class RestoreScreenController(
                 addView(TextView(activity).apply { text = card.runId; textSize = 18f })
                 addView(TextView(activity).apply { text = activity.getString(R.string.restore_run_details, card.runDate, card.status.name, card.entryCount, formatBytes(card.recoverableBytes)) })
                 addView(TextView(activity).apply { text = card.verificationLabel })
+                addView(MaterialButton(activity).apply {
+                    text = activity.getString(R.string.restore_select_all)
+                    contentDescription = "Select all from ${card.runId}"
+                    setOnClickListener { selectAll(discovered) }
+                })
                 card.entries.forEach { entry ->
                     addView(CheckBox(activity).apply {
                         id = R.id.restore_entry_checkbox
@@ -277,8 +283,12 @@ class RestoreScreenController(
         render()
     }
 
-    private fun selectAllFromFirstRun() {
-        val run = discoveryResult.runs.firstOrNull() ?: return
+    private fun selectAllForSelectedRun() {
+        val id = selectedUndoLogId ?: return
+        discoveryResult.runs.firstOrNull { it.undoLogId == id }?.let(::selectAll)
+    }
+
+    private fun selectAll(run: DiscoveredUndoLog) {
         selectedUndoLogId = run.undoLogId
         selectedPaths.clear()
         selectedPaths += run.run.entries.map { it.relativePath }
@@ -294,16 +304,30 @@ class RestoreScreenController(
             .setMessage(R.string.restore_confirmation_message)
             .setNegativeButton(android.R.string.cancel, null)
             .setPositiveButton(R.string.restore_confirm) { _, _ ->
-                if (latestRunState is RunState.Running || launchPending) return@setPositiveButton
+                if (latestRunState is RunState.Running) return@setPositiveButton
                 val treeUri = selectedTreeUri ?: return@setPositiveButton
-                launchPending = true
-                render()
                 val request = ServiceRunRequest.Restore(
                     treeUri = treeUri,
                     undoLogId = undoLogId,
                     selection = RestoreSelection.Entries(selectedPaths.toSet())
                 )
-                testFixture?.startRestore?.invoke(request) ?: startRestore(request)
+                val claim = ProcessRestoreLaunchOwnership.instance.tryClaim(
+                    request,
+                    optimizePending = ProcessOptimizeDispatchOwnership.instance.current() != null
+                ) ?: return@setPositiveButton
+                render()
+                try {
+                    val testStart = testFixture?.startRestore
+                    if (testStart != null) {
+                        testStart(request)
+                        ProcessRestoreLaunchOwnership.instance.onDispatchFailed(claim)
+                    } else {
+                        startRestore(request)
+                    }
+                } catch (failure: Throwable) {
+                    ProcessRestoreLaunchOwnership.instance.onDispatchFailed(claim)
+                    throw failure
+                }
             }
             .show()
     }
@@ -320,6 +344,7 @@ class RestoreScreenController(
         if (terminal.operationKind != RunOperationKind.RESTORE) return emptyList()
         val report = terminal.report
         return buildList {
+            add(activity.getString(R.string.restore_failed_count, report.errors))
             if (report.status == RunStatus.CANCELLED) add(activity.getString(R.string.restore_cancelled))
             addAll(report.terminalFailures.filter { it.isNotBlank() })
             report.terminalError?.takeIf { it.isNotBlank() }?.let(::add)

@@ -6,6 +6,21 @@ import org.junit.Test
 
 class RestoreLaunchOwnershipTest {
     @Test
+    fun persistedExactClaimRecoversConservativelyAfterProcessDeathAndBlocksPendingOptimize() {
+        val store = RecordingRestoreLaunchClaimStore()
+        val request = ServiceRunRequest.Restore("content://tree/root", "FileForge_Undo_v2_saved.jsonl", RestoreSelection.All)
+        val firstProcess = RestoreLaunchOwnership(store)
+        assertTrue(firstProcess.tryClaim(request, optimizePending = false) != null)
+
+        val recoveredProcess = RestoreLaunchOwnership(store)
+        assertTrue(recoveredProcess.current() != null)
+        assertFalse(recoveredProcess.tryClaim(request, optimizePending = true) != null)
+        assertFalse(recoveredProcess.tryClaim(request, optimizePending = false) != null)
+        recoveredProcess.onServiceRejected(request)
+        assertTrue(recoveredProcess.tryClaim(request, optimizePending = false) != null)
+    }
+
+    @Test
     fun exactRestoreClaimSurvivesRecreationReplayAndOnlyItsAcknowledgementReleasesIt() {
         val ownership = RestoreLaunchOwnership()
         val first = ServiceRunRequest.Restore(
@@ -19,7 +34,8 @@ class RestoreLaunchOwnershipTest {
         assertFalse(ownership.tryClaim(second) != null)
         ownership.onObserved(RunState.Terminal(OptimizationReport(status = RunStatus.COMPLETED), false, RunOperationKind.OPTIMIZE))
         assertTrue(ownership.current() === firstClaim)
-        ownership.onObserved(RunState.Running(ProgressSnapshot("restoring"), false, RunOperationKind.RESTORE))
+        ownership.onServiceAccepted(first)
+        ownership.onServiceCompleted(first)
         assertTrue(ownership.current() == null)
         assertTrue(ownership.tryClaim(second) != null)
     }
@@ -39,4 +55,11 @@ class RestoreLaunchOwnershipTest {
         ownership.onDispatchFailed(secondClaim)
         assertTrue(ownership.current() == null)
     }
+}
+
+private class RecordingRestoreLaunchClaimStore : RestoreLaunchClaimStore {
+    var value: RestoreLaunchClaimRecord? = null
+    override fun read(): RestoreLaunchClaimRecord? = value
+    override fun write(record: RestoreLaunchClaimRecord) { value = record }
+    override fun clear() { value = null }
 }

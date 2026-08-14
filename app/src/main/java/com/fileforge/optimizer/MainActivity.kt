@@ -28,6 +28,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bottomNavigation: BottomNavigationView
     private lateinit var optimizeController: OptimizeScreenController
     private lateinit var restoreController: RestoreScreenController
+    private var currentDestination: Int = R.id.navigation_optimize
+    private var activityVisible = false
     private var serviceBinder: OptimizationBinder? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val observationSequencer = RunStateObservationSequencer()
@@ -90,6 +92,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         ThemePreferences.applyActivityThemeBeforeOnCreate(this)
         super.onCreate(savedInstanceState)
+        ProcessRestoreLaunchOwnership.initialize(this)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         optimizeController = OptimizeScreenController(
             activity = this,
@@ -107,8 +110,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        optimizeController.onVisible()
-        restoreController.onVisible()
+        activityVisible = true
+        if (currentDestination == R.id.navigation_restore) restoreController.onVisible()
+        else optimizeController.onVisible()
         runStateDispatcher.resume()
         optimizeController.awaitServiceReplay()
         optimizeController.refreshTreeCapabilities()
@@ -116,8 +120,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
-        optimizeController.onHidden()
-        restoreController.onHidden()
+        if (currentDestination == R.id.navigation_restore) restoreController.onHidden()
+        else optimizeController.onHidden()
+        activityVisible = false
         runStateDispatcher.clear()
         serviceSession.onHidden()
         super.onStop()
@@ -175,12 +180,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showDestination(itemId: Int) {
+        if (itemId != currentDestination && activityVisible) {
+            if (currentDestination == R.id.navigation_restore) restoreController.onHidden()
+            else optimizeController.onHidden()
+        }
+        currentDestination = itemId
         contentContainer.removeAllViews()
         when (itemId) {
             R.id.navigation_restore -> {
                 toolbar.setTitle(R.string.navigation_restore)
                 (restoreController.view.parent as? ViewGroup)?.removeView(restoreController.view)
                 contentContainer.addView(restoreController.view)
+                if (activityVisible) restoreController.onVisible()
             }
             R.id.navigation_about -> {
                 toolbar.setTitle(R.string.navigation_about)
@@ -192,6 +203,7 @@ class MainActivity : AppCompatActivity() {
                 toolbar.setTitle(R.string.navigation_optimize)
                 (optimizeController.view.parent as? ViewGroup)?.removeView(optimizeController.view)
                 contentContainer.addView(optimizeController.view)
+                if (activityVisible) optimizeController.onVisible()
             }
         }
     }

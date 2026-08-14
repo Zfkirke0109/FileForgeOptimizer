@@ -15,7 +15,8 @@ sealed class RestoreSelection {
 
 enum class RestoreEntryStatus {
     RESTORED, PATH_REJECTED, BACKUP_MISSING, BACKUP_SIZE_MISMATCH, BACKUP_HASH_MISMATCH,
-    ORIGINAL_MISSING, DIRECTORY_REJECTED, WRITE_FAILED, RESTORED_VERIFICATION_FAILED, RECEIPT_FAILED
+    ORIGINAL_MISSING, DIRECTORY_REJECTED, WRITE_FAILED, RESTORED_VERIFICATION_FAILED, RECEIPT_FAILED,
+    UNPROCESSED_CANCELLED, UNPROCESSED_AUDIT_STOPPED
 }
 
 data class RestoreEntryResult(
@@ -39,7 +40,9 @@ data class RestoreReport(
     val restoredCount: Int,
     val receiptError: String? = null,
     /** Exact receipt identity returned by exclusive receipt creation, if a mutation was attempted. */
-    val receiptName: String? = null
+    val receiptName: String? = null,
+    val selectedCount: Int = entries.size,
+    val failedCount: Int = entries.count { it.status != RestoreEntryStatus.RESTORED }
 )
 
 data class RestoreProgressSnapshot(
@@ -151,13 +154,24 @@ class RestoreCoordinator(
         if (status == RunStatus.COMPLETED && (receiptError != null || results.any { it.status != RestoreEntryStatus.RESTORED })) {
             status = RunStatus.COMPLETED_WITH_ERRORS
         }
+        if (results.size < selected.size) {
+            val unprocessedStatus = if (status == RunStatus.CANCELLED) {
+                RestoreEntryStatus.UNPROCESSED_CANCELLED
+            } else {
+                RestoreEntryStatus.UNPROCESSED_AUDIT_STOPPED
+            }
+            selected.drop(results.size).forEach { entry ->
+                results += result(entry, unprocessedStatus, "Restore was not attempted")
+            }
+        }
         return RestoreReport(
             run = run,
             entries = results,
             status = status,
             restoredCount = results.count { it.status == RestoreEntryStatus.RESTORED },
             receiptError = receiptError,
-            receiptName = receipt?.name
+            receiptName = receipt?.name,
+            selectedCount = selected.size
         )
     }
 

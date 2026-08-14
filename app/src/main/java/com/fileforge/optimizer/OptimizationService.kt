@@ -55,6 +55,7 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
 
     override fun onCreate() {
         super.onCreate()
+        ProcessRestoreLaunchOwnership.initialize(this)
         repository = RunStateRepository.forAndroid(this)
         executor = Executors.newSingleThreadExecutor { task ->
             Thread(task, "FileForge-Optimization").apply { isDaemon = false }
@@ -124,7 +125,12 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         onProgress: (ProgressSnapshot) -> Unit
     ): RunState.Terminal = when (request) {
         is ServiceRunRequest.Optimize -> runOptimization(request, cancellation, onProgress)
-        is ServiceRunRequest.Restore -> runRestore(request, cancellation, onProgress)
+        is ServiceRunRequest.Restore -> try {
+            ProcessRestoreLaunchOwnership.instance.onServiceAccepted(request)
+            runRestore(request, cancellation, onProgress)
+        } finally {
+            ProcessRestoreLaunchOwnership.instance.onServiceCompleted(request)
+        }
     }
 
     override fun deliverTimeoutTerminal(
@@ -214,7 +220,7 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         require(!undoNode.isDirectory) { "Undo log must be a file" }
         val undoRun = gateway.openRead(undoNode).use { input ->
             InputStreamReader(input, Charsets.UTF_8).use { reader ->
-                UndoLogRepository().read(reader)
+                UndoLogRepository().readStreamingForRestore(reader, cancellation)
             }
         }
         require(undoRun.header.runId.isNotBlank()) { "Undo log is not recognized" }
@@ -241,10 +247,10 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         val failures = restore.entries.filter { it.status != RestoreEntryStatus.RESTORED }
         return RunState.Terminal(
             OptimizationReport(
-                scanned = restore.entries.size,
+                scanned = restore.selectedCount,
                 optimized = restore.restoredCount,
-                skipped = failures.size,
-                errors = failures.size + if (restore.receiptError == null) 0 else 1,
+                skipped = restore.entries.count { it.status == RestoreEntryStatus.UNPROCESSED_CANCELLED || it.status == RestoreEntryStatus.UNPROCESSED_AUDIT_STOPPED },
+                errors = restore.failedCount,
                 status = restore.status,
                 terminalError = restore.receiptError,
                 terminalFailures = failures.map { result ->

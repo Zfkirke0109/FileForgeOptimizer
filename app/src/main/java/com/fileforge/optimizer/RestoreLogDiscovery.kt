@@ -1,6 +1,7 @@
 package com.fileforge.optimizer
 
 import java.io.InputStreamReader
+import java.io.InputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class DiscoveredUndoLog(
@@ -18,6 +19,27 @@ data class RestoreDiscoveryResult(
     val failures: List<RestoreDiscoveryFailure>
 )
 
+class RestoreDiscoveryVisibilityGate {
+    class Generation internal constructor(val id: Long) {
+        private val cancelled = AtomicBoolean(false)
+        fun cancel() { cancelled.set(true) }
+        fun isCancelled(): Boolean = cancelled.get()
+    }
+
+    private var nextId = 0L
+    private var current: Generation? = null
+    var serviceWorkWasCancelled: Boolean = false
+        private set
+
+    fun enterRestore(): Generation {
+        current?.cancel()
+        return Generation(++nextId).also { current = it }
+    }
+    fun hideRestore() { current?.cancel(); current = null }
+    fun currentGeneration(): Generation? = current
+    fun acceptCompletion(generation: Generation): Boolean = current === generation && !generation.isCancelled()
+}
+
 /**
  * Read-only selected-root discovery. It deliberately lists only the direct children supplied by
  * the SAF gateway; it never resolves a name, follows a path, or creates a document.
@@ -28,6 +50,7 @@ class RestoreLogDiscovery(
     private val undoLogs: UndoLogRepository = UndoLogRepository()
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
+    private val activeInput = AtomicReference<InputStream?>(null)
 
     fun discover(cancellation: CancellationToken = NeverCancelled): RestoreDiscoveryResult {
         checkOpen(cancellation)
@@ -37,8 +60,16 @@ class RestoreLogDiscovery(
             checkOpen(cancellation)
             if (child.isDirectory || !isRecognizedUndoLogName(child.name)) return@forEach
             try {
-                val run = documentGateway.openRead(child).use { input ->
-                    InputStreamReader(input, Charsets.UTF_8).use { reader -> undoLogs.read(reader) }
+                val input = documentGateway.openRead(child)
+                activeInput.set(input)
+                val run = try {
+                    input.use {
+                        InputStreamReader(it, Charsets.UTF_8).use { reader ->
+                            undoLogs.readStreamingForRestore(reader, CancellationToken { checkOpen(cancellation) })
+                        }
+                    }
+                } finally {
+                    activeInput.compareAndSet(input, null)
                 }
                 validate(run)
                 runs += DiscoveredUndoLog(child.name, run)
@@ -57,6 +88,7 @@ class RestoreLogDiscovery(
 
     override fun close() {
         closed.set(true)
+        activeInput.getAndSet(null)?.close()
     }
 
     private fun checkOpen(cancellation: CancellationToken) {

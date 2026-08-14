@@ -117,6 +117,61 @@ class UndoLogRepository {
         return if (v2Header != null) readV2(lines, v2Header) else readLegacy(lines)
     }
 
+    /**
+     * Bounded incremental reader for restore discovery and service-selected logs. It preserves the
+     * long-standing permissive committed-entry semantics of [read], while never materializing the
+     * complete provider document and checking cancellation between every consumed character.
+     */
+    fun readStreamingForRestore(
+        reader: Reader,
+        cancellation: CancellationToken = NeverCancelled
+    ): UndoRun {
+        val lines = RestoreBoundedLineReader(reader, cancellation)
+        val first = lines.nextNonBlank() ?: return emptyLegacyRun()
+        val header = parseV2Header(first)
+        return if (header != null) readV2Streaming(lines, header) else readLegacyStreaming(lines, first)
+    }
+
+    private fun readV2Streaming(lines: RestoreBoundedLineReader, header: UndoHeader): UndoRun {
+        val entries = mutableListOf<UndoEntry>()
+        var terminal: UndoTerminalSummary? = null
+        var terminalInvalidated = false
+        while (true) {
+            val line = lines.nextLine() ?: break
+            if (line.isBlank()) continue
+            val fields = parseJsonObject(line) ?: continue
+            if (fields.long("schemaVersion") != V2_SCHEMA_VERSION.toLong()) continue
+            when (fields.string("recordType")) {
+                "entry" -> {
+                    if (terminal != null) terminalInvalidated = true
+                    parseV2Entry(fields)?.let(entries::add)
+                }
+                "terminal" -> {
+                    if (terminal != null) terminalInvalidated = true
+                    else parseTerminal(fields)?.let { terminal = it }
+                }
+            }
+            if (entries.size > RESTORE_MAX_RECORDS) throw IllegalArgumentException("Too many undo records")
+        }
+        val validTerminal = terminal?.takeIf { !terminalInvalidated && it.entriesCommitted == entries.size }
+        return UndoRun(header, entries, validTerminal?.status ?: RunStatus.RUNNING, validTerminal)
+    }
+
+    private fun readLegacyStreaming(lines: RestoreBoundedLineReader, first: String): UndoRun {
+        val stamp = LEGACY_HEADER.matchEntire(first.trim())?.groupValues?.get(1) ?: return emptyLegacyRun()
+        val mode = lines.nextLine()?.takeIf { it.startsWith("Mode=") } ?: return emptyLegacyRun()
+        val format = lines.nextLine()?.takeIf { it.trim() == LEGACY_FORMAT } ?: return emptyLegacyRun()
+        @Suppress("UNUSED_VARIABLE") val recognizedLegacyHeader = mode to format
+        val entries = mutableListOf<UndoEntry>()
+        while (true) {
+            val line = lines.nextLine() ?: break
+            if (line.isBlank()) continue
+            parseLegacyEntry(line, stamp)?.let(entries::add)
+            if (entries.size > RESTORE_MAX_RECORDS) throw IllegalArgumentException("Too many undo records")
+        }
+        return UndoRun(UndoHeader(stamp, "", schemaVersion = LEGACY_SCHEMA_VERSION), entries, RunStatus.COMPLETED)
+    }
+
     private fun readV2(lines: List<String>, header: UndoHeader): UndoRun {
         val entries = mutableListOf<UndoEntry>()
         var terminal: UndoTerminalSummary? = null
@@ -424,7 +479,10 @@ class UndoLogRepository {
         private fun peek(): Char? = text.getOrNull(index)
     }
 
-    private companion object {
+    companion object {
+        const val RESTORE_MAX_LINE_CHARS = 256 * 1024
+        const val RESTORE_MAX_TOTAL_CHARS = 16 * 1024 * 1024
+        const val RESTORE_MAX_RECORDS = 100_000
         const val V2_SCHEMA_VERSION = 2
         const val LEGACY_SCHEMA_VERSION = 1
         const val LEGACY_FORMAT = "Format: relative_path | original_bytes | optimized_bytes | backup_path | note"
@@ -435,5 +493,42 @@ class UndoLogRepository {
         const val LOW_SURROGATE = '\uDFFF'
         val LEGACY_HEADER = Regex("FileForge Undo Log (.+)")
         val JSON_WHITESPACE = setOf(' ', '\t', '\n', '\r')
+    }
+}
+
+private class RestoreBoundedLineReader(
+    private val reader: Reader,
+    private val cancellation: CancellationToken
+) {
+    private var totalChars = 0
+
+    fun nextNonBlank(): String? {
+        while (true) {
+            val next = nextLine() ?: return null
+            if (next.isNotBlank()) return next
+        }
+    }
+
+    fun nextLine(): String? {
+        val line = StringBuilder()
+        var sawAny = false
+        while (true) {
+            cancellation.throwIfCancelled()
+            val next = reader.read()
+            if (next < 0) return line.takeIf { sawAny }?.toString()
+            sawAny = true
+            totalChars++
+            if (totalChars > UndoLogRepository.RESTORE_MAX_TOTAL_CHARS) {
+                throw IllegalArgumentException("Undo log exceeds restore size limit")
+            }
+            val character = next.toChar()
+            if (character == '\n') return line.toString()
+            if (character != '\r') {
+                if (line.length == UndoLogRepository.RESTORE_MAX_LINE_CHARS) {
+                    throw IllegalArgumentException("Undo log record exceeds restore line limit")
+                }
+                line.append(character)
+            }
+        }
     }
 }

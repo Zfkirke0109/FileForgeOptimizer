@@ -64,6 +64,7 @@
     <string name="restore_confirmation_message">Backups and undo logs remain after restore.</string>
     <string name="restore_confirm">Restore</string>
     <string name="restore_terminal_counts">Restored %1$d of %2$d files</string>
+    <string name="restore_failed_count">Failed or unprocessed: %1$d</string>
     <string name="restore_cancelled">Restore cancelled</string>
     <string name="restore_progress_value">Restoring %1$d of %2$d • %3$s</string>
     <plurals name="restore_confirmation_title">

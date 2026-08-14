@@ -59,7 +59,7 @@ class RestoreLogDiscoveryTest {
     }
 
     @Test
-    fun strictDiscoveryRejectsAnOtherwiseValidV2LogWithOneMalformedRecord() {
+    fun streamingDiscoveryRetainsCommittedEntriesWhenAV2LogContainsMalformedRecords() {
         val gateway = RecordingDocumentGateway().apply {
             put(
                 "FileForge_Undo_v2_partially-malformed.jsonl",
@@ -73,8 +73,8 @@ class RestoreLogDiscoveryTest {
 
         val result = RestoreLogDiscovery(gateway, gateway.root).discover()
 
-        assertTrue(result.runs.isEmpty())
-        assertEquals(listOf("FileForge_Undo_v2_partially-malformed.jsonl"), result.failures.map { it.undoLogId })
+        assertEquals(listOf("FileForge_Undo_v2_partially-malformed.jsonl"), result.runs.map { it.undoLogId })
+        assertEquals(listOf("docs/valid.txt"), result.runs.single().run.entries.map { it.relativePath })
     }
 
     @Test
@@ -83,13 +83,13 @@ class RestoreLogDiscoveryTest {
         val cancelled = CancellationToken { throw OptimizationCancelledException("test cancellation") }
 
         try {
-            repository.readStrictForRestore(StringReader(v2Header("cancelled") + "\n"), cancelled)
+            repository.readStreamingForRestore(StringReader(v2Header("cancelled") + "\n"), cancelled)
             throw AssertionError("Expected cancellation")
         } catch (_: OptimizationCancelledException) {
             // The reader is checked before consuming the first record.
         }
         try {
-            repository.readStrictForRestore(StringReader("x".repeat(UndoLogRepository.RESTORE_MAX_LINE_CHARS + 1)))
+            repository.readStreamingForRestore(StringReader("x".repeat(UndoLogRepository.RESTORE_MAX_LINE_CHARS + 1)))
             throw AssertionError("Expected an oversized-record rejection")
         } catch (_: IllegalArgumentException) {
             // Bounded restore parsing rejects before allocating an unbounded record.

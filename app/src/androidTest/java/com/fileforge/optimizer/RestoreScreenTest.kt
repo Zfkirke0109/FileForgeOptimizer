@@ -65,7 +65,7 @@ class RestoreScreenTest {
             onView(withText("SHA-256 verified")).check(matches(isDisplayed()))
             onView(withText("Legacy size-only verification")).check(matches(isDisplayed()))
             onView(withText("run-42")).check(matches(isDisplayed()))
-            onView(withId(R.id.restore_select_all)).perform(click())
+            onView(withContentDescription("Select all from run-42")).perform(click())
             onView(withContentDescription("Select docs/report.txt")).perform(click())
             onView(withId(R.id.restore_selected)).check(matches(isEnabled())).perform(click())
 
