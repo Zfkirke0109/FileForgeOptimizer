@@ -19,6 +19,59 @@ import java.util.zip.ZipOutputStream
 
 class OptimizerEngineTransactionHardeningTest {
     @Test
+    fun everyRecoverableThrowableAfterUndoAppendStartsPoisonsRunAndStopsBeforeSecondFile() {
+        listOf(
+            UndoFault.MID_LINE_ASSERTION,
+            UndoFault.FLUSH_AFTER_DELEGATE_ASSERTION,
+            UndoFault.MID_LINE_CANCELLATION
+        ).forEach { fault ->
+            withEngine(realRun) { gateway, engine, _ ->
+                gateway.put("a-first.zip", zipFixture)
+                gateway.put("b-second.zip", zipFixture)
+                gateway.undoFault = fault
+
+                val report = engine.run(NeverCancelled) {}
+                val durable = gateway.readDurableUndo()
+
+                assertEquals("run status for $fault", RunStatus.FAILED, report.status)
+                assertArrayEquals("first original restored for $fault", zipFixture, gateway.contents("a-first.zip"))
+                assertArrayEquals("second original untouched for $fault", zipFixture, gateway.contents("b-second.zip"))
+                assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.zip") })
+                assertTrue(gateway.mutations.none { it == "open-write:b-second.zip" })
+                assertEquals("no terminal write for $fault", 0, gateway.undoWritesAfterPoison)
+                assertEquals("no writer flush for $fault", 0, gateway.undoFlushesAfterPoison)
+                assertEquals(1, gateway.undoCloses)
+                assertEquals(RunStatus.RUNNING, durable.status)
+                assertEquals(null, durable.terminal)
+            }
+        }
+    }
+
+    @Test
+    fun failedEmergencyRollbackIsStructuredCriticalAndLeavesPoisonedLogUnfinalized() =
+        withEngine(realRun) { gateway, engine, _ ->
+            gateway.put("a-first.zip", zipFixture)
+            gateway.put("b-second.zip", zipFixture)
+            gateway.undoFault = UndoFault.MID_LINE_WRITE
+            gateway.failEmergencyRollbackForPath = "a-first.zip"
+
+            val report = engine.run(NeverCancelled) {}
+            val durable = gateway.readDurableUndo()
+
+            assertEquals(RunStatus.FAILED, report.status)
+            assertTrue(report.rollbackFailure!!.contains("emergency rollback write failed"))
+            assertTrue(report.terminalError!!.contains("critical", ignoreCase = true))
+            assertTrue(report.terminalError!!.contains("rollback", ignoreCase = true))
+            assertTrue(report.terminalFailures.any { it.contains("emergency rollback write failed") })
+            assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.zip") })
+            assertTrue(gateway.mutations.none { it == "open-write:b-second.zip" })
+            assertEquals(0, gateway.undoWritesAfterPoison)
+            assertEquals(0, gateway.undoFlushesAfterPoison)
+            assertEquals(RunStatus.RUNNING, durable.status)
+            assertEquals(null, durable.terminal)
+        }
+
+    @Test
     fun poisonedUndoWriteOrAmbiguousFlushAbortsBeforeSecondFileAndNeverFinalizesWriter() {
         listOf(UndoFault.MID_LINE_WRITE, UndoFault.FLUSH_AFTER_DELEGATE).forEach { fault ->
             withEngine(realRun) { gateway, engine, _ ->

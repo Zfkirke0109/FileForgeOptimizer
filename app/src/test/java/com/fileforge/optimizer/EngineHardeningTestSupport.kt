@@ -8,7 +8,16 @@ import java.io.OutputStream
 import java.io.Writer
 import java.util.concurrent.CountDownLatch
 
-internal enum class UndoFault { WRITE, MID_LINE_WRITE, FLUSH, FLUSH_AFTER_DELEGATE, CLOSE_AFTER_FLUSH }
+internal enum class UndoFault {
+    WRITE,
+    MID_LINE_WRITE,
+    MID_LINE_ASSERTION,
+    MID_LINE_CANCELLATION,
+    FLUSH,
+    FLUSH_AFTER_DELEGATE,
+    FLUSH_AFTER_DELEGATE_ASSERTION,
+    CLOSE_AFTER_FLUSH
+}
 
 internal open class FaultInjectingEngineGateway : DocumentGateway {
     val root = DocumentNode("root", "selected", isDirectory = true, length = 0)
@@ -21,13 +30,16 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
     var listFailure: Throwable? = null
     var readFailure: Throwable? = null
     var finalizeFailure: AssertionError? = null
+    var failEmergencyRollbackForPath: String? = null
     var undoWritesAfterPoison = 0
+    var undoFlushesAfterPoison = 0
     var undoCloses = 0
 
     protected val nodes = linkedMapOf(root.id to root)
     protected val children = linkedMapOf(root.id to linkedMapOf<String, String>())
     protected val bytes = linkedMapOf<String, ByteArray>()
     protected val advertisedLengths = mutableMapOf<String, Long>()
+    private val writeAttempts = mutableMapOf<String, Int>()
 
     fun put(relativePath: String, contents: ByteArray, advertisedLength: Long = contents.size.toLong()): DocumentNode {
         val parts = relativePath.split('/')
@@ -70,7 +82,10 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
     }
 
     override fun openWrite(node: DocumentNode): OutputStream {
-        mutations += "open-write:${path(node)}"
+        val relativePath = path(node)
+        mutations += "open-write:$relativePath"
+        val writeAttempt = (writeAttempts[relativePath] ?: 0) + 1
+        writeAttempts[relativePath] = writeAttempt
         val output = ByteArrayOutputStream()
         val undo = node.name.startsWith("FileForge_Undo_v2_")
         return object : OutputStream() {
@@ -81,18 +96,31 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
                 write(byteArrayOf(value.toByte()), 0, 1)
             }
             override fun write(source: ByteArray, offset: Int, length: Int) {
+                if (relativePath == failEmergencyRollbackForPath && writeAttempt >= 2) {
+                    throw IOException("emergency rollback write failed")
+                }
                 if (undo && poisoned) undoWritesAfterPoison++
                 if (undo && undoFault == UndoFault.WRITE && flushes >= 1) throw IOException("undo append write failed")
-                if (undo && undoFault == UndoFault.MID_LINE_WRITE && flushes >= 1) {
+                if (undo && undoFault in setOf(
+                        UndoFault.MID_LINE_WRITE,
+                        UndoFault.MID_LINE_ASSERTION,
+                        UndoFault.MID_LINE_CANCELLATION
+                    ) && flushes >= 1
+                ) {
                     val prefix = maxOf(1, length / 3)
                     output.write(source, offset, prefix)
                     persist(node, output)
                     poisoned = true
-                    throw IOException("undo append failed after a durable line prefix")
+                    when (undoFault) {
+                        UndoFault.MID_LINE_ASSERTION -> throw AssertionError("undo append assertion after a durable line prefix")
+                        UndoFault.MID_LINE_CANCELLATION -> throw OptimizationCancelledException("undo append cancellation after a durable line prefix")
+                        else -> throw IOException("undo append failed after a durable line prefix")
+                    }
                 }
                 output.write(source, offset, length)
             }
             override fun flush() {
+                if (undo && poisoned) undoFlushesAfterPoison++
                 flushes++
                 if (undo && undoFault == UndoFault.FLUSH && flushes >= 2) {
                     flushFailed = true
@@ -100,8 +128,15 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
                     throw IOException("undo append flush failed")
                 }
                 persist(node, output)
-                if (undo && undoFault == UndoFault.FLUSH_AFTER_DELEGATE && flushes >= 2) {
+                if (undo && undoFault in setOf(
+                        UndoFault.FLUSH_AFTER_DELEGATE,
+                        UndoFault.FLUSH_AFTER_DELEGATE_ASSERTION
+                    ) && flushes >= 2
+                ) {
                     poisoned = true
+                    if (undoFault == UndoFault.FLUSH_AFTER_DELEGATE_ASSERTION) {
+                        throw AssertionError("undo append assertion after delegate flush")
+                    }
                     throw IOException("undo append failed after delegate flush")
                 }
             }
