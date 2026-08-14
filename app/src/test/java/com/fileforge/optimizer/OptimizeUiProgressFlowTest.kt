@@ -2,7 +2,6 @@ package com.fileforge.optimizer
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -204,8 +203,8 @@ class OptimizeUiProgressFlowTest {
     }
 
     @Test
-    fun recreatedGateKeepsPersistedDispatchPendingThroughSameStaleTerminalUntilRunning() {
-        val storage = MemoryOptimizeDispatchStateStorage()
+    fun recreatedGateKeepsProcessOwnedDispatchPendingForFirstReplayThenClearsIdenticalTerminal() {
+        val ownership = OptimizeDispatchOwnership()
         val staleTerminal = RunState.Terminal(
             OptimizationReport(
                 scanned = 4,
@@ -213,11 +212,11 @@ class OptimizeUiProgressFlowTest {
             ),
             dryRun = false
         )
-        val original = OptimizeStartDispatchGate(storage)
+        val original = OptimizeStartDispatchGate(ownership)
         original.onObservedState(staleTerminal, sequence = 1)
         assertTrue(original.beginDispatch(observationWatermark = 1))
 
-        val recreated = OptimizeStartDispatchGate(storage)
+        val recreated = OptimizeStartDispatchGate(ownership)
         recreated.awaitReplay()
         recreated.onObservedState(
             RunState.Terminal(staleTerminal.report, dryRun = false),
@@ -228,25 +227,25 @@ class OptimizeUiProgressFlowTest {
         assertTrue(recreated.isPending)
         assertFalse(recreated.allowsStart(baseStartEnabled = true))
         recreated.onObservedState(
-            RunState.Running(ProgressSnapshot(phase = "optimizing"), dryRun = false),
+            RunState.Terminal(staleTerminal.report, dryRun = false),
             sequence = 2
         )
         assertFalse(recreated.isPending)
-        assertNull(storage.read())
     }
 
     @Test
-    fun recreatedGateClearsPersistedDispatchForChangedSetupFailureTerminal() {
-        val storage = MemoryOptimizeDispatchStateStorage()
+    fun recreatedGateClearsProcessOwnedDispatchForChangedSetupFailureTerminal() {
+        val ownership = OptimizeDispatchOwnership()
         val staleTerminal = RunState.Terminal(
             OptimizationReport(status = RunStatus.COMPLETED),
             dryRun = true
         )
-        val original = OptimizeStartDispatchGate(storage)
+        val original = OptimizeStartDispatchGate(ownership)
         original.onObservedState(staleTerminal, sequence = 1)
         assertTrue(original.beginDispatch(observationWatermark = 1))
 
-        val recreated = OptimizeStartDispatchGate(storage)
+        val recreated = OptimizeStartDispatchGate(ownership)
+        recreated.awaitReplay()
         recreated.onObservedState(
             RunState.Terminal(
                 OptimizationReport(
@@ -259,21 +258,59 @@ class OptimizeUiProgressFlowTest {
         )
 
         assertFalse(recreated.isPending)
-        assertNull(storage.read())
     }
 
     @Test
-    fun synchronousDispatchFailureClearsPersistedMarkerForNextController() {
-        val storage = MemoryOptimizeDispatchStateStorage()
-        val original = OptimizeStartDispatchGate(storage)
+    fun recreatedGateClearsProcessOwnedDispatchForRunningObservation() {
+        val ownership = OptimizeDispatchOwnership()
+        val original = OptimizeStartDispatchGate(ownership)
+        val staleTerminal = RunState.Terminal(
+            OptimizationReport(status = RunStatus.COMPLETED),
+            dryRun = false
+        )
+        original.onObservedState(staleTerminal, sequence = 1)
+        assertTrue(original.beginDispatch(observationWatermark = 1))
+
+        val recreated = OptimizeStartDispatchGate(ownership)
+        recreated.awaitReplay()
+        recreated.onObservedState(
+            RunState.Running(ProgressSnapshot(phase = "optimizing"), dryRun = false),
+            sequence = 1
+        )
+
+        assertFalse(recreated.isPending)
+    }
+
+    @Test
+    fun simulatedProcessResetHasNoOrphanedPendingDispatch() {
+        val firstProcessOwnership = OptimizeDispatchOwnership()
+        val original = OptimizeStartDispatchGate(firstProcessOwnership)
+        val staleTerminal = RunState.Terminal(
+            OptimizationReport(status = RunStatus.COMPLETED),
+            dryRun = false
+        )
+        original.onObservedState(staleTerminal, sequence = 1)
+        assertTrue(original.beginDispatch(observationWatermark = 1))
+
+        val restartedProcess = OptimizeStartDispatchGate(OptimizeDispatchOwnership())
+        restartedProcess.awaitReplay()
+        restartedProcess.onObservedState(staleTerminal, sequence = 1)
+
+        assertFalse(restartedProcess.isPending)
+        assertTrue(restartedProcess.allowsStart(baseStartEnabled = true))
+    }
+
+    @Test
+    fun synchronousDispatchFailureClearsProcessOwnershipForNextController() {
+        val ownership = OptimizeDispatchOwnership()
+        val original = OptimizeStartDispatchGate(ownership)
         original.onObservedState(RunState.Idle, sequence = 1)
         assertTrue(original.beginDispatch(observationWatermark = 1))
 
         original.onDispatchFailed()
 
-        val recreated = OptimizeStartDispatchGate(storage)
+        val recreated = OptimizeStartDispatchGate(ownership)
         assertFalse(recreated.isPending)
-        assertNull(storage.read())
     }
 
     @Test
@@ -314,20 +351,6 @@ class OptimizeUiProgressFlowTest {
 
         override fun setProgress(value: Int, animated: Boolean) {
             events += "progress:$value:$animated"
-        }
-    }
-
-    private class MemoryOptimizeDispatchStateStorage : OptimizeDispatchStateStorage {
-        private var value: PersistedOptimizeDispatch? = null
-
-        override fun read(): PersistedOptimizeDispatch? = value
-
-        override fun write(value: PersistedOptimizeDispatch) {
-            this.value = value
-        }
-
-        override fun clear() {
-            value = null
         }
     }
 }

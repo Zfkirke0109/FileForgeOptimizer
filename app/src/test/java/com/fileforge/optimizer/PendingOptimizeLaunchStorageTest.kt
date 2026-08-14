@@ -32,14 +32,24 @@ class PendingOptimizeLaunchStorageTest {
     }
 
     @Test
-    fun blankTreeUriFailsClosedAndClearsTheCompleteRecord() {
-        listOf("", "   ").forEach { blankUri ->
+    fun malformedAndNonContentTreeUrisFailClosedAndClearTheCompleteRecord() {
+        listOf(
+            "",
+            "   ",
+            "not a URI",
+            "file:///tree/primary%3AFolder",
+            "https://documents.example/tree/primary%3AFolder",
+            "content:///tree/primary%3AFolder",
+            "content://documents.example/document/primary%3AFolder",
+            "content://documents.example/tree/",
+            "content://documents.example/tree/%"
+        ).forEach { invalidUri ->
             val store = MemoryPendingLaunchRecordStore(
-                validRecord() + ("pending_launch_tree_uri" to blankUri)
+                validRecord() + ("pending_launch_tree_uri" to invalidUri)
             )
 
             assertNull(StrictPendingOptimizeLaunchStorage(store).read())
-            assertTrue(store.values.isEmpty())
+            assertTrue("Record was not cleared for $invalidUri", store.values.isEmpty())
         }
     }
 
@@ -77,7 +87,7 @@ class PendingOptimizeLaunchStorageTest {
         assertEquals(
             PendingOptimizeLaunch(
                 request = ServiceRunRequest.Optimize(
-                    treeUri = "content://tree/exact",
+                    treeUri = VALID_TREE_URI,
                     runIntent = RunIntent(
                         mode = OptimizeMode.AGGRESSIVE,
                         dryRun = true,
@@ -93,7 +103,7 @@ class PendingOptimizeLaunchStorageTest {
 
     private fun validRecord(): Map<String, Any?> = linkedMapOf(
         "pending_launch_present" to true,
-        "pending_launch_tree_uri" to "content://tree/exact",
+        "pending_launch_tree_uri" to VALID_TREE_URI,
         "pending_launch_mode" to "AGGRESSIVE",
         "pending_launch_dry_run" to true,
         "pending_launch_apk_lab" to true,
@@ -120,5 +130,10 @@ class PendingOptimizeLaunchStorageTest {
         override fun clear() {
             values.clear()
         }
+    }
+
+    private companion object {
+        const val VALID_TREE_URI =
+            "content://com.example.documents/tree/primary%3AFileForge"
     }
 }

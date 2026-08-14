@@ -11,57 +11,119 @@ class PendingOptimizeLaunchCoordinatorTest {
     fun deniedPermissionResultSurvivesControllerRecreationUntilReplayThenConsumesOnce() {
         val storage = MemoryPendingLaunchStorage()
         val request = request(
-            treeUri = "content://tree/exact",
+            treeUri = "content://com.example.documents/tree/exact",
             mode = OptimizeMode.AGGRESSIVE,
             dryRun = true,
             apkLab = true,
             textMinify = true
         )
-        PendingOptimizeLaunchCoordinator(storage).beginPermissionRequest(request)
+        PendingOptimizeLaunchCoordinator(storage, readWriteCapabilities)
+            .beginPermissionRequest(request)
 
-        val recreated = PendingOptimizeLaunchCoordinator(storage)
+        val recreated = PendingOptimizeLaunchCoordinator(storage, readWriteCapabilities)
         recreated.recordPermissionResult(granted = false)
 
-        assertNull(recreated.takeReady(replayReady = false, startAllowed = true))
-        val launch = recreated.takeReady(replayReady = true, startAllowed = true)
+        assertNull(recreated.takeReady(replayReady = false, dispatchAvailable = true))
+        val launch = recreated.takeReady(replayReady = true, dispatchAvailable = true)
             ?: error("Expected deferred launch")
         assertEquals(request, launch.request)
         assertTrue(launch.explainReducedVisibility)
-        assertNull(recreated.takeReady(replayReady = true, startAllowed = true))
+        assertNull(recreated.takeReady(replayReady = true, dispatchAvailable = true))
         assertNull(storage.read())
     }
 
     @Test
     fun replayBeforePermissionResultKeepsExactRequestUntilResultArrives() {
         val storage = MemoryPendingLaunchStorage()
-        val request = request("content://tree/read-write", OptimizeMode.SAFE, false, false, true)
-        val coordinator = PendingOptimizeLaunchCoordinator(storage)
+        val request = request(
+            "content://com.example.documents/tree/read-write",
+            OptimizeMode.SAFE,
+            false,
+            false,
+            true
+        )
+        val coordinator = PendingOptimizeLaunchCoordinator(storage, readWriteCapabilities)
         coordinator.beginPermissionRequest(request)
 
-        assertNull(coordinator.takeReady(replayReady = true, startAllowed = true))
+        assertNull(coordinator.takeReady(replayReady = true, dispatchAvailable = true))
         coordinator.recordPermissionResult(granted = true)
-        val launch = coordinator.takeReady(replayReady = true, startAllowed = true)
+        val launch = coordinator.takeReady(replayReady = true, dispatchAvailable = true)
             ?: error("Expected deferred launch")
 
         assertEquals(request, launch.request)
         assertFalse(launch.explainReducedVisibility)
-        assertNull(coordinator.takeReady(replayReady = true, startAllowed = true))
+        assertNull(coordinator.takeReady(replayReady = true, dispatchAvailable = true))
     }
 
     @Test
     fun unavailableStartKeepsResolvedRequestDeferredInsteadOfDiscardingIt() {
         val storage = MemoryPendingLaunchStorage()
-        val coordinator = PendingOptimizeLaunchCoordinator(storage)
-        val request = request("content://tree/busy", OptimizeMode.SAFE, true, false, false)
+        val coordinator = PendingOptimizeLaunchCoordinator(storage, readWriteCapabilities)
+        val request = request(
+            "content://com.example.documents/tree/busy",
+            OptimizeMode.SAFE,
+            true,
+            false,
+            false
+        )
         coordinator.beginPermissionRequest(request)
         coordinator.recordPermissionResult(granted = true)
 
-        assertNull(coordinator.takeReady(replayReady = true, startAllowed = false))
+        assertNull(coordinator.takeReady(replayReady = true, dispatchAvailable = false))
         assertEquals(request, storage.read()?.request)
         assertEquals(
             request,
-            coordinator.takeReady(replayReady = true, startAllowed = true)?.request
+            coordinator.takeReady(replayReady = true, dispatchAvailable = true)?.request
         )
+    }
+
+    @Test
+    fun oldWritableRequestDispatchesExactlyWhenNewSelectedTreeIsReadOnly() {
+        val oldRequestUri = "content://com.example.documents/tree/old-writable"
+        val newSelectedUri = "content://com.example.documents/tree/new-read-only"
+        val queriedUris = mutableListOf<String>()
+        val capabilities = mapOf(
+            oldRequestUri to SelectedTreeCapabilities.READ_WRITE_DIRECTORY,
+            newSelectedUri to SelectedTreeCapabilities.READ_ONLY_DIRECTORY
+        )
+        val storage = MemoryPendingLaunchStorage()
+        val coordinator = PendingOptimizeLaunchCoordinator(storage) { treeUri ->
+            queriedUris += treeUri
+            capabilities[treeUri] ?: SelectedTreeCapabilities.NONE
+        }
+        val request = request(oldRequestUri, OptimizeMode.AGGRESSIVE, false, true, true)
+        coordinator.beginPermissionRequest(request)
+        coordinator.recordPermissionResult(granted = true)
+
+        val launch = coordinator.takeReady(replayReady = true, dispatchAvailable = true)
+            ?: error("Expected the persisted writable request to launch")
+
+        assertEquals(listOf(oldRequestUri), queriedUris)
+        assertEquals(request, launch.request)
+    }
+
+    @Test
+    fun oldRevokedRequestFailsClosedWhenNewSelectedTreeIsWritable() {
+        val oldRequestUri = "content://com.example.documents/tree/old-revoked"
+        val newSelectedUri = "content://com.example.documents/tree/new-writable"
+        val queriedUris = mutableListOf<String>()
+        val capabilities = mapOf(
+            oldRequestUri to SelectedTreeCapabilities.NONE,
+            newSelectedUri to SelectedTreeCapabilities.READ_WRITE_DIRECTORY
+        )
+        val storage = MemoryPendingLaunchStorage()
+        val coordinator = PendingOptimizeLaunchCoordinator(storage) { treeUri ->
+            queriedUris += treeUri
+            capabilities[treeUri] ?: SelectedTreeCapabilities.NONE
+        }
+        coordinator.beginPermissionRequest(
+            request(oldRequestUri, OptimizeMode.SAFE, false, false, false)
+        )
+        coordinator.recordPermissionResult(granted = false)
+
+        assertNull(coordinator.takeReady(replayReady = true, dispatchAvailable = true))
+        assertEquals(listOf(oldRequestUri), queriedUris)
+        assertNull(storage.read())
     }
 
     private fun request(
@@ -91,6 +153,12 @@ class PendingOptimizeLaunchCoordinatorTest {
 
         override fun clear() {
             value = null
+        }
+    }
+
+    private companion object {
+        val readWriteCapabilities: (String) -> SelectedTreeCapabilities = {
+            SelectedTreeCapabilities.READ_WRITE_DIRECTORY
         }
     }
 }
