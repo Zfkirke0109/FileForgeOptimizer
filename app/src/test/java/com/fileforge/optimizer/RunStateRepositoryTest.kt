@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -321,6 +322,45 @@ class RunStateRepositoryTest {
     }
 
     @Test
+    fun immediateReplayListenerCanPublishWithoutDeadlockAndReceivesReplayThenPublication() {
+        val repository = RunStateRepository(RecordingRunStateStorage())
+        val observed = Collections.synchronizedList(mutableListOf<String>())
+        val publishOnce = AtomicBoolean(false)
+        val observeFailure = AtomicReference<Throwable?>()
+        val observeReturned = CountDownLatch(1)
+        val observeThread = Thread {
+            try {
+                repository.observe { state ->
+                    when (state) {
+                        RunState.Idle -> {
+                            observed += "idle"
+                            if (publishOnce.compareAndSet(false, true)) {
+                                repository.publish(runningState(sequence = 1))
+                            }
+                        }
+                        is RunState.Running ->
+                            observed += "running:${state.snapshot.filesProcessed}"
+                        is RunState.Terminal -> observed += "terminal"
+                    }
+                }
+            } catch (failure: Throwable) {
+                observeFailure.set(failure)
+            } finally {
+                observeReturned.countDown()
+            }
+        }.apply { isDaemon = true }
+
+        observeThread.start()
+        val returnedInTime = observeReturned.await(2, TimeUnit.SECONDS)
+        observeThread.join(250)
+
+        assertTrue(returnedInTime)
+        assertFalse(observeThread.isAlive)
+        assertNull(observeFailure.get())
+        assertEquals(listOf("idle", "running:1"), observed)
+    }
+
+    @Test
     fun concurrentPublishQueuesBehindCommittedStateWithoutReorderingOtherListeners() {
         val repository = RunStateRepository(RecordingRunStateStorage())
         val firstDeliveryEntered = CountDownLatch(1)
@@ -405,6 +445,49 @@ class RunStateRepositoryTest {
                 }
             )
         }
+    }
+
+    @Test
+    fun vmFatalListenerFailurePropagatesWithoutPermanentlyStrandingTheDrain() {
+        val repository = RunStateRepository(RecordingRunStateStorage())
+        val syntheticFatal = OutOfMemoryError("synthetic listener fatal")
+        val failingSubscription = repository.observe { state ->
+            if (state is RunState.Running && state.snapshot.filesProcessed == 1) {
+                throw syntheticFatal
+            }
+        }
+        val healthyOrder = Collections.synchronizedList(mutableListOf<Int>())
+        val healthyReceivedSecond = CountDownLatch(1)
+        val healthySubscription = repository.observe { state ->
+            if (state is RunState.Running) {
+                healthyOrder += state.snapshot.filesProcessed
+                if (state.snapshot.filesProcessed == 2) healthyReceivedSecond.countDown()
+            }
+        }
+
+        val propagated = assertThrows(OutOfMemoryError::class.java) {
+            repository.publish(runningState(sequence = 1))
+        }
+        assertSame(syntheticFatal, propagated)
+        failingSubscription.close()
+        val healthyPublisherFailure = AtomicReference<Throwable?>()
+        val healthyPublisher = Thread {
+            try {
+                repository.publish(runningState(sequence = 2))
+            } catch (failure: Throwable) {
+                healthyPublisherFailure.set(failure)
+            }
+        }
+
+        healthyPublisher.start()
+        healthyPublisher.join(2_000)
+        val delivered = healthyReceivedSecond.await(2, TimeUnit.SECONDS)
+        healthySubscription.close()
+
+        assertFalse(healthyPublisher.isAlive)
+        assertNull(healthyPublisherFailure.get())
+        assertTrue(delivered)
+        assertTrue(healthyOrder.contains(2))
     }
 
     @Test
