@@ -1,6 +1,7 @@
 package com.fileforge.optimizer
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
@@ -51,9 +52,9 @@ class ByteArrayOptimizerAdapterHardeningTest {
             }
         )
 
-        val failure = expectType<FileOutcome.Failed>(
+        val failure = assertThrows(UndoDurabilityException::class.java) {
             adapter.process(node, "document.pdf", FileKind.PDF, realRun, NeverCancelled)
-        )
+        }
 
         assertEquals(RollbackResult.Restored, failure.rollback)
         assertEquals(original.toList(), gateway.contents("document.pdf").toList())

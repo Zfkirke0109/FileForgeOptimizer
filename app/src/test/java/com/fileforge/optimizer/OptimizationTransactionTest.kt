@@ -97,9 +97,9 @@ class OptimizationTransactionTest {
     fun undoAppendFailureAfterVerifiedOriginalRollsBackAndLeavesNoUnloggedReplacement() = withCoordinator { gateway, coordinator, undo ->
         undo.failure = IOException("undo append failed")
 
-        val outcome = coordinator.process(gateway.node("archive.zip")!!, "archive.zip", realRun, NeverCancelled)
-
-        val failure = expectType<FileOutcome.Failed>(outcome)
+        val failure = assertThrows(UndoDurabilityException::class.java) {
+            coordinator.process(gateway.node("archive.zip")!!, "archive.zip", realRun, NeverCancelled)
+        }
         assertEquals(RollbackResult.Restored, failure.rollback)
         assertEquals(original.toList(), gateway.contents("archive.zip").toList())
         assertEquals(2, gateway.events.count { it == "read:root/FileForge_Backups_run-1/archive.zip" })
