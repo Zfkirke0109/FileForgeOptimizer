@@ -29,7 +29,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var optimizeController: OptimizeScreenController
     private var serviceBinder: OptimizationBinder? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val runStateDispatcher = LatestValueDispatcher<RunState>(
+    private val observationSequencer = RunStateObservationSequencer()
+    private val runStateDispatcher = LatestValueDispatcher<SequencedRunState>(
         schedule = { task ->
             mainHandler.post { task() }
             Unit
@@ -37,7 +38,9 @@ class MainActivity : AppCompatActivity() {
         deliver = { state -> optimizeController.render(state) }
     )
 
-    private val runStateListener: (RunState) -> Unit = runStateDispatcher::submit
+    private val runStateListener: (RunState) -> Unit = { state ->
+        runStateDispatcher.submit(observationSequencer.next(state))
+    }
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -87,7 +90,8 @@ class MainActivity : AppCompatActivity() {
         optimizeController = OptimizeScreenController(
             activity = this,
             startRun = serviceSession::start,
-            cancelRun = serviceSession::cancel
+            cancelRun = serviceSession::cancel,
+            observationWatermark = { observationSequencer.watermark }
         )
         buildMaterialHost()
     }
@@ -95,6 +99,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         runStateDispatcher.resume()
+        optimizeController.awaitServiceReplay()
         optimizeController.refreshTreeCapabilities()
         serviceSession.onVisible()
     }

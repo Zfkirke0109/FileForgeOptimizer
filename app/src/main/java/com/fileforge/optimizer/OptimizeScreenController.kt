@@ -162,7 +162,8 @@ object NotificationPermissionFlow {
 class OptimizeScreenController(
     private val activity: AppCompatActivity,
     private val startRun: (ServiceRunRequest.Optimize) -> Unit,
-    private val cancelRun: () -> Unit
+    private val cancelRun: () -> Unit,
+    private val observationWatermark: () -> Long
 ) {
     val view: View
 
@@ -240,17 +241,22 @@ class OptimizeScreenController(
         restoreControls()
         installListeners()
         capabilityCache.refresh()
-        render(RunState.Idle)
+        renderCurrentState()
     }
 
-    fun render(state: RunState) {
-        latestRunState = state
-        startDispatchGate.onObservedState(state)
+    fun render(observation: SequencedRunState) {
+        latestRunState = observation.state
+        startDispatchGate.onObservedState(observation.state, observation.sequence)
         renderCurrentState()
     }
 
     fun refreshTreeCapabilities() {
         capabilityCache.refresh()
+        renderCurrentState()
+    }
+
+    fun awaitServiceReplay() {
+        startDispatchGate.awaitReplay()
         renderCurrentState()
     }
 
@@ -560,7 +566,10 @@ class OptimizeScreenController(
     }
 
     private fun dispatchStart(request: ServiceRunRequest.Optimize) {
-        startDispatchGate.beginDispatch()
+        if (!startDispatchGate.beginDispatch(observationWatermark())) {
+            renderCurrentState()
+            return
+        }
         renderCurrentState()
         try {
             startRun(request)

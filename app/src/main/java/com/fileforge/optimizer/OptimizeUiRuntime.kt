@@ -1,5 +1,7 @@
 package com.fileforge.optimizer
 
+import java.util.concurrent.atomic.AtomicLong
+
 interface OptimizeProgressIndicator {
     val indeterminate: Boolean
     fun hide()
@@ -92,16 +94,46 @@ class SelectedTreeCapabilitiesCache(
     fun refresh(): SelectedTreeCapabilities = reader().also { current = it }
 }
 
+data class SequencedRunState(
+    val sequence: Long,
+    val state: RunState
+)
+
+class RunStateObservationSequencer {
+    private val sequence = AtomicLong(0)
+
+    val watermark: Long
+        get() = sequence.get()
+
+    fun next(state: RunState): SequencedRunState =
+        SequencedRunState(sequence.incrementAndGet(), state)
+}
+
 class OptimizeStartDispatchGate {
+    var isReplayReady: Boolean = false
+        private set
     var isPending: Boolean = false
         private set
+    private var releaseAfterSequence: Long = 0
 
-    fun beginDispatch() {
+    fun beginDispatch(observationWatermark: Long): Boolean {
+        if (!isReplayReady || isPending) return false
         isPending = true
+        releaseAfterSequence = observationWatermark
+        return true
     }
 
-    fun onObservedState(state: RunState) {
-        if (isPending && (state is RunState.Running || state is RunState.Terminal)) {
+    fun awaitReplay() {
+        isReplayReady = false
+    }
+
+    fun onObservedState(state: RunState, sequence: Long) {
+        if (!isReplayReady) {
+            isReplayReady = true
+        }
+        if (isPending && sequence > releaseAfterSequence &&
+            (state is RunState.Running || state is RunState.Terminal)
+        ) {
             isPending = false
         }
     }
@@ -110,7 +142,8 @@ class OptimizeStartDispatchGate {
         isPending = false
     }
 
-    fun allowsStart(baseStartEnabled: Boolean): Boolean = baseStartEnabled && !isPending
+    fun allowsStart(baseStartEnabled: Boolean): Boolean =
+        baseStartEnabled && isReplayReady && !isPending
 }
 
 interface OptimizeServicePort {
