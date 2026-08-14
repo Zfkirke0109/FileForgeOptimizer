@@ -313,7 +313,7 @@ class OptimizeUiProgressFlowTest {
         )
         original.onObservedState(terminal, sequence = 1)
         assertTrue(original.beginDispatch(observationWatermark = 1))
-        ownership.onServiceFinished()
+        ownership.onServiceFinished(requireNotNull(ownership.current()))
 
         val recreated = OptimizeStartDispatchGate(ownership)
         recreated.awaitReplay()

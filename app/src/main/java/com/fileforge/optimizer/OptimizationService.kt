@@ -50,6 +50,8 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
     private var foregroundNotificationActive = false
     @Volatile
     private var detailedNotificationUpdatesAllowed = false
+    @Volatile
+    private var optimizeDispatchClaim: OptimizeDispatchClaim? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -86,6 +88,7 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         else if (::controller.isInitialized) controller.close()
         if (::notificationSubscription.isInitialized) notificationSubscription.close()
         if (::executor.isInitialized) executor.shutdown()
+        releaseOptimizeDispatchOwnership()
         super.onDestroy()
     }
 
@@ -94,6 +97,11 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         initialState: RunState.Running,
         detailedNotificationsAllowed: Boolean
     ) {
+        optimizeDispatchClaim = if (initialState.operationKind == RunOperationKind.OPTIMIZE) {
+            ProcessOptimizeDispatchOwnership.instance.current()
+        } else {
+            null
+        }
         // Android still requires an FGS notification when POST_NOTIFICATIONS is denied.
         detailedNotificationUpdatesAllowed = detailedNotificationsAllowed
         notificationThrottle.shouldDeliver(initialState)
@@ -156,11 +164,17 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
     }
 
     override fun stopForegroundAndSelf() {
-        ProcessOptimizeDispatchOwnership.instance.onServiceFinished()
+        releaseOptimizeDispatchOwnership()
         stopForeground(STOP_FOREGROUND_DETACH)
         foregroundNotificationActive = false
         detailedNotificationUpdatesAllowed = false
         stopSelf()
+    }
+
+    private fun releaseOptimizeDispatchOwnership() {
+        val owned = optimizeDispatchClaim ?: return
+        optimizeDispatchClaim = null
+        ProcessOptimizeDispatchOwnership.instance.onServiceFinished(owned)
     }
 
     private fun runOptimization(

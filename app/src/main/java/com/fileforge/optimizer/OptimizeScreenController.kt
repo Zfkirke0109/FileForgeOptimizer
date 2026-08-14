@@ -186,6 +186,8 @@ class OptimizeScreenController(
 
     private var selectedTreeUri: Uri? = restoreSelectedTreeUri()
     private var latestRunState: RunState = RunState.Idle
+    private var visible = false
+    private var closed = false
     private val pendingLaunchCoordinator = PendingOptimizeLaunchCoordinator(
         StrictPendingOptimizeLaunchStorage(
             SharedPreferencesPendingOptimizeLaunchRecordStore(preferences)
@@ -193,9 +195,9 @@ class OptimizeScreenController(
         ::readTreeCapabilities
     )
     private val capabilityCache = SelectedTreeCapabilitiesCache(::readSelectedTreeCapabilities)
-    private val startDispatchGate = OptimizeStartDispatchGate(
-        ProcessOptimizeDispatchOwnership.instance
-    )
+    private val dispatchOwnership = ProcessOptimizeDispatchOwnership.instance
+    private val startDispatchGate = OptimizeStartDispatchGate(dispatchOwnership)
+    private lateinit var serviceFinishedSubscription: AutoCloseable
     private val progressPort: OptimizeProgressIndicator by lazy {
         object : OptimizeProgressIndicator {
             override val indeterminate: Boolean
@@ -242,6 +244,28 @@ class OptimizeScreenController(
         installListeners()
         capabilityCache.refresh()
         renderCurrentState()
+        serviceFinishedSubscription = dispatchOwnership.observeServiceFinished {
+            activity.runOnUiThread {
+                if (!visible || closed) return@runOnUiThread
+                renderCurrentState()
+                drainPendingPermissionLaunch()
+            }
+        }
+    }
+
+    fun onVisible() {
+        visible = true
+        renderCurrentState()
+    }
+
+    fun onHidden() {
+        visible = false
+    }
+
+    fun close() {
+        if (closed) return
+        closed = true
+        serviceFinishedSubscription.close()
     }
 
     fun render(observation: SequencedRunState) {

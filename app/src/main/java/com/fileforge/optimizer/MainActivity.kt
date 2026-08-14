@@ -98,6 +98,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        optimizeController.onVisible()
         runStateDispatcher.resume()
         optimizeController.awaitServiceReplay()
         optimizeController.refreshTreeCapabilities()
@@ -105,9 +106,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        optimizeController.onHidden()
         runStateDispatcher.clear()
         serviceSession.onHidden()
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        optimizeController.close()
+        super.onDestroy()
     }
 
     private fun buildMaterialHost() {

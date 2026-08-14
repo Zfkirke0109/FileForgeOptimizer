@@ -113,8 +113,7 @@ class RunStateObservationSequencer {
 
 internal data class OptimizeDispatchClaim(
     val id: Long,
-    val baselineStateKey: String,
-    val serviceFinished: Boolean = false
+    val baselineStateKey: String
 )
 
 /** Lives only as long as the process that can own the started service. */
@@ -122,6 +121,7 @@ class OptimizeDispatchOwnership {
     private val lock = Any()
     private var nextId = 0L
     private var claim: OptimizeDispatchClaim? = null
+    private val serviceFinishedListeners = linkedSetOf<() -> Unit>()
 
     internal fun current(): OptimizeDispatchClaim? = synchronized(lock) { claim }
 
@@ -137,10 +137,27 @@ class OptimizeDispatchOwnership {
         }
     }
 
-    internal fun onServiceFinished() {
-        synchronized(lock) {
-            claim = claim?.copy(serviceFinished = true)
+    internal fun observeServiceFinished(listener: () -> Unit): AutoCloseable {
+        synchronized(lock) { serviceFinishedListeners += listener }
+        return AutoCloseable {
+            synchronized(lock) { serviceFinishedListeners -= listener }
         }
+    }
+
+    internal fun onServiceFinished(expected: OptimizeDispatchClaim): Boolean {
+        val listeners = synchronized(lock) {
+            if (claim?.id != expected.id) return false
+            claim = null
+            serviceFinishedListeners.toList()
+        }
+        listeners.forEach { listener ->
+            try {
+                listener()
+            } catch (failure: Throwable) {
+                if (failure.isVmFatal()) throw failure
+            }
+        }
+        return true
     }
 }
 
@@ -177,7 +194,7 @@ class OptimizeStartDispatchGate(
         val stateKey = state.semanticKey()
         val pending = ownership.current()
         val unchangedPendingReplay = !isReplayReady && suppressEquivalentReplay &&
-            pending != null && !pending.serviceFinished && stateKey == pending.baselineStateKey
+            pending != null && stateKey == pending.baselineStateKey
         if (!isReplayReady) {
             isReplayReady = true
         }
