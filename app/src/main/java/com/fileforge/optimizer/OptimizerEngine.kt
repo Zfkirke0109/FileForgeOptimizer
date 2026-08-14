@@ -160,7 +160,16 @@ class OptimizerEngine(
             undoPoisoned = true
             report.errors = saturatingIncrement(report.errors)
             report.status = RunStatus.FAILED
-            report.terminalError = poisoned.message ?: poisoned.javaClass.name
+            val rollbackFailure = (poisoned.rollback as? RollbackResult.Failed)?.cause
+            if (rollbackFailure == null) {
+                report.terminalError = poisoned.message ?: poisoned.javaClass.name
+            } else {
+                val detail = rollbackFailure.message ?: rollbackFailure.javaClass.name
+                report.rollbackFailure = detail
+                report.terminalFailures = report.terminalFailures + "Emergency rollback failed: $detail"
+                report.terminalError = "CRITICAL: undo log durability failed and emergency rollback failed: $detail"
+            }
+            poisoned.fatalPrimary?.let { vmFatal = it }
         } catch (failure: Throwable) {
             report.errors = saturatingIncrement(report.errors)
             report.status = RunStatus.FAILED
@@ -387,9 +396,6 @@ class OptimizerEngine(
             report.terminalError = report.terminalError ?: message
         }
     }
-
-    private fun Throwable.isVmFatal(): Boolean =
-        this is OutOfMemoryError || this is StackOverflowError || this is ThreadDeath
 
     private fun saturatingIncrement(value: Int): Int = if (value == Int.MAX_VALUE) value else value + 1
 

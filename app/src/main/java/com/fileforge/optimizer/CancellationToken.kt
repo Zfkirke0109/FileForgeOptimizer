@@ -12,3 +12,6 @@ class OptimizationCancelledException(message: String = "Optimization cancelled")
 object NeverCancelled : CancellationToken {
     override fun throwIfCancelled() = Unit
 }
+
+internal fun Throwable.isVmFatal(): Boolean =
+    this is OutOfMemoryError || this is StackOverflowError || this is ThreadDeath

@@ -147,15 +147,7 @@ class ByteArrayOptimizerAdapter(
             )
             transactionDurable = true
             FileOutcome.Optimized(relativePath, expectedOriginal.bytes, writtenCandidate.bytes, TOOL_ID, result.note)
-        } catch (cancelled: OptimizationCancelledException) {
-            val rollbackBackup = backup
-            val rollbackIntegrity = originalIntegrity
-            if (originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null) {
-                val rollback = restoreBackup(originalNode, rollbackBackup, rollbackIntegrity)
-                if (rollback is RollbackResult.Failed) cancelled.addSuppressed(rollback.cause)
-            }
-            throw cancelled
-        } catch (failure: Exception) {
+        } catch (failure: Throwable) {
             val rollbackBackup = backup
             val rollbackIntegrity = originalIntegrity
             val rollback = if (originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null) {
@@ -164,9 +156,16 @@ class ByteArrayOptimizerAdapter(
                 RollbackResult.NotNeeded
             }
             if (undoAppendStarted && !transactionDurable) {
-                throw UndoDurabilityException("Undo append/flush failed; the run log is poisoned", failure, rollback).also {
-                    if (rollback is RollbackResult.Failed) it.addSuppressed(rollback.cause)
-                }
+                throw poisonedUndoFailure(failure, rollback)
+            }
+            val fatal = fatalPrimary(failure, rollback)
+            if (fatal != null) {
+                attachSecondaryFailure(fatal, failure, rollback)
+                throw fatal
+            }
+            if (failure is OptimizationCancelledException) {
+                if (rollback is RollbackResult.Failed) failure.addSuppressed(rollback.cause)
+                throw failure
             }
             FileOutcome.Failed(relativePath, failure.message ?: failure.javaClass.name, failure, rollback)
         }
@@ -203,8 +202,32 @@ class ByteArrayOptimizerAdapter(
         val verified = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, NeverCancelled) }
         check(restored == expected && verified == expected) { "Rollback verification failed" }
         RollbackResult.Restored
-    } catch (failure: Exception) {
+    } catch (failure: Throwable) {
         RollbackResult.Failed(failure)
+    }
+
+    private fun poisonedUndoFailure(failure: Throwable, rollback: RollbackResult): UndoDurabilityException {
+        val fatal = fatalPrimary(failure, rollback)
+        if (fatal != null) attachSecondaryFailure(fatal, failure, rollback)
+        return UndoDurabilityException(
+            "Undo append/flush failed; the run log is poisoned",
+            failure,
+            rollback,
+            fatal
+        ).also { poisoned ->
+            if (fatal == null && rollback is RollbackResult.Failed) poisoned.addSuppressed(rollback.cause)
+        }
+    }
+
+    private fun fatalPrimary(failure: Throwable, rollback: RollbackResult): Throwable? = when {
+        failure.isVmFatal() -> failure
+        rollback is RollbackResult.Failed && rollback.cause.isVmFatal() -> rollback.cause
+        else -> null
+    }
+
+    private fun attachSecondaryFailure(primary: Throwable, failure: Throwable, rollback: RollbackResult) {
+        if (failure !== primary) primary.addSuppressed(failure)
+        if (rollback is RollbackResult.Failed && rollback.cause !== primary) primary.addSuppressed(rollback.cause)
     }
 
     private class InputLimitExceededException(cause: Throwable? = null) : IOException("Input memory limit exceeded", cause)
