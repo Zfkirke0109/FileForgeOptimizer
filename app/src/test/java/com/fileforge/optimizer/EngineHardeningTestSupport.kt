@@ -69,6 +69,7 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
         val undo = node.name.startsWith("FileForge_Undo_v2_")
         return object : OutputStream() {
             private var flushes = 0
+            private var flushFailed = false
             override fun write(value: Int) {
                 if (undo && undoFault == UndoFault.WRITE && flushes >= 1) throw IOException("undo append write failed")
                 output.write(value)
@@ -79,11 +80,14 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
             }
             override fun flush() {
                 flushes++
+                if (undo && undoFault == UndoFault.FLUSH && flushes >= 2) {
+                    flushFailed = true
+                    throw IOException("undo append flush failed")
+                }
                 persist(node, output)
-                if (undo && undoFault == UndoFault.FLUSH && flushes >= 2) throw IOException("undo append flush failed")
             }
             override fun close() {
-                persist(node, output)
+                if (!flushFailed) persist(node, output)
                 if (undo && undoFault == UndoFault.CLOSE_AFTER_FLUSH) throw IOException("undo close failed after flush")
             }
         }
