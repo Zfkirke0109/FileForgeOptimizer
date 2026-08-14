@@ -170,9 +170,10 @@ class RunStateRepositoryTest {
         )
         val valid = checkNotNull(validStorage.value)
         val invalidDocuments = listOf(
-            Regex("""(\"status\"\s*:\s*\")[^\"]*(\")""").replaceFirst(valid) { match ->
-                "${match.groupValues[1]}FUTURE_STATUS${match.groupValues[2]}"
-            },
+            Regex("""(\"status\"\s*:\s*\")[^\"]*(\")""").replaceFirst(
+                valid,
+                "\$1FUTURE_STATUS\$2"
+            ),
             Regex("""(\"scanned\"\s*:\s*)5""").replace(valid) { match ->
                 "${match.groupValues[1]}\"five\""
             },
@@ -181,9 +182,7 @@ class RunStateRepositoryTest {
             },
             Regex(
                 """(\"skipsByReason\"\s*:\s*\{\s*\")[^\"]*(\")"""
-            ).replaceFirst(valid) { match ->
-                "${match.groupValues[1]}FUTURE_SKIP_REASON${match.groupValues[2]}"
-            }
+            ).replaceFirst(valid, "\$1FUTURE_SKIP_REASON\$2")
         )
         invalidDocuments.forEach { invalid ->
             assertNotEquals(valid, invalid)
