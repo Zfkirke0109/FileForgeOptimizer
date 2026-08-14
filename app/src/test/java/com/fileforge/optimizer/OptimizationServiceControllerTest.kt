@@ -275,6 +275,173 @@ class OptimizationServiceControllerTest {
     }
 
     @Test
+    fun controllerCloseIsIdempotentAndRemovesEveryBindingSubscription() {
+        val fixture = Fixture()
+        val observed = mutableListOf<RunState>()
+        val listener: (RunState) -> Unit = observed::add
+        fixture.controller.binding.addListener(listener)
+        val router = OptimizationServiceCommandRouter(fixture.controller) { }
+
+        router.close()
+        router.close()
+        fixture.repository.publish(runningState(sequence = 1))
+
+        assertEquals(listOf(RunState.Idle), observed)
+        assertEquals(0, fixture.repository.activeObserverCount)
+    }
+
+    @Test
+    fun restoreRequestPublishesLiveRestoreOperationStatesAndTerminalIdentity() {
+        val fixture = Fixture()
+        fixture.runtime.progressToEmit += ProgressSnapshot(
+            phase = "restoring",
+            filesDiscovered = 2,
+            filesProcessed = 1,
+            optimized = 1,
+            totalWork = 2
+        )
+        fixture.runtime.progressToEmit += ProgressSnapshot(
+            phase = "restoring",
+            filesDiscovered = 2,
+            filesProcessed = 2,
+            optimized = 2,
+            totalWork = 2
+        )
+        val observed = mutableListOf<RunState>()
+        val subscription = fixture.repository.observe(observed::add)
+
+        fixture.controller.onStartCommand(
+            ServiceRunRequest.Restore(
+                treeUri = "content://tree/restore",
+                undoLogId = "undo-restore",
+                selection = RestoreSelection.All
+            )
+        )
+        fixture.runtime.runNext()
+        subscription.close()
+
+        val running = observed.filterIsInstance<RunState.Running>()
+        assertEquals(listOf(0, 1, 2), running.map { it.snapshot.filesProcessed })
+        assertTrue(running.all { it.operationKind == RunOperationKind.RESTORE })
+        assertEquals(
+            RunOperationKind.RESTORE,
+            observed.filterIsInstance<RunState.Terminal>().single().operationKind
+        )
+    }
+
+    @Test
+    fun invalidCommandsKeepOwnedRunButRoutingSeamStopsIdleService() {
+        val invalidCommands: List<Pair<String?, Map<String, Any?>>> = listOf(
+            null to emptyMap(),
+            "unknown.action" to emptyMap(),
+            OptimizationServiceContract.ACTION_START to emptyMap(),
+            OptimizationServiceContract.ACTION_RESTORE to mapOf(
+                OptimizationServiceContract.EXTRA_TREE_URI to "content://tree/restore",
+                OptimizationServiceContract.EXTRA_UNDO_LOG_ID to "undo",
+                OptimizationServiceContract.EXTRA_RESTORE_SELECTION to "not-json"
+            ),
+            OptimizationServiceContract.ACTION_CANCEL to mapOf("unexpected" to "value")
+        )
+        val activeFixture = Fixture()
+        val activeStopRequests = AtomicInteger()
+        val activeRouter = OptimizationServiceCommandRouter(activeFixture.controller) {
+            activeStopRequests.incrementAndGet()
+        }
+        assertTrue(activeFixture.controller.onStartCommand(optimizeRequest()).accepted)
+
+        invalidCommands.forEach { (action, extras) ->
+            assertEquals(
+                "action=$action",
+                ServiceRestartPolicy.NOT_STICKY,
+                activeRouter.onCommand(action, extras)
+            )
+        }
+        assertEquals(1, activeFixture.runtime.pendingTaskCount)
+        assertEquals(0, activeStopRequests.get())
+        assertEquals(0, activeFixture.events.count { it == "stop" })
+
+        invalidCommands.forEach { (action, extras) ->
+            val idleFixture = Fixture()
+            val idleStopRequests = AtomicInteger()
+            val idleRouter = OptimizationServiceCommandRouter(idleFixture.controller) {
+                idleStopRequests.incrementAndGet()
+            }
+            assertEquals(
+                "action=$action",
+                ServiceRestartPolicy.NOT_STICKY,
+                idleRouter.onCommand(action, extras)
+            )
+            assertEquals("action=$action", 1, idleStopRequests.get())
+            assertTrue(idleFixture.controller.binding.currentState === RunState.Idle)
+        }
+    }
+
+    @Test
+    fun routingSeamDecodesAndDispatchesValidOptimizeAndRestoreExactlyOnce() {
+        val requests = listOf<ServiceRunRequest>(
+            optimizeRequest(dryRun = true),
+            ServiceRunRequest.Restore(
+                treeUri = "content://tree/restore",
+                undoLogId = "undo-valid",
+                selection = RestoreSelection.Entries(setOf("docs/a.zip", "images/b.png"))
+            )
+        )
+
+        requests.forEach { request ->
+            val fixture = Fixture()
+            val stopRequests = AtomicInteger()
+            val router = OptimizationServiceCommandRouter(fixture.controller) {
+                stopRequests.incrementAndGet()
+            }
+            val encoded = OptimizationServiceRequestCodec.encode(request)
+
+            val policy = router.onCommand(encoded.action, encoded.extras)
+            fixture.runtime.runNext()
+
+            assertEquals(ServiceRestartPolicy.NOT_STICKY, policy)
+            assertEquals(listOf(request), fixture.runtime.requests)
+            assertEquals(1, fixture.runtime.foregroundStates.size)
+            assertEquals(1, fixture.events.count { it == "scheduled" })
+            assertEquals(0, stopRequests.get())
+        }
+    }
+
+    @Test
+    fun routingSeamCancelsActiveRunButStopsIdleServiceForValidCancel() {
+        val activeFixture = Fixture()
+        val activeStopRequests = AtomicInteger()
+        val activeRouter = OptimizationServiceCommandRouter(activeFixture.controller) {
+            activeStopRequests.incrementAndGet()
+        }
+        val encodedStart = OptimizationServiceRequestCodec.encode(optimizeRequest())
+        activeRouter.onCommand(encodedStart.action, encodedStart.extras)
+
+        val activePolicy = activeRouter.onCommand(
+            OptimizationServiceContract.ACTION_CANCEL,
+            emptyMap()
+        )
+
+        assertEquals(ServiceRestartPolicy.NOT_STICKY, activePolicy)
+        assertFalse(activeFixture.controller.cancelActive())
+        assertEquals(0, activeStopRequests.get())
+        assertEquals(1, activeFixture.runtime.pendingTaskCount)
+
+        val idleFixture = Fixture()
+        val idleStopRequests = AtomicInteger()
+        val idleRouter = OptimizationServiceCommandRouter(idleFixture.controller) {
+            idleStopRequests.incrementAndGet()
+        }
+        val idlePolicy = idleRouter.onCommand(
+            OptimizationServiceContract.ACTION_CANCEL,
+            emptyMap()
+        )
+
+        assertEquals(ServiceRestartPolicy.NOT_STICKY, idlePolicy)
+        assertEquals(1, idleStopRequests.get())
+        assertTrue(idleFixture.controller.binding.currentState === RunState.Idle)
+    }
+
+    @Test
     fun terminalRepositoryPublicationPrecedesForegroundAndServiceStop() {
         val fixture = Fixture()
         val subscription = fixture.repository.observe { state ->
@@ -387,6 +554,74 @@ class OptimizationServiceControllerTest {
     }
 
     @Test
+    fun api35TimeoutCommitsAndStopsWhileProgressListenerIsBlockedThenRetiresLateDelivery() {
+        val fixture = Fixture(recordPersistenceEvents = true)
+        fixture.runtime.progressToEmit += ProgressSnapshot(
+            phase = "optimizing",
+            filesDiscovered = 2,
+            filesProcessed = 1
+        )
+        val progressDeliveryEntered = CountDownLatch(1)
+        val releaseProgressDelivery = CountDownLatch(1)
+        val observed = Collections.synchronizedList(mutableListOf<RunState>())
+        val subscription = fixture.repository.observe { state ->
+            observed += state
+            if (state is RunState.Running && state.snapshot.filesProcessed == 1) {
+                progressDeliveryEntered.countDown()
+                releaseProgressDelivery.await(3, TimeUnit.SECONDS)
+            }
+        }
+        fixture.controller.onStartCommand(optimizeRequest())
+        val workerFailure = AtomicReference<Throwable?>()
+        val worker = Thread {
+            try {
+                fixture.runtime.runNext()
+            } catch (failure: Throwable) {
+                workerFailure.set(failure)
+            }
+        }.apply { isDaemon = true }
+        worker.start()
+        assertTrue(progressDeliveryEntered.await(2, TimeUnit.SECONDS))
+        val timeoutReturned = CountDownLatch(1)
+        val timeoutFailure = AtomicReference<Throwable?>()
+        val timeoutThread = Thread {
+            try {
+                fixture.controller.onTimeout()
+            } catch (failure: Throwable) {
+                timeoutFailure.set(failure)
+            } finally {
+                timeoutReturned.countDown()
+            }
+        }.apply { isDaemon = true }
+        timeoutThread.start()
+
+        val returnedPromptly = timeoutReturned.await(1, TimeUnit.SECONDS)
+        try {
+            assertTrue("timeout waited for progress listener delivery", returnedPromptly)
+            assertNull(timeoutFailure.get())
+            assertTrue(worker.isAlive)
+            assertEquals(RunStatus.CANCELLED, (fixture.repository.currentState as RunState.Terminal).report.status)
+            assertEquals(1, fixture.storage.writes.size)
+            assertTrue(fixture.events.indexOf("persist") < fixture.events.indexOf("stop"))
+            assertEquals(1, fixture.events.count { it == "stop" })
+        } finally {
+            releaseProgressDelivery.countDown()
+            worker.join(2_000)
+            timeoutThread.join(2_000)
+            subscription.close()
+        }
+
+        assertFalse(worker.isAlive)
+        assertFalse(timeoutThread.isAlive)
+        assertNull(workerFailure.get())
+        assertEquals(RunStatus.CANCELLED, (fixture.repository.currentState as RunState.Terminal).report.status)
+        assertEquals(1, observed.count { it is RunState.Terminal })
+        val terminalIndex = observed.indexOfFirst { it is RunState.Terminal }
+        assertFalse(observed.drop(terminalIndex + 1).any { it is RunState.Running })
+        assertEquals(1, fixture.events.count { it == "stop" })
+    }
+
+    @Test
     fun api35TimeoutWithoutActiveRunIsNoOp() {
         val fixture = Fixture()
         val observed = mutableListOf<RunState>()
@@ -401,9 +636,12 @@ class OptimizationServiceControllerTest {
         assertTrue(fixture.storage.writes.isEmpty())
     }
 
-    private class Fixture(notificationPermissionGranted: Boolean = true) {
+    private class Fixture(
+        notificationPermissionGranted: Boolean = true,
+        recordPersistenceEvents: Boolean = false
+    ) {
         val events = mutableListOf<String>()
-        val storage = RecordingRunStateStorage()
+        val storage = RecordingRunStateStorage(events.takeIf { recordPersistenceEvents })
         val repository = RunStateRepository(storage)
         val runtime = RecordingServiceRuntime(events)
         val controller = OptimizationServiceController(
@@ -480,12 +718,15 @@ class OptimizationServiceControllerTest {
         }
     }
 
-    private class RecordingRunStateStorage : RunStateStorage {
+    private class RecordingRunStateStorage(
+        private val events: MutableList<String>? = null
+    ) : RunStateStorage {
         val writes = mutableListOf<String>()
 
         override fun read(): String? = null
 
         override fun write(json: String) {
+            events?.add("persist")
             writes += json
         }
     }

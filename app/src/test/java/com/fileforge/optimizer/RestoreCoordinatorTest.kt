@@ -74,6 +74,29 @@ class RestoreCoordinatorTest {
     }
 
     @Test
+    fun perEntryProgressStartsAtZeroAndPublishesEverySelectedResult() {
+        val progress = mutableListOf<RestoreProgressSnapshot>()
+        withRestore(
+            entries = listOf(entry("docs/a.zip"), entry("docs/b.zip")),
+            onProgress = progress::add
+        ) { gateway, coordinator, _, run ->
+            gateway.put("docs/b.zip", byteArrayOf(7))
+            gateway.put("FileForge_Backups_run-1/docs/b.zip", backupB)
+
+            val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+            assertEquals(2, report.restoredCount)
+            assertEquals(listOf(0, 1, 2), progress.map { it.processedEntries })
+            assertTrue(progress.all { it.totalEntries == 2 })
+            assertEquals(listOf(0, 1, 2), progress.map { it.restoredEntries })
+            assertEquals(
+                listOf(null, "docs/a.zip", "docs/b.zip"),
+                progress.map { it.lastResult?.relativePath }
+            )
+        }
+    }
+
+    @Test
     fun oneEntryFailureDoesNotStopLaterEntriesAndReceiptIncludesOnlyRealWrites() = withRestore(entries = listOf(entry("docs/a.zip"), entry("docs/b.zip"))) {
             gateway, coordinator, receipt, run ->
         gateway.put("FileForge_Backups_run-1/docs/b.zip", backupB)
@@ -289,6 +312,7 @@ class RestoreCoordinatorTest {
         receiptWriter: RestoreReceiptWriter = RecordingReceiptWriter(),
         runId: String = "run-1",
         timestamp: String = "20260813T200000Z",
+        onProgress: (RestoreProgressSnapshot) -> Unit = {},
         block: (RecordingDocumentGateway, RestoreCoordinator, RecordingReceiptWriter, UndoRun) -> Unit
     ) {
         val gateway = RecordingDocumentGateway().apply {
@@ -299,7 +323,13 @@ class RestoreCoordinatorTest {
         }
         val recording = receiptWriter as? RecordingReceiptWriter ?: RecordingReceiptWriter()
         val run = UndoRun(UndoHeader(runId, "2026-08-13T19:00:00Z"), entries, RunStatus.COMPLETED)
-        val coordinator = RestoreCoordinator(gateway, gateway.root, receiptWriter) { timestamp }
+        val coordinator = RestoreCoordinator(
+            documentGateway = gateway,
+            selectedRoot = gateway.root,
+            receiptWriter = receiptWriter,
+            onProgress = onProgress,
+            clock = { timestamp }
+        )
         block(gateway, coordinator, recording, run)
     }
 

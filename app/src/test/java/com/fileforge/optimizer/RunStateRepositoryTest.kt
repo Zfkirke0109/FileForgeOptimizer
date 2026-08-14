@@ -139,6 +139,32 @@ class RunStateRepositoryTest {
     }
 
     @Test
+    fun restoreOperationKindPersistsAndUnknownKindRejectsWholeTerminal() {
+        val storage = RecordingRunStateStorage()
+        RunStateRepository(storage).publish(
+            RunState.Terminal(
+                OptimizationReport(scanned = 2, optimized = 2, status = RunStatus.COMPLETED),
+                dryRun = false,
+                operationKind = RunOperationKind.RESTORE
+            )
+        )
+
+        val restored = mutableListOf<RunState>()
+        RunStateRepository(storage).observe(restored::add).close()
+        assertEquals(
+            RunOperationKind.RESTORE,
+            (restored.single() as RunState.Terminal).operationKind
+        )
+        val valid = checkNotNull(storage.value)
+        val invalid = Regex("""(\"operationKind\"\s*:\s*\")[^\"]*(\")""")
+            .replaceFirst(valid, "\$1FUTURE_OPERATION\$2")
+        assertNotEquals(valid, invalid)
+        val rejected = mutableListOf<RunState>()
+        RunStateRepository(RecordingRunStateStorage(invalid)).observe(rejected::add).close()
+        assertEquals(listOf(RunState.Idle), rejected)
+    }
+
+    @Test
     fun missingInvalidOrNonTerminalStoredJsonFallsBackToIdle() {
         listOf<String?>(
             null,

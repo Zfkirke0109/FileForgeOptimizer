@@ -1,6 +1,7 @@
 package com.fileforge.optimizer
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -168,6 +169,75 @@ class OptimizationServiceRequestCodecTest {
         )
         assertTrue(optimization.extras.values.all { it is String })
         assertTrue(restore.extras.values.all { it is String })
+    }
+
+    @Test
+    fun strictSyntaxGuardRejectsAndroidJsonExtensionsAndDuplicateKeysAtEveryDepth() {
+        val valid = """{"outer":{"name":"value"},"items":[1,2,{"id":3}]}"""
+        assertTrue(StrictServiceJsonSyntax.isObject(valid))
+        val invalid = listOf(
+            "{'name':'value'}",
+            "{name:\"value\"}",
+            "{\"name\":value}",
+            "{\"name\":/* comment */\"value\"}",
+            "{\"name\":\"value\"// comment\n}",
+            "{\"name\"=\"value\"}",
+            "{\"name\"=>\"value\"}",
+            "{\"a\":1;\"b\":2}",
+            "{\"number\":0x10}",
+            "{\"number\":010}",
+            "{\"name\":\"value\",}",
+            "{\"items\":[1,2,]}",
+            "{\"name\":\"first\",\"name\":\"second\"}",
+            "{\"outer\":{\"name\":\"first\",\"name\":\"second\"}}",
+            "{\"items\":[{\"id\":1,\"id\":2}]}"
+        )
+
+        invalid.forEach { serialized ->
+            assertFalse(serialized, StrictServiceJsonSyntax.isObject(serialized))
+        }
+    }
+
+    @Test
+    fun codecRejectsEveryLenientAndroidJsonFormWithoutDefaulting() {
+        val invalidRunIntents = listOf(
+            "{'mode':'SAFE','dryRun':false,'apkLabMode':false,'textMinify':true}",
+            "{mode:\"SAFE\",dryRun:false,apkLabMode:false,textMinify:true}",
+            "{\"mode\":SAFE,\"dryRun\":false,\"apkLabMode\":false,\"textMinify\":true}",
+            "{\"mode\":\"SAFE\",/*comment*/\"dryRun\":false,\"apkLabMode\":false,\"textMinify\":true}",
+            "{\"mode\"=\"SAFE\",\"dryRun\"=>false,\"apkLabMode\":false,\"textMinify\":true}",
+            "{\"mode\":\"SAFE\";\"dryRun\":false;\"apkLabMode\":false;\"textMinify\":true}",
+            "{\"mode\":\"SAFE\",\"dryRun\":0x0,\"apkLabMode\":false,\"textMinify\":true}",
+            "{\"mode\":\"SAFE\",\"dryRun\":00,\"apkLabMode\":false,\"textMinify\":true}",
+            "{\"mode\":\"SAFE\",\"dryRun\":false,\"apkLabMode\":false,\"textMinify\":true,}",
+            "{\"mode\":\"SAFE\",\"mode\":\"AGGRESSIVE\",\"dryRun\":false,\"apkLabMode\":false,\"textMinify\":true}"
+        )
+        invalidRunIntents.forEach { serialized ->
+            assertNull(
+                serialized,
+                OptimizationServiceRequestCodec.decode(
+                    OptimizationServiceContract.ACTION_START,
+                    optimizeExtras(serialized)
+                )
+            )
+        }
+
+        listOf(
+            "{'kind':'ALL'}",
+            "{kind:\"ALL\"}",
+            "{\"kind\"=\"ALL\"}",
+            "{\"kind\":\"ALL\",}",
+            "{\"kind\":\"ALL\",\"kind\":\"ENTRIES\"}",
+            "{\"kind\":\"ENTRIES\",\"relativePaths\":[\"a\",]}"
+        ).forEach { serialized ->
+            assertNull(
+                serialized,
+                OptimizationServiceRequestCodec.decode(
+                    OptimizationServiceContract.ACTION_RESTORE,
+                    restoreExtras(serialized)
+                )
+            )
+        }
     }
 
     private fun optimizeExtras(serializedIntent: Any?): Map<String, Any?> = mapOf(

@@ -132,6 +132,52 @@ class NotificationProgressTest {
     }
 
     @Test
+    fun restoreRunningNotificationUsesRestoreLanguageAndOneCancelAction() {
+        val spec = OptimizationNotification.render(
+            RunState.Running(
+                snapshot = ProgressSnapshot(
+                    phase = "restoring",
+                    filesDiscovered = 5,
+                    filesProcessed = 2,
+                    optimized = 2,
+                    totalWork = 5
+                ),
+                dryRun = false,
+                operationKind = RunOperationKind.RESTORE
+            )
+        )
+
+        assertTrue(spec.title.contains("restor", ignoreCase = true))
+        assertTrue(spec.text.contains("2"))
+        assertFalse(spec.text.contains("saved", ignoreCase = true))
+        assertEquals(1, spec.actions.size)
+        assertEquals(OptimizationServiceActions.ACTION_CANCEL, spec.actions.single().serviceAction)
+        assertFalse(spec.isIndeterminate)
+        assertEquals(5, spec.progressMax)
+        assertEquals(2, spec.progressCurrent)
+    }
+
+    @Test
+    fun everyRestoreTerminalUsesRestoreLanguageAndNeverOffersCancel() {
+        RunStatus.entries.filter { it != RunStatus.RUNNING }.forEach { status ->
+            val spec = OptimizationNotification.render(
+                RunState.Terminal(
+                    OptimizationReport(scanned = 4, optimized = 3, status = status),
+                    dryRun = false,
+                    operationKind = RunOperationKind.RESTORE
+                )
+            )
+
+            assertTrue("status=$status title=${spec.title}", spec.title.contains("restor", ignoreCase = true))
+            assertTrue("status=$status text=${spec.text}", spec.text.contains("3"))
+            assertFalse("status=$status", spec.title.contains("optimiz", ignoreCase = true))
+            assertFalse("status=$status", spec.text.contains("saved", ignoreCase = true))
+            assertTrue("status=$status", spec.actions.isEmpty())
+            assertFalse("status=$status", spec.isIndeterminate)
+        }
+    }
+
+    @Test
     fun notificationUsesStableChannelAndNotificationIdentifiers() {
         val running = OptimizationNotification.render(running(totalWork = null, filesProcessed = 0))
         val terminal = OptimizationNotification.render(

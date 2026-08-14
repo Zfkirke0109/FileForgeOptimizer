@@ -12,6 +12,7 @@ import androidx.test.filters.SdkSuppress
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -72,5 +73,56 @@ class OptimizationServiceTest {
 
         assertNotNull(timeout)
         assertEquals(Void.TYPE, timeout.returnType)
+    }
+
+    @Test
+    fun serviceOwnsCloseableCommandRouterAndDeclaresDestroyCleanup() {
+        assertTrue(
+            OptimizationService::class.java.declaredFields.any { field ->
+                OptimizationServiceCommandRouter::class.java.isAssignableFrom(field.type)
+            }
+        )
+        assertNotNull(OptimizationService::class.java.getDeclaredMethod("onDestroy"))
+    }
+
+    @Test
+    fun codecRejectsJsonFormsThatAndroidJsonTokenerWouldAcceptLeniently() {
+        listOf(
+            "{'mode':'SAFE','dryRun':false,'apkLabMode':false,'textMinify':true}",
+            "{mode:\"SAFE\",dryRun:false,apkLabMode:false,textMinify:true}",
+            "{\"mode\":\"SAFE\";\"dryRun\":false;\"apkLabMode\":false;\"textMinify\":true}",
+            "{\"mode\":\"SAFE\",\"dryRun\":false,\"apkLabMode\":false,\"textMinify\":true,}",
+            "{\"mode\":\"SAFE\",\"mode\":\"AGGRESSIVE\",\"dryRun\":false,\"apkLabMode\":false,\"textMinify\":true}"
+        ).forEach { serialized ->
+            assertNull(
+                serialized,
+                OptimizationServiceRequestCodec.decode(
+                    OptimizationServiceContract.ACTION_START,
+                    mapOf(
+                        OptimizationServiceContract.EXTRA_TREE_URI to "content://tree/test",
+                        OptimizationServiceContract.EXTRA_RUN_INTENT to serialized
+                    )
+                )
+            )
+        }
+        listOf(
+            "{'kind':'ALL'}",
+            "{kind:\"ALL\"}",
+            "{\"kind\"=\"ALL\"}",
+            "{\"kind\":\"ALL\",}",
+            "{\"kind\":\"ALL\",\"kind\":\"ENTRIES\"}"
+        ).forEach { serialized ->
+            assertNull(
+                serialized,
+                OptimizationServiceRequestCodec.decode(
+                    OptimizationServiceContract.ACTION_RESTORE,
+                    mapOf(
+                        OptimizationServiceContract.EXTRA_TREE_URI to "content://tree/test",
+                        OptimizationServiceContract.EXTRA_UNDO_LOG_ID to "undo-id",
+                        OptimizationServiceContract.EXTRA_RESTORE_SELECTION to serialized
+                    )
+                )
+            )
+        }
     }
 }
