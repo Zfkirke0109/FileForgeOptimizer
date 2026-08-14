@@ -81,20 +81,21 @@ class OptimizerEngineIntegrationTest {
     }
 
     @Test
-    fun nonZipByteArrayOptimizersUseNamedSixtyFourMiBDefaultLimit() = withCache { cache ->
+    fun nonZipByteArrayOptimizersUseNamedSixtyFourMiBActualByteLimit() = withCache { cache ->
         assertEquals(64L * 1024L * 1024L, ByteArrayOptimizerAdapter.DEFAULT_MAX_INPUT_BYTES)
+        val original = "%PDF-1.4\n%%EOF\ntrailing".toByteArray()
         val gateway = EngineDocumentGateway().apply {
-            put("large.pdf", "%PDF-1.4\n%%EOF\ntrailing".toByteArray(), ByteArrayOptimizerAdapter.DEFAULT_MAX_INPUT_BYTES + 1)
+            put("overreported.pdf", original, ByteArrayOptimizerAdapter.DEFAULT_MAX_INPUT_BYTES + 1)
             resetObservations()
         }
 
         val report = engine(gateway, cache, dryRun).run(NeverCancelled) {}
 
         assertEquals(1, report.scanned)
-        assertEquals(0, report.candidates)
-        assertEquals(1, report.skipped)
-        assertEquals(mapOf(SkipReason.MEMORY_LIMIT to 1), report.skipsByReason)
-        assertEquals(1, gateway.readPaths.count { it == "large.pdf" })
+        assertEquals(1, report.candidates)
+        assertEquals(0, report.skipped)
+        assertTrue(report.potentialSavingsBytes in 1 until original.size.toLong())
+        assertTrue(gateway.readPaths.count { it == "overreported.pdf" } >= 2)
         assertTrue(gateway.mutations.isEmpty())
     }
 
