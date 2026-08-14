@@ -49,4 +49,25 @@
     <string name="terminal_status_value">Terminal status: %1$s</string>
     <string name="notification_permission_denied">Notifications are off, so background progress may be less visible. The run will continue safely.</string>
     <string name="start_failed">Could not start optimization: %1$s</string>
+    <string name="restore_screen_description">Verified restore history and progress</string>
+    <string name="restore_scope_description">Choose exact files from a verified undo log. Restore keeps backups and undo logs.</string>
+    <string name="restore_loading">Loading verified undo logs…</string>
+    <string name="restore_tree_unavailable">Choose a readable, writable folder to restore files.</string>
+    <string name="restore_empty">No verified undo logs were found.</string>
+    <string name="restore_parse_failure">Could not read %1$s: %2$s</string>
+    <string name="restore_run_details">%1$s • %2$s • %3$d files • Recoverable %4$s</string>
+    <string name="restore_entry_details">Original %1$s • Optimized %2$s\nBackup: %3$s</string>
+    <string name="restore_select_entry">Select %1$s</string>
+    <string name="restore_select_all">Select all</string>
+    <string name="restore_selected">Restore selected</string>
+    <string name="cancel_restore">Cancel restore</string>
+    <string name="restore_confirmation_message">Backups and undo logs remain after restore.</string>
+    <string name="restore_confirm">Restore</string>
+    <string name="restore_terminal_counts">Restored %1$d of %2$d files</string>
+    <string name="restore_cancelled">Restore cancelled</string>
+    <string name="restore_progress_value">Restoring %1$d of %2$d • %3$s</string>
+    <plurals name="restore_confirmation_title">
+        <item quantity="one">Restore %1$d file?</item>
+        <item quantity="other">Restore %1$d files?</item>
+    </plurals>
 </resources>

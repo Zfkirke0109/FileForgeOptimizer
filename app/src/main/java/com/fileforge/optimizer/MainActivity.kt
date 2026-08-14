@@ -27,6 +27,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var contentContainer: FrameLayout
     private lateinit var bottomNavigation: BottomNavigationView
     private lateinit var optimizeController: OptimizeScreenController
+    private lateinit var restoreController: RestoreScreenController
     private var serviceBinder: OptimizationBinder? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val observationSequencer = RunStateObservationSequencer()
@@ -35,7 +36,10 @@ class MainActivity : AppCompatActivity() {
             mainHandler.post { task() }
             Unit
         },
-        deliver = { state -> optimizeController.render(state) }
+        deliver = { state ->
+            optimizeController.render(state)
+            restoreController.render(state)
+        }
     )
 
     private val runStateListener: (RunState) -> Unit = { state ->
@@ -93,12 +97,18 @@ class MainActivity : AppCompatActivity() {
             cancelRun = serviceSession::cancel,
             observationWatermark = { observationSequencer.watermark }
         )
+        restoreController = RestoreScreenController(
+            activity = this,
+            startRestore = { request -> OptimizationService.start(this, request) },
+            cancelRun = serviceSession::cancel
+        )
         buildMaterialHost()
     }
 
     override fun onStart() {
         super.onStart()
         optimizeController.onVisible()
+        restoreController.onVisible()
         runStateDispatcher.resume()
         optimizeController.awaitServiceReplay()
         optimizeController.refreshTreeCapabilities()
@@ -107,6 +117,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         optimizeController.onHidden()
+        restoreController.onHidden()
         runStateDispatcher.clear()
         serviceSession.onHidden()
         super.onStop()
@@ -114,6 +125,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         optimizeController.close()
+        restoreController.close()
         super.onDestroy()
     }
 
@@ -167,9 +179,8 @@ class MainActivity : AppCompatActivity() {
         when (itemId) {
             R.id.navigation_restore -> {
                 toolbar.setTitle(R.string.navigation_restore)
-                contentContainer.addView(
-                    placeholder(R.string.restore_placeholder_title, R.string.restore_placeholder_body)
-                )
+                (restoreController.view.parent as? ViewGroup)?.removeView(restoreController.view)
+                contentContainer.addView(restoreController.view)
             }
             R.id.navigation_about -> {
                 toolbar.setTitle(R.string.navigation_about)

@@ -67,7 +67,9 @@ data class OptimizationReport(
     var skipsByReason: Map<SkipReason, Int> = emptyMap(),
     var terminalError: String? = null,
     var terminalFailures: List<String> = emptyList(),
-    var rollbackFailure: String? = null
+    var rollbackFailure: String? = null,
+    /** The exact receipt identity returned by the restore coordinator, never a predicted name. */
+    var restoreReceiptName: String? = null
 )
 
 enum class FileKind {

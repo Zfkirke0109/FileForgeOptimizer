@@ -37,7 +37,9 @@ data class RestoreReport(
     val entries: List<RestoreEntryResult>,
     val status: RunStatus,
     val restoredCount: Int,
-    val receiptError: String? = null
+    val receiptError: String? = null,
+    /** Exact receipt identity returned by exclusive receipt creation, if a mutation was attempted. */
+    val receiptName: String? = null
 )
 
 data class RestoreProgressSnapshot(
@@ -149,7 +151,14 @@ class RestoreCoordinator(
         if (status == RunStatus.COMPLETED && (receiptError != null || results.any { it.status != RestoreEntryStatus.RESTORED })) {
             status = RunStatus.COMPLETED_WITH_ERRORS
         }
-        return RestoreReport(run, results, status, results.count { it.status == RestoreEntryStatus.RESTORED }, receiptError)
+        return RestoreReport(
+            run = run,
+            entries = results,
+            status = status,
+            restoredCount = results.count { it.status == RestoreEntryStatus.RESTORED },
+            receiptError = receiptError,
+            receiptName = receipt?.name
+        )
     }
 
     private fun rejectedRunReport(run: UndoRun, selected: List<UndoEntry>): RestoreReport {

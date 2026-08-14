@@ -200,7 +200,7 @@ class RunStateRepositoryTest {
     }
 
     @Test
-    fun legacyVersionOneTerminalDefaultsToOptimizeWhileNewWritesUseVersionTwoOperationKind() {
+    fun legacyVersionOneTerminalDefaultsToOptimizeWhileNewWritesUseVersionThreeOperationKind() {
         val legacyVersionOne = """{
             "version":1,
             "dryRun":false,
@@ -233,24 +233,24 @@ class RunStateRepositoryTest {
         assertEquals(5, legacyTerminal.report.scanned)
         assertEquals(listOf("legacy receipt warning"), legacyTerminal.report.terminalFailures)
 
-        val versionTwoStorage = RecordingRunStateStorage()
-        RunStateRepository(versionTwoStorage).publish(
+        val versionThreeStorage = RecordingRunStateStorage()
+        RunStateRepository(versionThreeStorage).publish(
             RunState.Terminal(
                 OptimizationReport(scanned = 2, optimized = 2, status = RunStatus.COMPLETED),
                 dryRun = false,
                 operationKind = RunOperationKind.RESTORE
             )
         )
-        val encodedVersionTwo = checkNotNull(versionTwoStorage.value)
-        assertTrue(encodedVersionTwo.contains("\"version\":2"))
-        assertTrue(encodedVersionTwo.contains("\"operationKind\":\"RESTORE\""))
-        val restoredVersionTwo = mutableListOf<RunState>()
-        RunStateRepository(RecordingRunStateStorage(encodedVersionTwo))
-            .observe(restoredVersionTwo::add)
+        val encodedVersionThree = checkNotNull(versionThreeStorage.value)
+        assertTrue(encodedVersionThree.contains("\"version\":3"))
+        assertTrue(encodedVersionThree.contains("\"operationKind\":\"RESTORE\""))
+        val restoredVersionThree = mutableListOf<RunState>()
+        RunStateRepository(RecordingRunStateStorage(encodedVersionThree))
+            .observe(restoredVersionThree::add)
             .close()
         assertEquals(
             RunOperationKind.RESTORE,
-            (restoredVersionTwo.single() as RunState.Terminal).operationKind
+            (restoredVersionThree.single() as RunState.Terminal).operationKind
         )
     }
 

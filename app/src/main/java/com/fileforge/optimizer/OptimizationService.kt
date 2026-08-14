@@ -252,7 +252,8 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
                         append(result.relativePath).append(": ").append(result.status.name)
                         if (result.message.isNotBlank()) append(" — ").append(result.message)
                     }
-                }
+                },
+                restoreReceiptName = restore.receiptName
             ),
             dryRun = false,
             operationKind = RunOperationKind.RESTORE

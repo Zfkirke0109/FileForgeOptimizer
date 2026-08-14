@@ -265,7 +265,8 @@ private class SharedPreferencesRunStateStorage(context: Context) : RunStateStora
 
 private object RunStateJsonCodec {
     private const val LEGACY_VERSION = 1
-    private const val CURRENT_VERSION = 2
+    private const val OPERATION_KIND_VERSION = 2
+    private const val CURRENT_VERSION = 3
 
     fun encode(state: RunState.Terminal): String {
         val report = state.report
@@ -288,6 +289,7 @@ private object RunStateJsonCodec {
             .put("terminalError", report.terminalError ?: JSONObject.NULL)
             .put("terminalFailures", terminalFailures)
             .put("rollbackFailure", report.rollbackFailure ?: JSONObject.NULL)
+            .put("restoreReceiptName", report.restoreReceiptName ?: JSONObject.NULL)
         return JSONObject()
             .put("version", CURRENT_VERSION)
             .put("dryRun", state.dryRun)
@@ -308,7 +310,7 @@ private object RunStateJsonCodec {
                     if (root.strictKeySet() != LEGACY_ROOT_KEYS) return null
                     RunOperationKind.OPTIMIZE
                 }
-                CURRENT_VERSION -> {
+                OPERATION_KIND_VERSION, CURRENT_VERSION -> {
                     if (root.strictKeySet() != CURRENT_ROOT_KEYS) return null
                     val operationName = root.requiredString("operationKind") ?: return null
                     RunOperationKind.entries.firstOrNull { it.name == operationName } ?: return null
@@ -317,12 +319,22 @@ private object RunStateJsonCodec {
             }
             val dryRun = root.requiredBoolean("dryRun") ?: return null
             val reportObject = root.requiredObject("report") ?: return null
-            if (reportObject.strictKeySet() != REPORT_KEYS) return null
+            val reportKeys = when (version) {
+                CURRENT_VERSION -> REPORT_KEYS
+                OPERATION_KIND_VERSION -> REPORT_KEYS_V2
+                else -> LEGACY_REPORT_KEYS
+            }
+            if (reportObject.strictKeySet() != reportKeys) return null
             val statusName = reportObject.requiredString("status") ?: return null
             val status = RunStatus.entries.firstOrNull { it.name == statusName } ?: return null
             if (status == RunStatus.RUNNING) return null
             val terminalError = reportObject.requiredNullableString("terminalError") ?: return null
             val rollbackFailure = reportObject.requiredNullableString("rollbackFailure") ?: return null
+            val restoreReceiptName = if (version == CURRENT_VERSION) {
+                reportObject.requiredNullableString("restoreReceiptName") ?: return null
+            } else {
+                NullableField(null)
+            }
             val report = OptimizationReport(
                 scanned = reportObject.requiredNonNegativeInt("scanned") ?: return null,
                 optimized = reportObject.requiredNonNegativeInt("optimized") ?: return null,
@@ -338,7 +350,8 @@ private object RunStateJsonCodec {
                 skipsByReason = reportObject.requiredSkips("skipsByReason") ?: return null,
                 terminalError = terminalError.value,
                 terminalFailures = reportObject.requiredStringList("terminalFailures") ?: return null,
-                rollbackFailure = rollbackFailure.value
+                rollbackFailure = rollbackFailure.value,
+                restoreReceiptName = restoreReceiptName.value
             )
             RunState.Terminal(report, dryRun, operationKind)
         } catch (failure: Throwable) {
@@ -436,8 +449,11 @@ private object RunStateJsonCodec {
         "skipsByReason",
         "terminalError",
         "terminalFailures",
-        "rollbackFailure"
+        "rollbackFailure",
+        "restoreReceiptName"
     )
+    private val REPORT_KEYS_V2 = REPORT_KEYS - "restoreReceiptName"
+    private val LEGACY_REPORT_KEYS = REPORT_KEYS_V2
 }
 
 private fun RunState.defensiveCopy(): RunState = when (this) {

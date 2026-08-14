@@ -77,6 +77,8 @@ class RestoreScreenTest {
     fun activeRunDisablesRestoreAndTerminalReceiptFailuresSurviveRecreation() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             onView(withId(R.id.navigation_restore)).perform(click())
+            onView(withContentDescription("Select photos/holiday.jpg")).perform(click())
+            onView(withId(R.id.restore_selected)).check(matches(isEnabled()))
             RunStateRepository.forAndroid(context).publish(
                 RunState.Running(
                     ProgressSnapshot(phase = "restoring", filesDiscovered = 2, filesProcessed = 1),

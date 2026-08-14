@@ -23,4 +23,11 @@
     <item name="live_counters" type="id" />
     <item name="savings" type="id" />
     <item name="terminal_message" type="id" />
+    <item name="restore_empty_state" type="id" />
+    <item name="restore_select_all" type="id" />
+    <item name="restore_selected" type="id" />
+    <item name="restore_entry_checkbox" type="id" />
+    <item name="cancel_restore" type="id" />
+    <item name="restore_terminal_summary" type="id" />
+    <item name="restore_progress" type="id" />
 </resources>
