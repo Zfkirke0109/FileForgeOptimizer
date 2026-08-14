@@ -184,8 +184,35 @@ class OptimizeScreenController(
 
     private var selectedTreeUri: Uri? = restoreSelectedTreeUri()
     private var latestRunState: RunState = RunState.Idle
-    private var startDispatchPending = false
     private var pendingRequest: ServiceRunRequest.Optimize? = null
+    private val capabilityCache = SelectedTreeCapabilitiesCache(::readSelectedTreeCapabilities)
+    private val startDispatchGate = OptimizeStartDispatchGate()
+    private val progressPort: OptimizeProgressIndicator by lazy {
+        object : OptimizeProgressIndicator {
+            override val indeterminate: Boolean
+                get() = progressIndicator.isIndeterminate
+
+            override fun hide() {
+                progressIndicator.visibility = View.INVISIBLE
+            }
+
+            override fun show() {
+                progressIndicator.visibility = View.VISIBLE
+            }
+
+            override fun setIndeterminateMode(value: Boolean) {
+                progressIndicator.isIndeterminate = value
+            }
+
+            override fun setMaximum(value: Int) {
+                progressIndicator.max = value
+            }
+
+            override fun setProgress(value: Int, animated: Boolean) {
+                progressIndicator.setProgressCompat(value, animated)
+            }
+        }
+    }
 
     private val treePicker = activity.registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -212,21 +239,31 @@ class OptimizeScreenController(
         view = buildView()
         restoreControls()
         installListeners()
+        capabilityCache.refresh()
         render(RunState.Idle)
     }
 
     fun render(state: RunState) {
         latestRunState = state
-        if (state is RunState.Running || state is RunState.Terminal) startDispatchPending = false
+        startDispatchGate.onObservedState(state)
+        renderCurrentState()
+    }
+
+    fun refreshTreeCapabilities() {
+        capabilityCache.refresh()
+        renderCurrentState()
+    }
+
+    private fun renderCurrentState() {
         val projection = OptimizeUiStateProjector.project(
-            state,
-            selectedTreeCapabilities(),
+            latestRunState,
+            capabilityCache.current,
             dryRunSwitch.isChecked
         )
         selectedFolderText.text = selectedTreeUri?.let { uri ->
             activity.getString(R.string.selected_folder_value, uri)
         } ?: activity.getString(R.string.selected_folder_none)
-        startButton.isEnabled = projection.startEnabled && !startDispatchPending
+        startButton.isEnabled = startDispatchGate.allowsStart(projection.startEnabled)
         cancelButton.isEnabled = projection.cancelEnabled
         phaseText.text = activity.getString(R.string.run_phase_value, projection.phase)
         currentPathText.text = projection.currentPath ?: activity.getString(R.string.no_active_file)
@@ -239,6 +276,7 @@ class OptimizeScreenController(
             projection.optimized,
             projection.errors
         )
+        val state = latestRunState
         savingsText.text = if (state is RunState.Running && state.dryRun ||
             state is RunState.Terminal && state.dryRun
         ) {
@@ -433,7 +471,7 @@ class OptimizeScreenController(
         }
         dryRunSwitch.setOnCheckedChangeListener { _, checked ->
             preferences.edit().putBoolean(KEY_DRY_RUN, checked).apply()
-            render(latestRunState)
+            renderCurrentState()
         }
         apkLabSwitch.setOnCheckedChangeListener { _, checked ->
             preferences.edit().putBoolean(KEY_APK_LAB, checked).apply()
@@ -461,14 +499,17 @@ class OptimizeScreenController(
         }
         selectedTreeUri = uri
         preferences.edit().putString(KEY_TREE_URI, uri.toString()).apply()
-        render(latestRunState)
+        capabilityCache.refresh()
+        renderCurrentState()
     }
 
     private fun onStartClicked() {
+        capabilityCache.refresh()
+        renderCurrentState()
         val request = buildRequestIfValid()
         if (request == null) {
             Snackbar.make(view, R.string.folder_access_invalid, Snackbar.LENGTH_LONG).show()
-            render(latestRunState)
+            renderCurrentState()
             return
         }
         val granted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -511,21 +552,21 @@ class OptimizeScreenController(
         )
         val projection = OptimizeUiStateProjector.project(
             latestRunState,
-            selectedTreeCapabilities(),
+            capabilityCache.current,
             intent.dryRun
         )
-        if (!projection.startEnabled || startDispatchPending) return null
+        if (!startDispatchGate.allowsStart(projection.startEnabled)) return null
         return ServiceRunRequest.Optimize(uri.toString(), intent)
     }
 
     private fun dispatchStart(request: ServiceRunRequest.Optimize) {
-        startDispatchPending = true
-        render(latestRunState)
+        startDispatchGate.beginDispatch()
+        renderCurrentState()
         try {
             startRun(request)
         } catch (failure: RuntimeException) {
-            startDispatchPending = false
-            render(latestRunState)
+            startDispatchGate.onDispatchFailed()
+            renderCurrentState()
             Snackbar.make(
                 view,
                 activity.getString(
@@ -537,7 +578,7 @@ class OptimizeScreenController(
         }
     }
 
-    private fun selectedTreeCapabilities(): SelectedTreeCapabilities {
+    private fun readSelectedTreeCapabilities(): SelectedTreeCapabilities {
         val uri = selectedTreeUri ?: return SelectedTreeCapabilities.NONE
         return try {
             val root = DocumentFile.fromTreeUri(activity, uri)
@@ -564,16 +605,12 @@ class OptimizeScreenController(
     }
 
     private fun updateProgress(projection: OptimizeUiProjection) {
-        progressIndicator.isIndeterminate = projection.progressIndeterminate
-        val max = projection.progressMax
-        val current = projection.progressCurrent
-        if (max != null && current != null) {
-            progressIndicator.max = max
-            progressIndicator.setProgressCompat(current, true)
-        } else if (!projection.progressIndeterminate) {
-            progressIndicator.max = 1
-            progressIndicator.setProgressCompat(0, false)
-        }
+        OptimizeProgressIndicatorRenderer.render(
+            progressPort,
+            projection.progressIndeterminate,
+            projection.progressMax,
+            projection.progressCurrent
+        )
     }
 
     private fun terminalMessage(projection: OptimizeUiProjection): String {

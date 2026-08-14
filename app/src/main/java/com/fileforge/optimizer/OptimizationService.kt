@@ -337,5 +337,12 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
             }
             ContextCompat.startForegroundService(context, intent)
         }
+
+        internal fun cancelIntent(context: Context): Intent =
+            Intent(context, OptimizationService::class.java).setAction(ACTION_CANCEL)
+
+        fun cancel(context: Context) {
+            context.startService(cancelIntent(context))
+        }
     }
 }

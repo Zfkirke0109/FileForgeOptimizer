@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.Menu
 import android.view.View
 import android.view.ViewGroup
@@ -26,11 +28,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bottomNavigation: BottomNavigationView
     private lateinit var optimizeController: OptimizeScreenController
     private var serviceBinder: OptimizationBinder? = null
-    private var serviceBound = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val runStateDispatcher = LatestValueDispatcher<RunState>(
+        schedule = { task ->
+            mainHandler.post { task() }
+            Unit
+        },
+        deliver = { state -> optimizeController.render(state) }
+    )
 
-    private val runStateListener: (RunState) -> Unit = { state ->
-        runOnUiThread { optimizeController.render(state) }
-    }
+    private val runStateListener: (RunState) -> Unit = runStateDispatcher::submit
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -49,34 +56,52 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val serviceSession = OptimizeServiceSession(
+        object : OptimizeServicePort {
+            override fun bind(): Boolean = bindService(
+                Intent(this@MainActivity, OptimizationService::class.java),
+                serviceConnection,
+                Context.BIND_AUTO_CREATE
+            )
+
+            override fun unbind() {
+                serviceBinder?.removeListener(runStateListener)
+                serviceBinder = null
+                unbindService(serviceConnection)
+            }
+
+            override fun start(request: ServiceRunRequest.Optimize) {
+                OptimizationService.start(this@MainActivity, request)
+            }
+
+            override fun cancel() {
+                OptimizationService.cancel(this@MainActivity)
+            }
+        }
+    )
+
     override fun onCreate(savedInstanceState: Bundle?) {
         ThemePreferences.applyActivityThemeBeforeOnCreate(this)
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         optimizeController = OptimizeScreenController(
             activity = this,
-            startRun = { request -> OptimizationService.start(this, request) },
-            cancelRun = ::cancelActiveRun
+            startRun = serviceSession::start,
+            cancelRun = serviceSession::cancel
         )
         buildMaterialHost()
     }
 
     override fun onStart() {
         super.onStart()
-        serviceBound = bindService(
-            Intent(this, OptimizationService::class.java),
-            serviceConnection,
-            Context.BIND_AUTO_CREATE
-        )
+        runStateDispatcher.resume()
+        optimizeController.refreshTreeCapabilities()
+        serviceSession.onVisible()
     }
 
     override fun onStop() {
-        serviceBinder?.removeListener(runStateListener)
-        serviceBinder = null
-        if (serviceBound) {
-            unbindService(serviceConnection)
-            serviceBound = false
-        }
+        runStateDispatcher.clear()
+        serviceSession.onHidden()
         super.onStop()
     }
 
@@ -171,13 +196,6 @@ class MainActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { setMargins(margin, margin, margin, margin) }
-        )
-    }
-
-    private fun cancelActiveRun() {
-        startService(
-            Intent(this, OptimizationService::class.java)
-                .setAction(OptimizationService.ACTION_CANCEL)
         )
     }
 
