@@ -115,7 +115,7 @@ class OptimizerEngineTransactionHardeningTest {
     }
 
     @Test
-    fun terminalWriteOrFlushFailureReturnsTheStatusActuallyRecoverableFromDurableLog() {
+    fun terminalWriteOrFlushFailureReturnsFailedNeverRunningEvenWhenLogRemainsInterrupted() {
         listOf(UndoFault.WRITE, UndoFault.FLUSH).forEach { fault ->
             withEngine(realRun) { gateway, engine, _ ->
                 gateway.put("unknown.bin", byteArrayOf(1))
@@ -124,12 +124,10 @@ class OptimizerEngineTransactionHardeningTest {
                 val report = engine.run(NeverCancelled) {}
                 val durable = gateway.readDurableUndo()
 
-                assertEquals("returned status must match durable parse for $fault", durable.status, report.status)
-                durable.terminal?.let { terminal ->
-                    assertEquals(terminal.errors, report.errors)
-                    assertEquals(terminal.scanned, report.scanned)
-                    assertEquals(terminal.skipped, report.skipped)
-                }
+                assertEquals(RunStatus.FAILED, report.status)
+                assertTrue(report.errors > 0)
+                assertEquals("unfinalized durable log must parse as interrupted for $fault", RunStatus.RUNNING, durable.status)
+                assertEquals(null, durable.terminal)
             }
         }
     }
