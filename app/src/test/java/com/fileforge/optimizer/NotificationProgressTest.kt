@@ -118,6 +118,20 @@ class NotificationProgressTest {
     }
 
     @Test
+    fun completedDryRunTitleDescribesAnalysisRatherThanOptimization() {
+        val spec = OptimizationNotification.render(
+            RunState.Terminal(
+                OptimizationReport(status = RunStatus.COMPLETED),
+                dryRun = true
+            )
+        )
+
+        assertTrue(spec.title.contains("analysis", ignoreCase = true))
+        assertTrue(spec.title.contains("complete", ignoreCase = true))
+        assertFalse(spec.title.contains("optimization", ignoreCase = true))
+    }
+
+    @Test
     fun notificationUsesStableChannelAndNotificationIdentifiers() {
         val running = OptimizationNotification.render(running(totalWork = null, filesProcessed = 0))
         val terminal = OptimizationNotification.render(

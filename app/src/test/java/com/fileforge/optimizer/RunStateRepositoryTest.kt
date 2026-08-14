@@ -168,18 +168,18 @@ class RunStateRepositoryTest {
         )
         val valid = checkNotNull(validStorage.value)
         val invalidDocuments = listOf(
-            valid.replaceFirst(Regex("""(\"status\"\s*:\s*\")[^\"]*(\")""")) { match ->
+            Regex("""(\"status\"\s*:\s*\")[^\"]*(\")""").replaceFirst(valid) { match ->
                 "${match.groupValues[1]}FUTURE_STATUS${match.groupValues[2]}"
             },
-            valid.replace(Regex("""(\"scanned\"\s*:\s*)5""")) { match ->
+            Regex("""(\"scanned\"\s*:\s*)5""").replace(valid) { match ->
                 "${match.groupValues[1]}\"five\""
             },
-            valid.replace(Regex("""(\"skipsByReason\"\s*:\s*)\{[^{}]*}""")) { match ->
+            Regex("""(\"skipsByReason\"\s*:\s*)\{[^{}]*}""").replace(valid) { match ->
                 "${match.groupValues[1]}[]"
             },
-            valid.replaceFirst(
-                Regex("""(\"skipsByReason\"\s*:\s*\{\s*\")[^\"]*(\")""")
-            ) { match ->
+            Regex(
+                """(\"skipsByReason\"\s*:\s*\{\s*\")[^\"]*(\")"""
+            ).replaceFirst(valid) { match ->
                 "${match.groupValues[1]}FUTURE_SKIP_REASON${match.groupValues[2]}"
             }
         )
@@ -297,6 +297,118 @@ class RunStateRepositoryTest {
     }
 
     @Test
+    fun reentrantPublishDeliversCurrentStateToEveryListenerBeforeQueuedNewerState() {
+        val repository = RunStateRepository(RecordingRunStateStorage())
+        val firstOrder = mutableListOf<Int>()
+        val secondOrder = mutableListOf<Int>()
+        val publishedSecond = AtomicBoolean(false)
+        repository.observe { state ->
+            if (state is RunState.Running) {
+                firstOrder += state.snapshot.filesProcessed
+                if (state.snapshot.filesProcessed == 1 && publishedSecond.compareAndSet(false, true)) {
+                    repository.publish(runningState(sequence = 2))
+                }
+            }
+        }
+        repository.observe { state ->
+            if (state is RunState.Running) secondOrder += state.snapshot.filesProcessed
+        }
+
+        repository.publish(runningState(sequence = 1))
+
+        assertEquals(listOf(1, 2), firstOrder)
+        assertEquals(listOf(1, 2), secondOrder)
+    }
+
+    @Test
+    fun concurrentPublishQueuesBehindCommittedStateWithoutReorderingOtherListeners() {
+        val repository = RunStateRepository(RecordingRunStateStorage())
+        val firstDeliveryEntered = CountDownLatch(1)
+        val releaseFirstDelivery = CountDownLatch(1)
+        val releaseWasObserved = AtomicBoolean(false)
+        repository.observe { state ->
+            if (state is RunState.Running && state.snapshot.filesProcessed == 1) {
+                firstDeliveryEntered.countDown()
+                releaseWasObserved.set(releaseFirstDelivery.await(3, TimeUnit.SECONDS))
+            }
+        }
+        val secondListenerOrder = Collections.synchronizedList(mutableListOf<Int>())
+        repository.observe { state ->
+            if (state is RunState.Running) {
+                secondListenerOrder += state.snapshot.filesProcessed
+            }
+        }
+        val firstPublisherFailure = AtomicReference<Throwable?>()
+        val secondPublisherFailure = AtomicReference<Throwable?>()
+        val secondPublisherReturned = CountDownLatch(1)
+        val firstPublisher = Thread {
+            try {
+                repository.publish(runningState(sequence = 1))
+            } catch (failure: Throwable) {
+                firstPublisherFailure.set(failure)
+            }
+        }
+        val secondPublisher = Thread {
+            try {
+                repository.publish(runningState(sequence = 2))
+            } catch (failure: Throwable) {
+                secondPublisherFailure.set(failure)
+            } finally {
+                secondPublisherReturned.countDown()
+            }
+        }
+
+        firstPublisher.start()
+        assertTrue(firstDeliveryEntered.await(2, TimeUnit.SECONDS))
+        secondPublisher.start()
+        val queuedPublisherReturned = secondPublisherReturned.await(2, TimeUnit.SECONDS)
+        releaseFirstDelivery.countDown()
+        firstPublisher.join(2_000)
+        secondPublisher.join(2_000)
+
+        assertTrue(queuedPublisherReturned)
+        assertFalse(firstPublisher.isAlive)
+        assertFalse(secondPublisher.isAlive)
+        assertTrue(releaseWasObserved.get())
+        assertNull(firstPublisherFailure.get())
+        assertNull(secondPublisherFailure.get())
+        assertEquals(listOf(1, 2), secondListenerOrder)
+    }
+
+    @Test
+    fun terminalPersistenceFailureStillPublishesTerminalWithObservableDiagnostic() {
+        val repository = RunStateRepository(FailingWriteRunStateStorage())
+        val firstStates = mutableListOf<RunState>()
+        val secondStates = mutableListOf<RunState>()
+        repository.observe(firstStates::add)
+        repository.observe(secondStates::add)
+        repository.publish(runningState(sequence = 1))
+
+        val thrown = runCatching {
+            repository.publish(
+                RunState.Terminal(
+                    OptimizationReport(status = RunStatus.COMPLETED),
+                    dryRun = false
+                )
+            )
+        }.exceptionOrNull()
+        val replayed = mutableListOf<RunState>()
+        repository.observe(replayed::add).close()
+
+        assertNull(thrown)
+        val firstTerminal = firstStates.filterIsInstance<RunState.Terminal>().single()
+        val secondTerminal = secondStates.filterIsInstance<RunState.Terminal>().single()
+        val replayedTerminal = replayed.single() as RunState.Terminal
+        listOf(firstTerminal, secondTerminal, replayedTerminal).forEach { terminal ->
+            assertTrue(
+                terminal.report.terminalFailures.any {
+                    it.contains("disk unavailable", ignoreCase = true)
+                }
+            )
+        }
+    }
+
+    @Test
     fun terminalStateRejectsRunningReport() {
         assertThrows(IllegalArgumentException::class.java) {
             RunState.Terminal(OptimizationReport(status = RunStatus.RUNNING), dryRun = false)
@@ -315,4 +427,17 @@ class RunStateRepositoryTest {
             value = json
         }
     }
+
+    private class FailingWriteRunStateStorage : RunStateStorage {
+        override fun read(): String? = null
+
+        override fun write(json: String) {
+            throw IllegalStateException("disk unavailable")
+        }
+    }
+
+    private fun runningState(sequence: Int): RunState.Running = RunState.Running(
+        snapshot = ProgressSnapshot(phase = "optimizing", filesProcessed = sequence),
+        dryRun = false
+    )
 }
