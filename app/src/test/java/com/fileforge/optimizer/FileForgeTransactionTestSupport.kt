@@ -56,6 +56,12 @@ internal class RecordingDocumentGateway : DocumentGateway {
         return bytes.getValue(node.id).copyOf()
     }
 
+    fun replaceContents(relativePath: String, contents: ByteArray) {
+        val node = node(relativePath) ?: error("No node at $relativePath")
+        check(!node.isDirectory) { "Cannot replace directory contents" }
+        bytes[node.id] = contents.copyOf()
+    }
+
     fun node(relativePath: String): DocumentNode? {
         var current = root
         relativePath.split('/').forEach { name ->

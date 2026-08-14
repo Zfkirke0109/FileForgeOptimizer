@@ -94,15 +94,16 @@ class OptimizationTransactionTest {
     }
 
     @Test
-    fun undoAppendFailureOccursOnlyAfterVerifiedOriginalAndDoesNotRollBackACompletedReplacement() = withCoordinator { gateway, coordinator, undo ->
+    fun undoAppendFailureAfterVerifiedOriginalRollsBackAndLeavesNoUnloggedReplacement() = withCoordinator { gateway, coordinator, undo ->
         undo.failure = IOException("undo append failed")
 
         val outcome = coordinator.process(gateway.node("archive.zip")!!, "archive.zip", realRun, NeverCancelled)
 
         val failure = expectType<FileOutcome.Failed>(outcome)
-        assertEquals(RollbackResult.NotNeeded, failure.rollback)
-        assertEquals(candidate.toList(), gateway.contents("archive.zip").toList())
-        assertEquals(1, gateway.events.count { it == "read:root/FileForge_Backups_run-1/archive.zip" })
+        assertEquals(RollbackResult.Restored, failure.rollback)
+        assertEquals(original.toList(), gateway.contents("archive.zip").toList())
+        assertEquals(2, gateway.events.count { it == "read:root/FileForge_Backups_run-1/archive.zip" })
+        assertTrue(undo.entries.isEmpty())
     }
 
     @Test

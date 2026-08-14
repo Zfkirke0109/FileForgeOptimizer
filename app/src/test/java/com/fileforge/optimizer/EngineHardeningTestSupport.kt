@@ -1,0 +1,177 @@
+package com.fileforge.optimizer
+
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.io.Writer
+import java.util.concurrent.CountDownLatch
+
+internal enum class UndoFault { WRITE, FLUSH, CLOSE_AFTER_FLUSH }
+
+internal open class FaultInjectingEngineGateway : DocumentGateway {
+    val root = DocumentNode("root", "selected", isDirectory = true, length = 0)
+    val mutations = mutableListOf<String>()
+    val readPaths = mutableListOf<String>()
+    var undoFault: UndoFault? = null
+    var exactCreationFault: ExactCreationFault? = null
+    var blockFirstList: CountDownLatch? = null
+    var firstListEntered: CountDownLatch? = null
+
+    protected val nodes = linkedMapOf(root.id to root)
+    protected val children = linkedMapOf(root.id to linkedMapOf<String, String>())
+    protected val bytes = linkedMapOf<String, ByteArray>()
+    protected val advertisedLengths = mutableMapOf<String, Long>()
+
+    fun put(relativePath: String, contents: ByteArray, advertisedLength: Long = contents.size.toLong()): DocumentNode {
+        val parts = relativePath.split('/')
+        require(parts.none { it.isBlank() || it == "." || it == ".." })
+        var parent = root
+        parts.dropLast(1).forEach { name -> parent = resolve(parent, name) ?: create(parent, name, true) }
+        val node = resolve(parent, parts.last()) ?: create(parent, parts.last(), false)
+        bytes[node.id] = contents.copyOf()
+        advertisedLengths[node.id] = advertisedLength
+        return node
+    }
+
+    fun contents(relativePath: String): ByteArray = bytes.getValue(node(relativePath).id).copyOf()
+
+    fun node(relativePath: String): DocumentNode {
+        var current = root
+        relativePath.split('/').forEach { name -> current = resolve(current, name) ?: error("No node at $relativePath") }
+        return current
+    }
+
+    fun relativePaths(): List<String> {
+        val paths = mutableListOf<String>()
+        val pending = ArrayDeque<Pair<DocumentNode, String>>()
+        pending.addLast(root to "")
+        while (pending.isNotEmpty()) {
+            val (parent, prefix) = pending.removeFirst()
+            list(parent).forEach { child ->
+                val path = if (prefix.isEmpty()) child.name else "$prefix/${child.name}"
+                paths += path
+                if (child.isDirectory) pending.addLast(child to path)
+            }
+        }
+        return paths
+    }
+
+    override fun openRead(node: DocumentNode): InputStream {
+        readPaths += path(node)
+        return ByteArrayInputStream(bytes[node.id] ?: throw IOException("Not a file: ${node.id}"))
+    }
+
+    override fun openWrite(node: DocumentNode): OutputStream {
+        mutations += "open-write:${path(node)}"
+        val output = ByteArrayOutputStream()
+        val undo = node.name.startsWith("FileForge_Undo_v2_")
+        return object : OutputStream() {
+            private var flushes = 0
+            override fun write(value: Int) {
+                if (undo && undoFault == UndoFault.WRITE && flushes >= 1) throw IOException("undo append write failed")
+                output.write(value)
+            }
+            override fun write(source: ByteArray, offset: Int, length: Int) {
+                if (undo && undoFault == UndoFault.WRITE && flushes >= 1) throw IOException("undo append write failed")
+                output.write(source, offset, length)
+            }
+            override fun flush() {
+                flushes++
+                persist(node, output)
+                if (undo && undoFault == UndoFault.FLUSH && flushes >= 2) throw IOException("undo append flush failed")
+            }
+            override fun close() {
+                persist(node, output)
+                if (undo && undoFault == UndoFault.CLOSE_AFTER_FLUSH) throw IOException("undo close failed after flush")
+            }
+        }
+    }
+
+    open override fun list(node: DocumentNode): List<DocumentNode> {
+        if (node == root && blockFirstList != null) {
+            firstListEntered?.countDown()
+            blockFirstList?.await()
+            blockFirstList = null
+        }
+        return children[node.id].orEmpty().values.map(nodes::getValue)
+    }
+
+    override fun resolve(parent: DocumentNode, name: String): DocumentNode? =
+        children[parent.id]?.get(name)?.let(nodes::get)
+
+    override fun createDirectory(parent: DocumentNode, name: String): DocumentNode {
+        mutations += "mkdir:${path(parent)}:$name"
+        return create(parent, name, true)
+    }
+
+    override fun createFile(parent: DocumentNode, mimeType: String, name: String): DocumentNode {
+        mutations += "create-file:${path(parent)}:$name"
+        return create(parent, name, false).also {
+            bytes[it.id] = byteArrayOf()
+            advertisedLengths[it.id] = 0
+        }
+    }
+
+    override fun createDirectoryExact(parent: DocumentNode, name: String): DocumentNode = exactCreate(parent, name, true)
+    override fun createFileExact(parent: DocumentNode, mimeType: String, name: String): DocumentNode = exactCreate(parent, name, false)
+
+    override fun length(node: DocumentNode): Long = advertisedLengths[node.id] ?: bytes[node.id]?.size?.toLong() ?: 0
+
+    private fun exactCreate(parent: DocumentNode, name: String, directory: Boolean): DocumentNode = when (exactCreationFault) {
+        ExactCreationFault.COLLISION_RENAME -> {
+            if (directory) createDirectory(parent, "$name (1)") else createFile(parent, "application/octet-stream", "$name (1)")
+            throw IOException("provider collision-renamed exact creation")
+        }
+        ExactCreationFault.CREATE_RACE -> {
+            if (resolve(parent, name) == null) {
+                if (directory) createDirectory(parent, name) else createFile(parent, "application/octet-stream", name)
+            }
+            throw IOException("exact creation lost a race")
+        }
+        ExactCreationFault.UNREACHABLE_RETURNED_NODE -> throw IOException("created node is unreachable by requested name")
+        null -> if (directory) createDirectory(parent, name) else createFile(parent, "application/octet-stream", name)
+    }
+
+    protected fun create(parent: DocumentNode, name: String, directory: Boolean): DocumentNode {
+        check(resolve(parent, name) == null) { "Duplicate child $name" }
+        val id = "${parent.id}/$name"
+        val created = DocumentNode(id, name, directory, 0)
+        nodes[id] = created
+        children.getOrPut(parent.id) { linkedMapOf() }[name] = id
+        if (directory) children[id] = linkedMapOf()
+        return created
+    }
+
+    private fun persist(node: DocumentNode, output: ByteArrayOutputStream) {
+        bytes[node.id] = output.toByteArray()
+        advertisedLengths[node.id] = output.size().toLong()
+    }
+
+    private fun path(node: DocumentNode): String = if (node == root) "" else node.id.removePrefix("${root.id}/")
+}
+
+internal class ScriptedUndoSinkWriter(
+    private val delegate: Writer,
+    private val failWriteAtCall: Int? = null,
+    private val failFlushAtCall: Int? = null,
+    private val failClose: Boolean = false
+) : Writer() {
+    private var writes = 0
+    private var flushes = 0
+    override fun write(source: CharArray, offset: Int, length: Int) {
+        writes++
+        if (writes == failWriteAtCall) throw IOException("scripted undo write failure")
+        delegate.write(source, offset, length)
+    }
+    override fun flush() {
+        flushes++
+        delegate.flush()
+        if (flushes == failFlushAtCall) throw IOException("scripted undo flush failure")
+    }
+    override fun close() {
+        delegate.close()
+        if (failClose) throw IOException("scripted close failure")
+    }
+}

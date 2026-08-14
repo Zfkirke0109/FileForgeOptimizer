@@ -63,12 +63,12 @@ class OptimizerEngineIntegrationTest {
     }
 
     @Test
-    fun zipFamilyHasNoArchiveSizeLimitEvenBeyondFormerThreeHundredMiBGuard() = withCache { cache ->
-        val advertisedLength = FORMER_ZIP_GUARD_BYTES + 1
+    fun zipFamilyIgnoresInflatedProviderLengthAndUsesActualStreamedBytes() = withCache { cache ->
         val gateway = EngineDocumentGateway().apply {
-            put("huge.zip", compressibleZip, advertisedLength)
+            put("archive.zip", compressibleZip, FORMER_ZIP_GUARD_BYTES + 1)
             resetObservations()
         }
+        val expectedCandidate = optimizeZip(compressibleZip)
 
         val report = engine(gateway, cache, dryRun).run(NeverCancelled) {}
 
@@ -76,7 +76,7 @@ class OptimizerEngineIntegrationTest {
         assertEquals(1, report.candidates)
         assertEquals(0, report.skipped)
         assertFalse(report.skipsByReason.containsKey(SkipReason.MEMORY_LIMIT))
-        assertTrue(report.potentialSavingsBytes > FORMER_ZIP_GUARD_BYTES - compressibleZip.size)
+        assertEquals(compressibleZip.size.toLong() - expectedCandidate.size, report.potentialSavingsBytes)
         assertTrue(gateway.mutations.isEmpty())
     }
 
