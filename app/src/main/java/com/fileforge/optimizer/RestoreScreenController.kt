@@ -13,6 +13,7 @@ import androidx.documentfile.provider.DocumentFile
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.snackbar.Snackbar
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
@@ -35,15 +36,34 @@ class RestoreScreenController(
     }
     private var selectedTreeUri: String? = testFixture?.treeUri ?: readSelectedTreeUri()
     private var capabilities: SelectedTreeCapabilities = testFixture?.selectedTree ?: readCapabilities()
-    private var discovery: RestoreLogDiscovery? = null
-    private var discoveryRequested = false
+    @Volatile private var discoveryTreeUri: String? = null
     private var discoveryLoading = false
     private var discoveryResult = testFixture?.discovery ?: RestoreDiscoveryResult(emptyList(), emptyList())
     private var selectedUndoLogId: String? = null
     private val selectedPaths = linkedSetOf<String>()
+    private var allSelected = false
     private var latestRunState: RunState = RunState.Idle
     private var closed = false
-    private val visibilityGate = RestoreDiscoveryVisibilityGate()
+    private val discoverySession = RestoreDiscoverySession(
+        schedule = { task -> executor.execute(task) },
+        createDiscovery = {
+            val treeUri = discoveryTreeUri
+                ?: throw IllegalStateException("Selected folder is unavailable")
+            val root = DocumentFile.fromTreeUri(activity, Uri.parse(treeUri))
+                ?: throw IllegalStateException("Selected folder is unavailable")
+            val gateway = SafDocumentGateway(activity, root)
+            RestoreLogDiscovery(gateway, gateway.rootNode)
+        },
+        onResult = { result ->
+            if (!closed) {
+                discoveryLoading = false
+                discoveryResult = result
+                clearSelection()
+                render()
+            }
+        },
+        deliver = { task -> activity.runOnUiThread(task) }
+    )
 
     private lateinit var discoveryStatus: TextView
     private lateinit var cards: LinearLayout
@@ -55,19 +75,17 @@ class RestoreScreenController(
 
     init {
         view = buildView()
-        if (testFixture != null) discoveryRequested = true
         render()
     }
 
     fun onVisible() {
         refreshSelectedTree()
-        if (testFixture == null) discoverOffMainThread(visibilityGate.enterRestore())
+        if (testFixture == null) refreshDiscovery()
         render()
     }
 
     fun onHidden() {
-        visibilityGate.hideRestore()
-        discovery?.close()
+        discoverySession.onHidden()
         discoveryLoading = false
     }
 
@@ -79,41 +97,23 @@ class RestoreScreenController(
     override fun close() {
         if (closed) return
         closed = true
-        discovery?.close()
+        discoverySession.close()
         executor.shutdownNow()
     }
 
-    private fun discoverOffMainThread(generation: RestoreDiscoveryVisibilityGate.Generation) {
-        discoveryRequested = true
+    private fun refreshDiscovery() {
         if (!canReadTree()) {
+            discoverySession.onHidden()
+            discoveryLoading = false
+            discoveryResult = RestoreDiscoveryResult(emptyList(), emptyList())
+            clearSelection()
             render()
             return
         }
-        val treeUri = selectedTreeUri ?: return
+        discoveryTreeUri = selectedTreeUri ?: return
         discoveryLoading = true
         render()
-        executor.execute {
-            val result = try {
-                val root = DocumentFile.fromTreeUri(activity, Uri.parse(treeUri))
-                    ?: throw IllegalStateException("Selected folder is unavailable")
-                val gateway = SafDocumentGateway(activity, root)
-                RestoreLogDiscovery(gateway, gateway.rootNode).also { discovery = it }.discover()
-            } catch (cancelled: OptimizationCancelledException) {
-                return@execute
-            } catch (failure: Throwable) {
-                if (failure.isVmFatal()) throw failure
-                RestoreDiscoveryResult(
-                    emptyList(),
-                    listOf(RestoreDiscoveryFailure("selected folder", failure.message ?: "Discovery failed"))
-                )
-            }
-            activity.runOnUiThread {
-                if (closed || treeUri != selectedTreeUri || !visibilityGate.acceptCompletion(generation)) return@runOnUiThread
-                discoveryLoading = false
-                discoveryResult = result
-                render()
-            }
-        }
+        discoverySession.onVisible()
     }
 
     private fun refreshSelectedTree() {
@@ -121,15 +121,12 @@ class RestoreScreenController(
         val latest = readSelectedTreeUri()
         val wasReadable = canReadTree()
         if (latest != selectedTreeUri) {
-            discovery?.close()
             selectedTreeUri = latest
             discoveryResult = RestoreDiscoveryResult(emptyList(), emptyList())
-            selectedUndoLogId = null
-            selectedPaths.clear()
-            discoveryRequested = false
+            clearSelection()
         }
         capabilities = readCapabilities()
-        if (!wasReadable && canReadTree()) discoveryRequested = false
+        if (wasReadable && !canReadTree()) clearSelection()
     }
 
     private fun buildView(): View = NestedScrollView(activity).apply {
@@ -192,7 +189,10 @@ class RestoreScreenController(
         if (closed) return
         renderDiscovery()
         val running = latestRunState is RunState.Running
-        restoreButton.isEnabled = !running && ProcessRestoreLaunchOwnership.instance.current() == null && canWriteTree() && selectedPaths.isNotEmpty()
+        restoreButton.isEnabled = !running &&
+            ProcessRestoreLaunchOwnership.instance.current() == null &&
+            canWriteTree() &&
+            hasSelection()
         cancelButton.visibility = if (running && (latestRunState as RunState.Running).operationKind == RunOperationKind.RESTORE) {
             View.VISIBLE
         } else {
@@ -247,10 +247,12 @@ class RestoreScreenController(
                 })
                 card.entries.forEach { entry ->
                     addView(CheckBox(activity).apply {
-                        id = R.id.restore_entry_checkbox
+                        id = View.generateViewId()
+                        isSaveEnabled = false
                         text = entry.relativePath
                         contentDescription = activity.getString(R.string.restore_select_entry, entry.relativePath)
-                        isChecked = selectedUndoLogId == card.undoLogId && entry.relativePath in selectedPaths
+                        isChecked = selectedUndoLogId == card.undoLogId &&
+                            (allSelected || entry.relativePath in selectedPaths)
                         setOnCheckedChangeListener { _, checked -> updateSelection(card.undoLogId, entry.relativePath, checked) }
                     })
                     addView(TextView(activity).apply {
@@ -275,10 +277,26 @@ class RestoreScreenController(
         if (checked && selectedUndoLogId != undoLogId) {
             selectedUndoLogId = undoLogId
             selectedPaths.clear()
+            allSelected = false
         }
         if (selectedUndoLogId == undoLogId) {
-            if (checked) selectedPaths += path else selectedPaths -= path
-            if (selectedPaths.isEmpty()) selectedUndoLogId = null
+            if (!checked && allSelected) {
+                selectedPaths.clear()
+                discoveryResult.runs
+                    .firstOrNull { it.undoLogId == undoLogId }
+                    ?.run
+                    ?.entries
+                    ?.asSequence()
+                    ?.map { it.relativePath }
+                    ?.filter { it != path }
+                    ?.toCollection(selectedPaths)
+                allSelected = false
+            } else if (checked) {
+                selectedPaths += path
+            } else {
+                selectedPaths -= path
+            }
+            if (!allSelected && selectedPaths.isEmpty()) selectedUndoLogId = null
         }
         render()
     }
@@ -291,14 +309,15 @@ class RestoreScreenController(
     private fun selectAll(run: DiscoveredUndoLog) {
         selectedUndoLogId = run.undoLogId
         selectedPaths.clear()
-        selectedPaths += run.run.entries.map { it.relativePath }
+        allSelected = true
         render()
     }
 
     private fun confirmSelectedRestore() {
         val undoLogId = selectedUndoLogId ?: return
         if (!restoreButton.isEnabled) return
-        val count = selectedPaths.size
+        val count = selectedCount(undoLogId)
+        if (count <= 0) return
         MaterialAlertDialogBuilder(activity)
             .setTitle(activity.resources.getQuantityString(R.plurals.restore_confirmation_title, count, count))
             .setMessage(R.string.restore_confirmation_message)
@@ -309,8 +328,19 @@ class RestoreScreenController(
                 val request = ServiceRunRequest.Restore(
                     treeUri = treeUri,
                     undoLogId = undoLogId,
-                    selection = RestoreSelection.Entries(selectedPaths.toSet())
+                    selection = if (allSelected) {
+                        RestoreSelection.All
+                    } else {
+                        RestoreSelection.Entries(selectedPaths.toSet())
+                    }
                 )
+                try {
+                    OptimizationServiceRequestCodec.encode(request)
+                } catch (failure: Throwable) {
+                    if (failure.isVmFatal()) throw failure
+                    showRestoreStartFailure(failure)
+                    return@setPositiveButton
+                }
                 val claim = ProcessRestoreLaunchOwnership.instance.tryClaim(
                     request,
                     optimizePending = ProcessOptimizeDispatchOwnership.instance.current() != null
@@ -326,10 +356,34 @@ class RestoreScreenController(
                     }
                 } catch (failure: Throwable) {
                     ProcessRestoreLaunchOwnership.instance.onDispatchFailed(claim)
-                    throw failure
+                    if (failure.isVmFatal()) throw failure
+                    render()
+                    showRestoreStartFailure(failure)
                 }
             }
             .show()
+    }
+
+    private fun hasSelection(): Boolean = selectedUndoLogId != null && (allSelected || selectedPaths.isNotEmpty())
+
+    private fun selectedCount(undoLogId: String): Int = if (allSelected) {
+        discoveryResult.runs.firstOrNull { it.undoLogId == undoLogId }?.run?.entries?.size ?: 0
+    } else {
+        selectedPaths.size
+    }
+
+    private fun clearSelection() {
+        selectedUndoLogId = null
+        selectedPaths.clear()
+        allSelected = false
+    }
+
+    private fun showRestoreStartFailure(failure: Throwable) {
+        Snackbar.make(
+            view,
+            failure.message ?: "Restore could not be started",
+            Snackbar.LENGTH_LONG
+        ).show()
     }
 
     private fun restoreTerminalHeadline(): String {

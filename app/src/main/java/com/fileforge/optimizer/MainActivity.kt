@@ -92,7 +92,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         ThemePreferences.applyActivityThemeBeforeOnCreate(this)
         super.onCreate(savedInstanceState)
-        ProcessRestoreLaunchOwnership.initialize(this)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         optimizeController = OptimizeScreenController(
             activity = this,

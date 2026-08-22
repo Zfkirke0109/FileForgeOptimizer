@@ -18,6 +18,7 @@ object OptimizationServiceContract {
     const val EXTRA_RUN_INTENT = "com.fileforge.optimizer.extra.RUN_INTENT"
     const val EXTRA_UNDO_LOG_ID = "com.fileforge.optimizer.extra.UNDO_LOG_ID"
     const val EXTRA_RESTORE_SELECTION = "com.fileforge.optimizer.extra.RESTORE_SELECTION"
+    internal const val EXTRA_RESTORE_CLAIM_ID = "com.fileforge.optimizer.extra.RESTORE_CLAIM_ID"
 }
 
 sealed class ServiceRunRequest {
@@ -135,6 +136,7 @@ object OptimizationServiceRequestCodec {
                     val path = encodedPaths.opt(index) as? String ?: return null
                     if (!paths.add(path)) return null
                 }
+                validateEntrySelection(paths)
                 RestoreSelection.Entries(paths)
             }
             else -> return null
@@ -151,10 +153,26 @@ object OptimizationServiceRequestCodec {
 
     private fun encodeSelection(selection: RestoreSelection): String = when (selection) {
         RestoreSelection.All -> JSONObject().put("kind", SELECTION_ALL).toString()
-        is RestoreSelection.Entries -> JSONObject()
-            .put("kind", SELECTION_ENTRIES)
-            .put("relativePaths", JSONArray(selection.relativePaths.sorted()))
-            .toString()
+        is RestoreSelection.Entries -> {
+            validateEntrySelection(selection.relativePaths)
+            JSONObject()
+                .put("kind", SELECTION_ENTRIES)
+                .put("relativePaths", JSONArray(selection.relativePaths.sorted()))
+                .toString()
+        }
+    }
+
+    private fun validateEntrySelection(paths: Set<String>) {
+        require(paths.size <= MAX_RESTORE_ENTRY_SELECTION_COUNT) {
+            "Restore selection is too large to send safely"
+        }
+        var encodedBytes = RESTORE_SELECTION_ENVELOPE_BYTES
+        paths.forEach { path ->
+            encodedBytes += JSONObject.quote(path).toByteArray(Charsets.UTF_8).size.toLong() + 1L
+            require(encodedBytes <= MAX_RESTORE_ENTRY_SELECTION_BYTES) {
+                "Restore selection is too large to send safely"
+            }
+        }
     }
 
     private fun parseObject(serialized: String): JSONObject? {
@@ -185,6 +203,9 @@ object OptimizationServiceRequestCodec {
     private val ENTRY_SELECTION_KEYS = setOf("kind", "relativePaths")
     private const val SELECTION_ALL = "ALL"
     private const val SELECTION_ENTRIES = "ENTRIES"
+    private const val MAX_RESTORE_ENTRY_SELECTION_COUNT = 10_000
+    private const val MAX_RESTORE_ENTRY_SELECTION_BYTES = 512L * 1024L
+    private const val RESTORE_SELECTION_ENVELOPE_BYTES = 128L
 }
 
 /** Strict RFC-8259 syntax gate independent of the platform's lenient JSONTokener. */
@@ -416,17 +437,28 @@ class OptimizationServiceController(
     val binding = OptimizationBinding(repository)
     private val active = AtomicReference<ActiveRun?>()
 
-    fun onStartCommand(request: ServiceRunRequest): ServiceStartResult {
+    fun onStartCommand(
+        request: ServiceRunRequest,
+        onFinished: (() -> Unit)? = null
+    ): ServiceStartResult {
         val claimed = ActiveRun(
             dryRun = (request as? ServiceRunRequest.Optimize)?.runIntent?.dryRun == true,
             operationKind = when (request) {
                 is ServiceRunRequest.Optimize -> RunOperationKind.OPTIMIZE
                 is ServiceRunRequest.Restore -> RunOperationKind.RESTORE
-            }
+            },
+            confirmedRestoreScope = (request as? ServiceRunRequest.Restore)
+                ?.selection
+                ?.let { selection -> (selection as? RestoreSelection.Entries)?.relativePaths?.size },
+            onFinished = onFinished
         )
         if (!active.compareAndSet(null, claimed)) return ServiceStartResult(accepted = false)
         val initial = RunState.Running(
-            ProgressSnapshot(phase = initialPhase(request)),
+            ProgressSnapshot(
+                phase = initialPhase(request),
+                filesDiscovered = claimed.confirmedRestoreScope ?: 0,
+                totalWork = claimed.confirmedRestoreScope
+            ),
             dryRun = claimed.dryRun,
             operationKind = claimed.operationKind
         )
@@ -472,9 +504,10 @@ class OptimizationServiceController(
         finish(
             claimed,
             RunState.Terminal(
-                OptimizationReport(
+                terminalReport(
+                    claimed = claimed,
                     status = RunStatus.CANCELLED,
-                    terminalError = TIMEOUT_MESSAGE
+                    error = TIMEOUT_MESSAGE
                 ),
                 dryRun = claimed.dryRun,
                 operationKind = claimed.operationKind
@@ -494,12 +527,12 @@ class OptimizationServiceController(
             }
         } catch (_: OptimizationCancelledException) {
             RunState.Terminal(
-                OptimizationReport(status = RunStatus.CANCELLED),
+                terminalReport(claimed, RunStatus.CANCELLED),
                 dryRun = claimed.dryRun,
                 operationKind = claimed.operationKind
             )
         } catch (failure: Throwable) {
-            val failed = failedTerminal(failure, claimed.dryRun, claimed.operationKind)
+            val failed = failedTerminal(failure, claimed)
             if (failure.isVmFatal()) {
                 try {
                     finish(claimed, failed)
@@ -528,14 +561,14 @@ class OptimizationServiceController(
             try {
                 finish(
                     claimed,
-                    failedTerminal(failure, claimed.dryRun, claimed.operationKind)
+                    failedTerminal(failure, claimed)
                 )
             } catch (finalizationFailure: Throwable) {
                 if (finalizationFailure !== failure) failure.addSuppressed(finalizationFailure)
             }
             throw failure
         }
-        finish(claimed, failedTerminal(failure, claimed.dryRun, claimed.operationKind))
+        finish(claimed, failedTerminal(failure, claimed))
     }
 
     private fun finish(
@@ -580,6 +613,7 @@ class OptimizationServiceController(
             }
         } finally {
             active.compareAndSet(claimed, null)
+            claimed.onFinished?.invoke()
         }
         publicationFailure?.let { throw it }
         return true
@@ -587,17 +621,42 @@ class OptimizationServiceController(
 
     private fun failedTerminal(
         failure: Throwable,
-        dryRun: Boolean,
-        operationKind: RunOperationKind
+        claimed: ActiveRun
     ) = RunState.Terminal(
-        OptimizationReport(
-            errors = 1,
+        terminalReport(
+            claimed = claimed,
             status = RunStatus.FAILED,
-            terminalError = failure.message ?: failure.javaClass.name
+            error = failure.message ?: failure.javaClass.name
         ),
-        dryRun,
-        operationKind
+        claimed.dryRun,
+        claimed.operationKind
     )
+
+    private fun terminalReport(
+        claimed: ActiveRun,
+        status: RunStatus,
+        error: String? = null
+    ): OptimizationReport {
+        if (claimed.operationKind != RunOperationKind.RESTORE) {
+            return OptimizationReport(
+                errors = if (status == RunStatus.FAILED) 1 else 0,
+                status = status,
+                terminalError = error
+            )
+        }
+        val scope = claimed.confirmedRestoreScope
+        return OptimizationReport(
+            scanned = scope ?: 0,
+            errors = scope ?: 0,
+            status = status,
+            terminalError = error,
+            terminalFailures = if (scope == null) {
+                listOf("Restore scope count unavailable before undo log discovery completed")
+            } else {
+                emptyList()
+            }
+        )
+    }
 
     private fun initialPhase(request: ServiceRunRequest): String = when (request) {
         is ServiceRunRequest.Optimize -> if (request.runIntent.dryRun) "analyzing" else "optimizing"
@@ -606,7 +665,9 @@ class OptimizationServiceController(
 
     private class ActiveRun(
         val dryRun: Boolean,
-        val operationKind: RunOperationKind
+        val operationKind: RunOperationKind,
+        val confirmedRestoreScope: Int?,
+        val onFinished: (() -> Unit)?
     ) {
         val cancellation = AtomicCancellationSource()
         val finalized = AtomicBoolean(false)
@@ -622,6 +683,8 @@ class OptimizationServiceController(
 /** Android-free action adapter. Invalid commands relinquish only an idle service instance. */
 class OptimizationServiceCommandRouter(
     private val controller: OptimizationServiceController,
+    private val restoreOwnership: RestoreLaunchOwnership? = null,
+    private val requireRestoreClaimId: Boolean = false,
     private val stopIdleService: () -> Unit
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
@@ -631,8 +694,34 @@ class OptimizationServiceCommandRouter(
         when (action) {
             OptimizationServiceContract.ACTION_START,
             OptimizationServiceContract.ACTION_RESTORE -> {
-                val request = OptimizationServiceRequestCodec.decode(action, extras)
-                if (request != null) controller.onStartCommand(request) else stopOnlyWhenIdle()
+                val hasRestoreClaimId = action == OptimizationServiceContract.ACTION_RESTORE &&
+                    extras.containsKey(OptimizationServiceContract.EXTRA_RESTORE_CLAIM_ID)
+                val restoreClaimId = if (action == OptimizationServiceContract.ACTION_RESTORE) {
+                    (extras[OptimizationServiceContract.EXTRA_RESTORE_CLAIM_ID] as? String)
+                        ?.takeIf { it.isNotBlank() }
+                } else {
+                    null
+                }
+                val requestExtras = if (action == OptimizationServiceContract.ACTION_RESTORE) {
+                    extras - OptimizationServiceContract.EXTRA_RESTORE_CLAIM_ID
+                } else {
+                    extras
+                }
+                if (hasRestoreClaimId && restoreClaimId == null) {
+                    stopOnlyWhenIdle()
+                    return ServiceRestartPolicy.NOT_STICKY
+                }
+                val request = OptimizationServiceRequestCodec.decode(action, requestExtras)
+                if (request == null) {
+                    restoreClaimId
+                        ?.let { restoreOwnership?.captureForService(it) }
+                        ?.let { restoreOwnership?.onServiceCompleted(it) }
+                    stopOnlyWhenIdle()
+                } else if (request is ServiceRunRequest.Restore) {
+                    routeRestore(request, restoreClaimId)
+                } else {
+                    controller.onStartCommand(request)
+                }
             }
             OptimizationServiceContract.ACTION_CANCEL -> {
                 if (extras.isNotEmpty()) stopOnlyWhenIdle()
@@ -642,6 +731,29 @@ class OptimizationServiceCommandRouter(
             else -> stopOnlyWhenIdle()
         }
         return ServiceRestartPolicy.NOT_STICKY
+    }
+
+    private fun routeRestore(request: ServiceRunRequest.Restore, expectedClaimId: String?) {
+        val owner = restoreOwnership
+        if (requireRestoreClaimId && expectedClaimId == null) {
+            stopOnlyWhenIdle()
+            return
+        }
+        val claim = if (expectedClaimId == null) {
+            owner?.captureForService(request)
+        } else {
+            owner?.captureForService(request, expectedClaimId)
+        }
+        val exactClaimWasRequired = expectedClaimId != null ||
+            (owner?.current() != null && claim == null)
+        if (exactClaimWasRequired && claim == null) {
+            stopOnlyWhenIdle()
+            return
+        }
+        val result = controller.onStartCommand(request) {
+            if (claim != null) owner?.onServiceCompleted(claim)
+        }
+        if (!result.accepted && claim != null) owner?.onServiceCompleted(claim)
     }
 
     private fun stopOnlyWhenIdle() {

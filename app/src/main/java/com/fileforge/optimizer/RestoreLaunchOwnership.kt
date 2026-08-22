@@ -1,77 +1,65 @@
 package com.fileforge.optimizer
 
-import android.content.Context
+import java.util.UUID
 
-data class RestoreLaunchClaimRecord(val id: Long, val requestKey: String)
-data class RestoreLaunchClaim internal constructor(val id: Long, val requestKey: String)
+data class RestoreLaunchClaim internal constructor(val id: String, val requestKey: String)
 
-interface RestoreLaunchClaimStore {
-    fun read(): RestoreLaunchClaimRecord?
-    fun write(record: RestoreLaunchClaimRecord)
-    fun clear()
-}
+/**
+ * Exact restore-dispatch gate. The owner is intentionally process-memory-only: Activities in the
+ * same process share [ProcessRestoreLaunchOwnership.instance], while a dead process cannot leave a
+ * disk marker that blocks the next launch.
+ */
+class RestoreLaunchOwnership {
+    private var claim: RestoreLaunchClaim? = null
 
-private object InMemoryRestoreLaunchClaimStore : RestoreLaunchClaimStore {
-    private var value: RestoreLaunchClaimRecord? = null
-    override fun read(): RestoreLaunchClaimRecord? = value
-    override fun write(record: RestoreLaunchClaimRecord) { value = record }
-    override fun clear() { value = null }
-}
+    @Synchronized
+    fun current(): RestoreLaunchClaim? = claim
 
-/** Exact-request gate shared by restore presentations and the foreground service. */
-class RestoreLaunchOwnership(private val store: RestoreLaunchClaimStore = InMemoryRestoreLaunchClaimStore) {
-    private var claim: RestoreLaunchClaim? = store.read()?.let { RestoreLaunchClaim(it.id, it.requestKey) }
-    private var nextId = claim?.id ?: 0L
-
-    @Synchronized fun current(): RestoreLaunchClaim? = claim
-
-    @Synchronized fun tryClaim(request: ServiceRunRequest.Restore, optimizePending: Boolean = false): RestoreLaunchClaim? {
+    @Synchronized
+    fun tryClaim(
+        request: ServiceRunRequest.Restore,
+        optimizePending: Boolean = false
+    ): RestoreLaunchClaim? {
         if (optimizePending || claim != null) return null
-        return RestoreLaunchClaim(++nextId, request.key()).also {
-            claim = it
-            store.write(RestoreLaunchClaimRecord(it.id, it.requestKey))
-        }
+        return RestoreLaunchClaim(UUID.randomUUID().toString(), request.key()).also { claim = it }
     }
 
-    @Synchronized fun onDispatchFailed(expected: RestoreLaunchClaim) = release(expected)
-    @Synchronized fun onServiceRejected(request: ServiceRunRequest.Restore) { claim?.takeIf { it.requestKey == request.key() }?.let(::release) }
-    @Synchronized fun onServiceAccepted(request: ServiceRunRequest.Restore) { /* exact bridge retains claim until completion */ }
-    @Synchronized fun onServiceCompleted(request: ServiceRunRequest.Restore) { claim?.takeIf { it.requestKey == request.key() }?.let(::release) }
-    @Synchronized fun onServiceCompleted(expected: RestoreLaunchClaim) = release(expected)
-    @Synchronized fun onObserved(state: RunState) { /* generic state has no exact request identity */ }
+    /** Returns the already-owned request claim so its opaque identity can be serialized. */
+    @Synchronized
+    fun captureForService(request: ServiceRunRequest.Restore): RestoreLaunchClaim? =
+        claim?.takeIf { it.requestKey == request.key() }
+
+    /** Captures only the exact opaque claim presented at service entry. */
+    @Synchronized
+    fun captureForService(
+        request: ServiceRunRequest.Restore,
+        expectedId: String
+    ): RestoreLaunchClaim? = claim?.takeIf {
+        it.requestKey == request.key() && it.id == expectedId
+    }
+
+    /** Used to release a malformed/rejected command that still carries an exact dispatch token. */
+    @Synchronized
+    fun captureForService(expectedId: String): RestoreLaunchClaim? = claim?.takeIf { it.id == expectedId }
+
+    @Synchronized
+    fun onDispatchFailed(expected: RestoreLaunchClaim) = release(expected)
+
+    @Synchronized
+    fun onServiceCompleted(expected: RestoreLaunchClaim) = release(expected)
+
+    @Synchronized
+    fun onObserved(state: RunState) {
+        // Generic run state deliberately has no restore-request identity and cannot release a claim.
+    }
 
     private fun release(expected: RestoreLaunchClaim) {
-        if (claim?.id == expected.id) { claim = null; store.clear() }
+        if (claim === expected) claim = null
     }
 }
 
 internal object ProcessRestoreLaunchOwnership {
-    @Volatile private var initialized = false
-    @Volatile private var owner = RestoreLaunchOwnership()
-    val instance: RestoreLaunchOwnership get() = owner
-
-    fun initialize(context: Context) {
-        if (initialized) return
-        synchronized(this) {
-            if (!initialized) {
-                owner = RestoreLaunchOwnership(SharedPreferencesRestoreLaunchClaimStore(context.applicationContext))
-                initialized = true
-            }
-        }
-    }
-}
-
-private class SharedPreferencesRestoreLaunchClaimStore(context: Context) : RestoreLaunchClaimStore {
-    private val preferences = context.getSharedPreferences("fileforge_restore_launch", Context.MODE_PRIVATE)
-    override fun read(): RestoreLaunchClaimRecord? {
-        val id = preferences.getLong("id", -1)
-        val key = preferences.getString("key", null)
-        return if (id >= 0 && key != null) RestoreLaunchClaimRecord(id, key) else null
-    }
-    override fun write(record: RestoreLaunchClaimRecord) {
-        preferences.edit().putLong("id", record.id).putString("key", record.requestKey).commit()
-    }
-    override fun clear() { preferences.edit().clear().commit() }
+    val instance = RestoreLaunchOwnership()
 }
 
 private fun ServiceRunRequest.Restore.key(): String = buildString {

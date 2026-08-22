@@ -421,7 +421,8 @@ class OptimizationServiceControllerTest {
 
         router.onCommand(
             OptimizationServiceContract.ACTION_RESTORE,
-            OptimizationServiceRequestCodec.encode(request).extras
+            OptimizationServiceRequestCodec.encode(request).extras +
+                (OptimizationServiceContract.EXTRA_RESTORE_CLAIM_ID to rejectedClaim.id)
         )
 
         assertNull(ownership.current())
@@ -446,7 +447,8 @@ class OptimizationServiceControllerTest {
 
         router.onCommand(
             OptimizationServiceContract.ACTION_RESTORE,
-            OptimizationServiceRequestCodec.encode(request).extras
+            OptimizationServiceRequestCodec.encode(request).extras +
+                (OptimizationServiceContract.EXTRA_RESTORE_CLAIM_ID to claim.id)
         )
 
         assertNull(ownership.current())
@@ -454,6 +456,32 @@ class OptimizationServiceControllerTest {
         assertTrue(fixture.runtime.requests.isEmpty())
         ownership.onServiceCompleted(claim)
         assertNull(ownership.current())
+    }
+
+    @Test
+    fun routerRejectsAStaleSerializedClaimForAnIdenticalNewerRestoreWithoutDispatching() {
+        val fixture = Fixture()
+        val ownership = RestoreLaunchOwnership()
+        val request = restoreRequest("undo-stale-identical")
+        val router = OptimizationServiceCommandRouter(
+            fixture.controller,
+            stopIdleService = {},
+            restoreOwnership = ownership
+        )
+        val stale = checkNotNull(ownership.tryClaim(request))
+        ownership.onDispatchFailed(stale)
+        val newer = checkNotNull(ownership.tryClaim(request))
+
+        router.onCommand(
+            OptimizationServiceContract.ACTION_RESTORE,
+            OptimizationServiceRequestCodec.encode(request).extras +
+                (OptimizationServiceContract.EXTRA_RESTORE_CLAIM_ID to stale.id)
+        )
+
+        assertTrue(ownership.current() === newer)
+        assertFalse(fixture.controller.hasActiveRun())
+        assertTrue(fixture.runtime.requests.isEmpty())
+        assertEquals(0, fixture.runtime.pendingTaskCount)
     }
 
     @Test
@@ -519,8 +547,12 @@ class OptimizationServiceControllerTest {
 
         router.onCommand(
             OptimizationServiceContract.ACTION_RESTORE,
-            OptimizationServiceRequestCodec.encode(request).extras
+            OptimizationServiceRequestCodec.encode(request).extras +
+                (OptimizationServiceContract.EXTRA_RESTORE_CLAIM_ID to claim.id)
         )
+
+        assertTrue(ownership.current() === claim)
+        assertTrue(fixture.runtime.requests.isEmpty())
         fixture.runtime.runNext()
 
         assertNull(ownership.current())

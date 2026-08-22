@@ -55,7 +55,6 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
 
     override fun onCreate() {
         super.onCreate()
-        ProcessRestoreLaunchOwnership.initialize(this)
         repository = RunStateRepository.forAndroid(this)
         executor = Executors.newSingleThreadExecutor { task ->
             Thread(task, "FileForge-Optimization").apply { isDaemon = false }
@@ -65,7 +64,12 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
             runtime = this,
             notificationPermissionGranted = ::hasNotificationPermission
         )
-        commandRouter = OptimizationServiceCommandRouter(controller) { stopSelf() }
+        commandRouter = OptimizationServiceCommandRouter(
+            controller = controller,
+            restoreOwnership = ProcessRestoreLaunchOwnership.instance,
+            requireRestoreClaimId = true,
+            stopIdleService = { stopSelf() }
+        )
         binder = OptimizationBinder(controller.binding)
         notificationSubscription = repository.observe(::updateNotification)
     }
@@ -125,12 +129,7 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         onProgress: (ProgressSnapshot) -> Unit
     ): RunState.Terminal = when (request) {
         is ServiceRunRequest.Optimize -> runOptimization(request, cancellation, onProgress)
-        is ServiceRunRequest.Restore -> try {
-            ProcessRestoreLaunchOwnership.instance.onServiceAccepted(request)
-            runRestore(request, cancellation, onProgress)
-        } finally {
-            ProcessRestoreLaunchOwnership.instance.onServiceCompleted(request)
-        }
+        is ServiceRunRequest.Restore -> runRestore(request, cancellation, onProgress)
     }
 
     override fun deliverTimeoutTerminal(
@@ -356,6 +355,16 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
             val intent = Intent(context, OptimizationService::class.java).setAction(encoded.action)
             encoded.extras.forEach { (name, value) ->
                 intent.putExtra(name, value as String)
+            }
+            if (request is ServiceRunRequest.Restore) {
+                ProcessRestoreLaunchOwnership.instance
+                    .captureForService(request)
+                    ?.let { claim ->
+                        intent.putExtra(
+                            OptimizationServiceContract.EXTRA_RESTORE_CLAIM_ID,
+                            claim.id
+                        )
+                    }
             }
             ContextCompat.startForegroundService(context, intent)
         }

@@ -2,7 +2,10 @@ package com.fileforge.optimizer
 
 import java.io.InputStreamReader
 import java.io.InputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 data class DiscoveredUndoLog(
     val undoLogId: String,
@@ -24,6 +27,9 @@ class RestoreDiscoveryVisibilityGate {
         private val cancelled = AtomicBoolean(false)
         fun cancel() { cancelled.set(true) }
         fun isCancelled(): Boolean = cancelled.get()
+        fun cancellationToken(): CancellationToken = CancellationToken {
+            if (isCancelled()) throw OptimizationCancelledException("Restore discovery is no longer visible")
+        }
     }
 
     private var nextId = 0L
@@ -31,13 +37,143 @@ class RestoreDiscoveryVisibilityGate {
     var serviceWorkWasCancelled: Boolean = false
         private set
 
+    @Synchronized
     fun enterRestore(): Generation {
         current?.cancel()
         return Generation(++nextId).also { current = it }
     }
+    @Synchronized
     fun hideRestore() { current?.cancel(); current = null }
+    @Synchronized
     fun currentGeneration(): Generation? = current
-    fun acceptCompletion(generation: Generation): Boolean = current === generation && !generation.isCancelled()
+    @Synchronized
+    fun acceptCompletion(generation: Generation): Boolean =
+        current === generation && !generation.isCancelled()
+}
+
+/**
+ * Associates each visible destination generation with exactly the discovery it created. Queued
+ * stale generations are cancelled before constructing provider-facing objects, and hiding closes
+ * only the active discovery for that generation.
+ */
+class RestoreDiscoverySession(
+    private val schedule: (() -> Unit) -> Unit,
+    private val createDiscovery: () -> RestoreLogDiscovery,
+    private val onResult: (RestoreDiscoveryResult) -> Unit,
+    private val deliver: ((() -> Unit) -> Unit) = { it() },
+    private val onFailure: (Throwable) -> RestoreDiscoveryResult = { failure ->
+        RestoreDiscoveryResult(
+            emptyList(),
+            listOf(
+                RestoreDiscoveryFailure(
+                    "selected folder",
+                    failure.message ?: "Discovery failed"
+                )
+            )
+        )
+    }
+) : AutoCloseable {
+    private data class Active(
+        val generation: RestoreDiscoveryVisibilityGate.Generation,
+        val discovery: RestoreLogDiscovery
+    )
+
+    private val lock = Any()
+    private val visibility = RestoreDiscoveryVisibilityGate()
+    private var active: Active? = null
+    private var closed = false
+
+    fun onVisible() {
+        val (generation, previous) = synchronized(lock) {
+            if (closed) return
+            val previous = active?.discovery
+            active = null
+            visibility.enterRestore() to previous
+        }
+        previous?.closeSafely()
+        try {
+            schedule { runGeneration(generation) }
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) throw failure
+            deliverResult(generation, onFailure(failure))
+        }
+    }
+
+    fun onHidden() {
+        val toClose = synchronized(lock) {
+            visibility.hideRestore()
+            active?.discovery.also { active = null }
+        }
+        toClose?.closeSafely()
+    }
+
+    override fun close() {
+        val toClose = synchronized(lock) {
+            if (closed) return
+            closed = true
+            visibility.hideRestore()
+            active?.discovery.also { active = null }
+        }
+        toClose?.closeSafely()
+    }
+
+    private fun runGeneration(generation: RestoreDiscoveryVisibilityGate.Generation) {
+        val cancellation = generation.cancellationToken()
+        if (generation.isCancelled()) return
+        val candidate = try {
+            createDiscovery()
+        } catch (failure: Throwable) {
+            if (failure is OptimizationCancelledException) return
+            if (failure.isVmFatal()) throw failure
+            deliverResult(generation, onFailure(failure))
+            return
+        }
+        val installed = synchronized(lock) {
+            if (closed || generation.isCancelled()) false
+            else {
+                active = Active(generation, candidate)
+                true
+            }
+        }
+        if (!installed) {
+            candidate.closeSafely()
+            return
+        }
+        val result = try {
+            candidate.discover(cancellation)
+        } catch (_: OptimizationCancelledException) {
+            return
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) throw failure
+            onFailure(failure)
+        } finally {
+            synchronized(lock) {
+                if (active?.generation === generation) active = null
+            }
+            candidate.closeSafely()
+        }
+        deliverResult(generation, result)
+    }
+
+    private fun deliverResult(
+        generation: RestoreDiscoveryVisibilityGate.Generation,
+        result: RestoreDiscoveryResult
+    ) {
+        deliver {
+            val accepted = synchronized(lock) {
+                !closed && visibility.acceptCompletion(generation)
+            }
+            if (accepted) onResult(result)
+        }
+    }
+
+    private fun RestoreLogDiscovery.closeSafely() {
+        try {
+            close()
+        } catch (failure: Throwable) {
+            if (failure.isVmFatal()) throw failure
+        }
+    }
 }
 
 /**
@@ -51,6 +187,7 @@ class RestoreLogDiscovery(
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
     private val activeInput = AtomicReference<InputStream?>(null)
+    private val activeInputLock = Any()
 
     fun discover(cancellation: CancellationToken = NeverCancelled): RestoreDiscoveryResult {
         checkOpen(cancellation)
@@ -61,15 +198,30 @@ class RestoreLogDiscovery(
             if (child.isDirectory || !isRecognizedUndoLogName(child.name)) return@forEach
             try {
                 val input = documentGateway.openRead(child)
-                activeInput.set(input)
-                val run = try {
-                    input.use {
-                        InputStreamReader(it, Charsets.UTF_8).use { reader ->
-                            undoLogs.readStreamingForRestore(reader, CancellationToken { checkOpen(cancellation) })
-                        }
+                try {
+                    synchronized(activeInputLock) {
+                        checkOpen(cancellation)
+                        activeInput.set(input)
                     }
+                } catch (failure: Throwable) {
+                    try {
+                        input.close()
+                    } catch (closeFailure: Throwable) {
+                        if (closeFailure.isVmFatal()) throw closeFailure
+                    }
+                    throw failure
+                }
+                var reader: InputStreamReader? = null
+                val run = try {
+                    reader = InputStreamReader(input, Charsets.UTF_8)
+                    undoLogs.readStreamingForRestore(
+                        reader,
+                        CancellationToken { checkOpen(cancellation) }
+                    )
                 } finally {
-                    activeInput.compareAndSet(input, null)
+                    if (activeInput.compareAndSet(input, null)) {
+                        (reader ?: input).close()
+                    }
                 }
                 validate(run)
                 runs += DiscoveredUndoLog(child.name, run)
@@ -88,7 +240,44 @@ class RestoreLogDiscovery(
 
     override fun close() {
         closed.set(true)
-        activeInput.getAndSet(null)?.close()
+        val input = synchronized(activeInputLock) { activeInput.getAndSet(null) }
+            ?: return
+        val completed = CountDownLatch(1)
+        val failure = AtomicReference<Throwable?>(null)
+        val fatalHandedToCloser = AtomicBoolean(false)
+        val closer = Thread(
+            {
+                var closeFailure: Throwable? = null
+                try {
+                    input.close()
+                } catch (caught: Throwable) {
+                    closeFailure = caught
+                    failure.set(caught)
+                } finally {
+                    completed.countDown()
+                }
+                closeFailure?.let { caught ->
+                    if (caught.isVmFatal() && fatalHandedToCloser.get()) throw caught
+                }
+            },
+            "FileForge-Restore-Discovery-Close"
+        ).apply { isDaemon = true }
+        try {
+            closer.start()
+        } catch (startFailure: Throwable) {
+            if (startFailure.isVmFatal()) throw startFailure
+            return
+        }
+        val finished = try {
+            completed.await(CLOSE_WAIT_MILLIS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!finished) fatalHandedToCloser.set(true)
+        failure.get()?.let { closeFailure ->
+            if (closeFailure.isVmFatal()) throw closeFailure
+        }
     }
 
     private fun checkOpen(cancellation: CancellationToken) {
@@ -105,6 +294,7 @@ class RestoreLogDiscovery(
         V2_NAME.matches(name) || LEGACY_NAME.matches(name)
 
     private companion object {
+        const val CLOSE_WAIT_MILLIS = 250L
         val V2_NAME = Regex("FileForge_Undo_v2_[^/\\\\]+\\.jsonl")
         val LEGACY_NAME = Regex("FileForge_Undo_(?!v2_)[^/\\\\]+\\.txt")
     }
