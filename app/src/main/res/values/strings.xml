@@ -18,7 +18,9 @@
     <string name="about_version_name">Version name: %1$s</string>
     <string name="about_version_code">Version code: %1$d</string>
     <string name="about_build_variant">Build variant: %1$s</string>
-    <string name="about_abi">ABI: %1$s</string>
+    <string name="about_distribution">Distribution: %1$s</string>
+    <string name="about_release_asset">Release asset: %1$s</string>
+    <string name="about_packaged_abi">Packaged ABI: %1$s</string>
     <string name="about_repository">Repository</string>
     <string name="about_issues">Issues</string>
     <string name="about_profile">GitHub profile</string>
@@ -34,6 +36,7 @@
     <string name="about_update_checking">Checking…</string>
     <string name="about_update_current">Current: %1$s</string>
     <string name="about_update_available">Update available: %1$s</string>
+    <string name="about_selected_asset">Selected asset: %1$s</string>
     <string name="about_update_no_release">No release found</string>
     <string name="about_update_offline">Offline</string>
     <string name="about_update_rate_limited">Rate limited</string>

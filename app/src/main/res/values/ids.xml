@@ -32,6 +32,7 @@
     <item name="restore_progress" type="id" />
     <item name="about_theme_group" type="id" />
     <item name="about_update_status" type="id" />
+    <item name="about_selected_asset" type="id" />
     <item name="about_check_updates" type="id" />
     <item name="about_view_release" type="id" />
 </resources>

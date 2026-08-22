@@ -40,10 +40,16 @@ class AboutScreenController(
         null
     }
     private val worker: Executor = fixture?.worker ?: ownedWorker!!
-    private val openLink: (String) -> Boolean = fixture?.openLink ?: ::openExternalLink
+    private val startIntent: (Intent) -> Boolean = fixture?.startIntent ?: ::startExternalIntent
     private val nativeInventory = fixture?.nativeInventory ?: UnavailableNativeToolInventory
+    private val buildMetadata = AboutBuildMetadata.fromGeneratedValues(
+        distribution = BuildConfig.DISTRIBUTION_VARIANT,
+        releaseAssetKind = BuildConfig.RELEASE_ASSET_KIND,
+        packagedAbi = BuildConfig.PACKAGED_ABI
+    )
     private lateinit var checkButton: MaterialButton
     private lateinit var updateStatus: TextView
+    private lateinit var selectedAssetStatus: TextView
     private lateinit var releaseButton: MaterialButton
     private var releaseUrl: String? = null
     private val updateSession: AboutUpdateSession
@@ -52,8 +58,8 @@ class AboutScreenController(
         view = buildView()
         val checker = fixture?.checker ?: GitHubLatestReleaseChecker(
             installedVersionName = BuildConfig.VERSION_NAME,
-            assetKind = ReleaseAssetKind.STANDARD,
-            transport = HttpUrlConnectionUpdateTransport()
+            assetKind = buildMetadata.releaseAssetKind,
+            transport = fixture?.transport ?: HttpUrlConnectionUpdateTransport()
         )
         updateSession = AboutUpdateSession(
             checker = checker,
@@ -99,8 +105,15 @@ class AboutScreenController(
             packageInfo.versionCode.toLong()
         }
         addText(activity.getString(R.string.about_version_code, versionCode))
-        addText(activity.getString(R.string.about_build_variant, "${BuildConfig.BUILD_TYPE} (standard)"))
-        addText(activity.getString(R.string.about_abi, Build.SUPPORTED_ABIS.firstOrNull() ?: "Unavailable"))
+        addText(activity.getString(R.string.about_build_variant, BuildConfig.BUILD_TYPE))
+        addText(activity.getString(R.string.about_distribution, buildMetadata.distribution))
+        addText(
+            activity.getString(
+                R.string.about_release_asset,
+                buildMetadata.releaseAssetKind.name.lowercase().replace('_', '-')
+            )
+        )
+        addText(activity.getString(R.string.about_packaged_abi, buildMetadata.packagedAbi))
         addLinkButton(R.string.about_repository, AboutLinks.REPOSITORY)
         addLinkButton(R.string.about_issues, AboutLinks.ISSUES)
         addLinkButton(R.string.about_profile, AboutLinks.PROFILE)
@@ -155,6 +168,12 @@ class AboutScreenController(
             setPadding(0, dp(8), 0, 0)
         }
         addView(updateStatus)
+        selectedAssetStatus = TextView(activity).apply {
+            id = R.id.about_selected_asset
+            visibility = View.GONE
+            setPadding(0, dp(4), 0, 0)
+        }
+        addView(selectedAssetStatus)
         checkButton = MaterialButton(activity).apply {
             id = R.id.about_check_updates
             setText(R.string.about_check_updates)
@@ -163,6 +182,7 @@ class AboutScreenController(
                 isEnabled = false
                 releaseUrl = null
                 releaseButton.visibility = View.GONE
+                selectedAssetStatus.visibility = View.GONE
                 updateStatus.setText(R.string.about_update_checking)
                 updateSession.checkNow()
             }
@@ -181,6 +201,7 @@ class AboutScreenController(
         checkButton.isEnabled = true
         releaseUrl = null
         releaseButton.visibility = View.GONE
+        selectedAssetStatus.visibility = View.GONE
         when (result) {
             is UpdateCheckResult.Current -> updateStatus.text =
                 activity.getString(R.string.about_update_current, result.latestVersion)
@@ -191,6 +212,13 @@ class AboutScreenController(
                 )
                 releaseUrl = result.releasePageUrl
                 releaseButton.visibility = View.VISIBLE
+                result.selectedAssetName?.let { assetName ->
+                    selectedAssetStatus.text = activity.getString(
+                        R.string.about_selected_asset,
+                        assetName
+                    )
+                    selectedAssetStatus.visibility = View.VISIBLE
+                }
             }
             UpdateCheckResult.NoRelease -> updateStatus.setText(R.string.about_update_no_release)
             UpdateCheckResult.Offline -> updateStatus.setText(R.string.about_update_offline)
@@ -199,10 +227,8 @@ class AboutScreenController(
         }
     }
 
-    private fun openExternalLink(url: String): Boolean = try {
-        activity.startActivity(
-            Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)
-        )
+    private fun startExternalIntent(intent: Intent): Boolean = try {
+        activity.startActivity(intent)
         true
     } catch (_: ActivityNotFoundException) {
         false
@@ -211,7 +237,10 @@ class AboutScreenController(
     }
 
     private fun launchLink(url: String) {
-        if (!openLink(url)) {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+            addCategory(Intent.CATEGORY_BROWSABLE)
+        }
+        if (!startIntent(intent)) {
             Snackbar.make(view, R.string.about_no_browser, Snackbar.LENGTH_LONG).show()
         }
     }
@@ -257,9 +286,10 @@ class AboutScreenController(
 }
 
 data class AboutScreenTestFixture(
-    val checker: LatestReleaseChecker,
+    val checker: LatestReleaseChecker?,
     val worker: Executor,
-    val openLink: ((String) -> Boolean)?,
+    val transport: UpdateHttpTransport?,
+    val startIntent: ((Intent) -> Boolean)?,
     val nativeInventory: NativeToolInventory
 )
 
@@ -267,12 +297,19 @@ object AboutScreenTestHooks {
     @Volatile private var fixture: AboutScreenTestFixture? = null
 
     fun install(
-        checker: LatestReleaseChecker,
         worker: Executor,
-        openLink: ((String) -> Boolean)? = null,
+        checker: LatestReleaseChecker? = null,
+        transport: UpdateHttpTransport? = null,
+        startIntent: ((Intent) -> Boolean)? = null,
         nativeInventory: NativeToolInventory = UnavailableNativeToolInventory
     ) {
-        fixture = AboutScreenTestFixture(checker, worker, openLink, nativeInventory)
+        fixture = AboutScreenTestFixture(
+            checker,
+            worker,
+            transport,
+            startIntent,
+            nativeInventory
+        )
     }
 
     fun clear() {

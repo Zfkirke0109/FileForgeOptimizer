@@ -112,7 +112,8 @@ data class UpdateHttpRequest(
     val connectTimeoutMillis: Int,
     val readTimeoutMillis: Int,
     val headers: Map<String, String>,
-    val maxResponseBytes: Int
+    val maxResponseBytes: Int,
+    val followRedirects: Boolean
 )
 
 open class UpdateHttpResponse(
@@ -232,7 +233,8 @@ class GitHubLatestReleaseChecker(
                 "X-GitHub-Api-Version" to API_VERSION,
                 "User-Agent" to "FileForgeOptimizer/$installedVersionName Android manual-update-check"
             ),
-            maxResponseBytes = MAX_RESPONSE_BYTES
+            maxResponseBytes = MAX_RESPONSE_BYTES,
+            followRedirects = false
         )
     }
 }
@@ -248,7 +250,7 @@ class HttpUrlConnectionUpdateTransport : UpdateHttpTransport, Closeable {
             connection.requestMethod = "GET"
             connection.connectTimeout = request.connectTimeoutMillis
             connection.readTimeout = request.readTimeoutMillis
-            connection.instanceFollowRedirects = false
+            connection.instanceFollowRedirects = request.followRedirects
             connection.useCaches = false
             request.headers.forEach { (name, value) -> connection.setRequestProperty(name, value) }
             val status = connection.responseCode

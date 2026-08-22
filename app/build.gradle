@@ -21,6 +21,9 @@ android {
         targetSdk 35
         versionCode 1
         versionName '0.1.0-mvp'
+        buildConfigField 'String', 'DISTRIBUTION_VARIANT', '"standard"'
+        buildConfigField 'String', 'RELEASE_ASSET_KIND', '"STANDARD"'
+        buildConfigField 'String', 'PACKAGED_ABI', '"none"'
     }
 
     compileOptions {
