@@ -20,7 +20,9 @@
 
     <style name="ThemeOverlay.FileForge.DynamicColors" parent="ThemeOverlay.Material3.DynamicColors.DayNight" />
 
-    <style name="ThemeOverlay.FileForge.Amoled" parent="">
+    <style name="ThemeOverlay.FileForge.Amoled" parent="@style/ThemeOverlay.FileForge.Amoled.Foundation" />
+
+    <style name="ThemeOverlay.FileForge.Amoled.Foundation" parent="">
         <item name="android:colorBackground">@color/fileforge_amoled_background</item>
         <item name="colorOnBackground">@color/fileforge_amoled_on_surface</item>
         <item name="colorSurface">@color/fileforge_amoled_background</item>
@@ -36,6 +38,5 @@
         <item name="android:statusBarColor">@color/fileforge_amoled_background</item>
         <item name="android:navigationBarColor">@color/fileforge_amoled_background</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:windowLightNavigationBar">false</item>
     </style>
 </resources>
