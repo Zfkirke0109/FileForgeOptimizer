@@ -2,6 +2,7 @@ package com.fileforge.optimizer
 
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.net.SocketTimeoutException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -45,6 +46,7 @@ class GitHubLatestReleaseCheckerTest {
         assertTrue(request.headers.getValue("User-Agent").contains("FileForgeOptimizer"))
         assertFalse(request.headers.keys.any { it.equals("Authorization", ignoreCase = true) })
         assertEquals(1_048_576, request.maxResponseBytes)
+        assertFalse(request.followRedirects)
     }
 
     @Test
@@ -100,6 +102,38 @@ class GitHubLatestReleaseCheckerTest {
         assertEquals("FileForgeOptimizer-standard.apk", standard.selectedAssetName)
         assertEquals("FileForgeOptimizer-native-arm64.apk", native.selectedAssetName)
         assertEquals("https://github.com/Zfkirke0109/FileForgeOptimizer/releases/tag/v2.0.0", standard.releasePageUrl)
+    }
+
+    @Test
+    fun timeoutIsOfflineAndRedirectsAreRejectedWithoutFollowingThem() {
+        val timeout = GitHubLatestReleaseChecker(
+            "1.0.0",
+            ReleaseAssetKind.STANDARD,
+            UpdateHttpTransport { throw SocketTimeoutException("read timed out") }
+        ).check()
+        assertEquals(UpdateCheckResult.Offline, timeout)
+
+        val redirectResponse = TrackingResponse(302, releaseJson("v2.0.0").toByteArray())
+        val redirect = GitHubLatestReleaseChecker(
+            "1.0.0",
+            ReleaseAssetKind.STANDARD,
+            UpdateHttpTransport { redirectResponse }
+        ).check()
+        assertEquals(UpdateCheckResult.Invalid, redirect)
+        assertTrue(redirectResponse.closed)
+    }
+
+    @Test
+    fun semanticVersionHandlesHugeCoreAndPrereleaseNumbersWithoutOverflow() {
+        val hugeCore = SemanticVersion.parse("999999999999999999999999999999.0.0")!!
+        val ordinaryCore = SemanticVersion.parse("2.0.0")!!
+        assertTrue(hugeCore > ordinaryCore)
+
+        val hugePrerelease = SemanticVersion.parse(
+            "1.0.0-beta.999999999999999999999999999999"
+        )!!
+        val ordinaryPrerelease = SemanticVersion.parse("1.0.0-beta.10")!!
+        assertTrue(hugePrerelease > ordinaryPrerelease)
     }
 
     private fun check(
