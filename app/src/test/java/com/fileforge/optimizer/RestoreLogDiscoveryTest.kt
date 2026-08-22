@@ -43,7 +43,7 @@ class RestoreLogDiscoveryTest {
     fun reportsRecognizedMalformedAndEmptyLogsIndividuallyWhileKeepingValidRunsAvailable() {
         val gateway = RecordingDocumentGateway().apply {
             put("FileForge_Undo_v2_good.jsonl", v2Log("good", "docs/keep.txt", 9, 3))
-            put("FileForge_Undo_v2_empty.jsonl", v2Header("empty"))
+            put("FileForge_Undo_v2_empty.jsonl", v2Header("empty").encodeToByteArray())
             put("FileForge_Undo_broken.txt", "not a FileForge undo log".encodeToByteArray())
             events.clear()
         }

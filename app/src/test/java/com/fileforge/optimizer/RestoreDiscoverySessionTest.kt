@@ -13,7 +13,7 @@ class RestoreDiscoverySessionTest {
         val queued = QueuedTasks()
         var creations = 0
         val gateway = RecordingDocumentGateway().apply {
-            put("FileForge_Undo_v2_queued.jsonl", v2Log("queued", "docs/queued.txt", 5, 2))
+            put("FileForge_Undo_v2_queued.jsonl", restoreV2Log("queued", "docs/queued.txt", 5, 2))
             events.clear()
         }
         val delivered = mutableListOf<RestoreDiscoveryResult>()
@@ -39,7 +39,7 @@ class RestoreDiscoverySessionTest {
     fun aStaleQueuedGenerationDoesNotCreateProviderWorkOrDuplicateTheCurrentResult() {
         val queued = QueuedTasks()
         val gateway = RecordingDocumentGateway().apply {
-            put("FileForge_Undo_v2_second.jsonl", v2Log("second", "docs/second.txt", 7, 3))
+            put("FileForge_Undo_v2_second.jsonl", restoreV2Log("second", "docs/second.txt", 7, 3))
             events.clear()
         }
         var creations = 0

@@ -17,10 +17,15 @@ import org.hamcrest.Matchers.not
 import org.hamcrest.Matchers.containsString
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.TimeUnit
 
 /** Exercises the Activity-owned restore presentation with an in-memory, no-write discovery seam. */
 @RunWith(AndroidJUnit4::class)
@@ -30,6 +35,7 @@ class RestoreScreenTest {
 
     @Before
     fun resetStateAndInstallSafeFixture() {
+        releasePendingRestoreClaim()
         context.getSharedPreferences("fileforge_optimize", Context.MODE_PRIVATE).edit().clear().commit()
         RunStateRepository.forAndroid(context).publish(RunState.Idle)
         RestoreScreenTestHooks.install(
@@ -41,6 +47,7 @@ class RestoreScreenTest {
     @After
     fun clearFixtureAndLeaveRepositoryIdle() {
         RestoreScreenTestHooks.clear()
+        releasePendingRestoreClaim()
         RunStateRepository.forAndroid(context).publish(RunState.Idle)
     }
 
@@ -272,6 +279,90 @@ class RestoreScreenTest {
             assertTrue(launches.isEmpty())
         }
     }
+
+    @Test
+    fun navigationAwayForwardsHiddenBeforeTheRealControllerQueuedDiscoveryCanApply() {
+        val blockerStarted = CountDownLatch(1)
+        val releaseBlocker = CountDownLatch(1)
+        val executorDrained = CountDownLatch(1)
+        lateinit var executor: ExecutorService
+        lateinit var session: RestoreDiscoverySession
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            onView(withId(R.id.navigation_restore)).perform(click())
+            scenario.onActivity { activity ->
+                val controller = privateField<RestoreScreenController>(activity, "restoreController")
+                executor = privateField(controller, "executor")
+                session = privateField(controller, "discoverySession")
+                executor.execute {
+                    blockerStarted.countDown()
+                    releaseBlocker.await(5, TimeUnit.SECONDS)
+                }
+                assertTrue(blockerStarted.await(1, TimeUnit.SECONDS))
+                session.onVisible()
+            }
+
+            onView(withId(R.id.navigation_about)).perform(click())
+            releaseBlocker.countDown()
+            executor.execute { executorDrained.countDown() }
+            assertTrue(executorDrained.await(1, TimeUnit.SECONDS))
+
+            scenario.onActivity { activity ->
+                val controller = privateField<RestoreScreenController>(activity, "restoreController")
+                val result = privateField<RestoreDiscoveryResult>(controller, "discoveryResult")
+                val visibility = privateField<RestoreDiscoveryVisibilityGate>(session, "visibility")
+                assertEquals(listOf("FileForge_Undo_v2_run-42.jsonl"), result.runs.map { it.undoLogId })
+                assertEquals(null, visibility.currentGeneration())
+            }
+        }
+    }
+
+    @Test
+    fun acceptedRestoreDispatchKeepsExactOwnershipAcrossRecreationAndRebindWithoutRedispatch() {
+        val launches = mutableListOf<ServiceRunRequest.Restore>()
+        RestoreScreenTestHooks.install(
+            selectedTree = SelectedTreeCapabilities.READ_WRITE_DIRECTORY,
+            discovery = restoreFixture(),
+            startRestore = launches::add
+        )
+
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            onView(withId(R.id.navigation_restore)).perform(click())
+            onView(withContentDescription("Select photos/holiday.jpg")).perform(click())
+            onView(withId(R.id.restore_selected)).perform(click())
+            onView(withId(android.R.id.button1)).perform(click())
+            val acceptedClaim = ProcessRestoreLaunchOwnership.instance.current()
+
+            assertNotNull(acceptedClaim)
+            assertEquals(1, launches.size)
+            RunStateRepository.forAndroid(context).publish(
+                RunState.Running(
+                    ProgressSnapshot("restoring", filesDiscovered = 1),
+                    dryRun = false,
+                    operationKind = RunOperationKind.RESTORE
+                )
+            )
+            scenario.recreate()
+
+            assertSame(acceptedClaim, ProcessRestoreLaunchOwnership.instance.current())
+            assertEquals(1, launches.size)
+            onView(withId(R.id.navigation_restore)).perform(click())
+            onView(withId(R.id.restore_selected)).check(matches(not(isEnabled())))
+        }
+    }
+
+    private fun releasePendingRestoreClaim() {
+        ProcessRestoreLaunchOwnership.instance.current()?.let {
+            ProcessRestoreLaunchOwnership.instance.onServiceCompleted(it)
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> privateField(target: Any, name: String): T =
+        target.javaClass.getDeclaredField(name).run {
+            isAccessible = true
+            get(target) as T
+        }
 
     private fun restoreFixture(): RestoreDiscoveryResult = RestoreDiscoveryResult(
         runs = listOf(

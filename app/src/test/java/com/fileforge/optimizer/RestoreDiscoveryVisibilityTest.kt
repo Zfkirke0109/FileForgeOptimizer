@@ -36,7 +36,7 @@ class RestoreDiscoveryVisibilityTest {
         val gate = RestoreDiscoveryVisibilityGate()
         val generation = gate.enterRestore()
         val gateway = RecordingDocumentGateway().apply {
-            put("FileForge_Undo_v2_queued.jsonl", v2Log("queued", "docs/queued.txt", 5, 2))
+            put("FileForge_Undo_v2_queued.jsonl", restoreV2Log("queued", "docs/queued.txt", 5, 2))
             events.clear()
         }
         gate.hideRestore()
