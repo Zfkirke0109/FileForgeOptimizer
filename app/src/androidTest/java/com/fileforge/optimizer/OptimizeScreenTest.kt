@@ -64,7 +64,7 @@ class OptimizeScreenTest {
             onView(allOf(withId(R.id.placeholder_title), withText("Restore")))
                 .check(matches(isDisplayed()))
             onView(withId(R.id.navigation_about)).perform(click())
-            onView(allOf(withId(R.id.placeholder_title), withText("About")))
+            onView(withText("Created by Zachary Kirke"))
                 .check(matches(isDisplayed()))
             onView(withId(R.id.navigation_optimize)).perform(click())
             onView(withId(R.id.start_optimization)).perform(scrollTo()).check(matches(isDisplayed()))
