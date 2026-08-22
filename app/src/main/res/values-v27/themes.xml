@@ -2,7 +2,7 @@
 <resources>
     <style
         name="ThemeOverlay.FileForge.Amoled"
-        parent="@style/ThemeOverlay.FileForge.Amoled.Foundation">
+        parent="@style/FileForge_Amoled_Foundation">
         <item name="android:windowLightNavigationBar">false</item>
     </style>
 </resources>

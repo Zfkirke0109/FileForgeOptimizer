@@ -20,9 +20,9 @@
 
     <style name="ThemeOverlay.FileForge.DynamicColors" parent="ThemeOverlay.Material3.DynamicColors.DayNight" />
 
-    <style name="ThemeOverlay.FileForge.Amoled" parent="@style/ThemeOverlay.FileForge.Amoled.Foundation" />
+    <style name="ThemeOverlay.FileForge.Amoled" parent="@style/FileForge_Amoled_Foundation" />
 
-    <style name="ThemeOverlay.FileForge.Amoled.Foundation" parent="">
+    <style name="FileForge_Amoled_Foundation" parent="">
         <item name="android:colorBackground">@color/fileforge_amoled_background</item>
         <item name="colorOnBackground">@color/fileforge_amoled_on_surface</item>
         <item name="colorSurface">@color/fileforge_amoled_background</item>
