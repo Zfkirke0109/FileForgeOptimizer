@@ -36,5 +36,6 @@
         <item name="android:statusBarColor">@color/fileforge_amoled_background</item>
         <item name="android:navigationBarColor">@color/fileforge_amoled_background</item>
         <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
     </style>
 </resources>

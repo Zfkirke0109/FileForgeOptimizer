@@ -18,7 +18,7 @@ class GitHubLatestReleaseCheckerTest {
         )
         assertTrue(SemanticVersion.parse("1.0.0")!! > SemanticVersion.parse("1.0.0-rc.1")!!)
         assertTrue(SemanticVersion.parse("1.0.0-beta.11")!! > SemanticVersion.parse("1.0.0-beta.2")!!)
-        assertTrue(SemanticVersion.parse("1.0.0-beta.2")!! > SemanticVersion.parse("1.0.0-beta.alpha")!!)
+        assertTrue(SemanticVersion.parse("1.0.0-beta.2")!! < SemanticVersion.parse("1.0.0-beta.alpha")!!)
         assertNull(SemanticVersion.parse("1.2"))
         assertNull(SemanticVersion.parse("release-1.2.3"))
         assertNull(SemanticVersion.parse("1.0.0-01"))

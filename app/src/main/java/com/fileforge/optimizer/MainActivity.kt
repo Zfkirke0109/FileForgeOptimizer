@@ -13,14 +13,12 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.bottomnavigation.BottomNavigationView
-import com.google.android.material.card.MaterialCardView
 
 class MainActivity : AppCompatActivity() {
     private lateinit var toolbar: MaterialToolbar
@@ -28,6 +26,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bottomNavigation: BottomNavigationView
     private lateinit var optimizeController: OptimizeScreenController
     private lateinit var restoreController: RestoreScreenController
+    private lateinit var aboutController: AboutScreenController
     private var currentDestination: Int = R.id.navigation_optimize
     private var activityVisible = false
     private var serviceBinder: OptimizationBinder? = null
@@ -106,6 +105,7 @@ class MainActivity : AppCompatActivity() {
                 ?: { request -> OptimizationService.start(this, request) },
             cancelRun = serviceSession::cancel
         )
+        aboutController = AboutScreenController(this)
         buildMaterialHost()
     }
 
@@ -132,6 +132,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         optimizeController.close()
         restoreController.close()
+        aboutController.close()
         super.onDestroy()
     }
 
@@ -196,9 +197,8 @@ class MainActivity : AppCompatActivity() {
             }
             R.id.navigation_about -> {
                 toolbar.setTitle(R.string.navigation_about)
-                contentContainer.addView(
-                    placeholder(R.string.about_placeholder_title, R.string.about_placeholder_body)
-                )
+                (aboutController.view.parent as? ViewGroup)?.removeView(aboutController.view)
+                contentContainer.addView(aboutController.view)
             }
             else -> {
                 toolbar.setTitle(R.string.navigation_optimize)
@@ -207,32 +207,6 @@ class MainActivity : AppCompatActivity() {
                 if (activityVisible) optimizeController.onVisible()
             }
         }
-    }
-
-    private fun placeholder(title: Int, body: Int): View = FrameLayout(this).apply {
-        val margin = dp(16)
-        addView(
-            MaterialCardView(this@MainActivity).apply {
-                val content = LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(20), dp(20), dp(20), dp(20))
-                    addView(TextView(this@MainActivity).apply {
-                        id = R.id.placeholder_title
-                        setText(title)
-                        textSize = 22f
-                    })
-                    addView(TextView(this@MainActivity).apply {
-                        setText(body)
-                        setPadding(0, dp(8), 0, 0)
-                    })
-                }
-                addView(content)
-            },
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(margin, margin, margin, margin) }
-        )
     }
 
     private fun applySystemBarInsets(root: View) {

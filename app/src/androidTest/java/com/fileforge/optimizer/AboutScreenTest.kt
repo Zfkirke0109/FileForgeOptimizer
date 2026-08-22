@@ -149,8 +149,11 @@ class AboutScreenTest {
 
     private fun View.descendants(): Sequence<View> = sequence {
         yield(this@descendants)
-        if (this@descendants is ViewGroup) {
-            for (index in 0 until childCount) yieldAll(getChildAt(index).descendants())
+        val group = this@descendants as? ViewGroup
+        if (group != null) {
+            for (index in 0 until group.childCount) {
+                yieldAll(group.getChildAt(index).descendants())
+            }
         }
     }
 }
