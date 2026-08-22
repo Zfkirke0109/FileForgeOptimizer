@@ -562,6 +562,42 @@ class OptimizationServiceControllerTest {
     }
 
     @Test
+    fun acceptedRestoreCommandReplaysRunningStateToAReboundClientWithoutRedispatch() {
+        val fixture = Fixture()
+        val ownership = RestoreLaunchOwnership()
+        val request = restoreRequest("undo-rebind")
+        val router = OptimizationServiceCommandRouter(
+            fixture.controller,
+            stopIdleService = {},
+            restoreOwnership = ownership
+        )
+        val claim = checkNotNull(ownership.tryClaim(request))
+        val originalStates = mutableListOf<RunState>()
+        val originalListener: (RunState) -> Unit = originalStates::add
+        fixture.controller.binding.addListener(originalListener)
+
+        router.onCommand(
+            OptimizationServiceContract.ACTION_RESTORE,
+            OptimizationServiceRequestCodec.encode(request).extras +
+                (OptimizationServiceContract.EXTRA_RESTORE_CLAIM_ID to claim.id)
+        )
+        fixture.controller.binding.removeListener(originalListener)
+        val reboundStates = mutableListOf<RunState>()
+        fixture.controller.binding.addListener(reboundStates::add)
+
+        val replay = reboundStates.last() as RunState.Running
+        assertEquals(RunOperationKind.RESTORE, replay.operationKind)
+        assertTrue(ownership.current() === claim)
+        assertEquals(1, fixture.runtime.pendingTaskCount)
+        assertTrue(fixture.runtime.requests.isEmpty())
+
+        fixture.runtime.runNext()
+
+        assertEquals(listOf(request), fixture.runtime.requests)
+        assertNull(ownership.current())
+    }
+
+    @Test
     fun cancellationBeforeRestoreRuntimeStartsRetainsTheConfirmedSelectedEntryDenominator() {
         val fixture = Fixture()
         val request = ServiceRunRequest.Restore(

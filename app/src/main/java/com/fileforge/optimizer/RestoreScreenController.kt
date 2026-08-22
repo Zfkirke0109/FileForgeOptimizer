@@ -347,13 +347,7 @@ class RestoreScreenController(
                 ) ?: return@setPositiveButton
                 render()
                 try {
-                    val testStart = testFixture?.startRestore
-                    if (testStart != null) {
-                        testStart(request)
-                        ProcessRestoreLaunchOwnership.instance.onDispatchFailed(claim)
-                    } else {
-                        startRestore(request)
-                    }
+                    startRestore(request)
                 } catch (failure: Throwable) {
                     ProcessRestoreLaunchOwnership.instance.onDispatchFailed(claim)
                     if (failure.isVmFatal()) throw failure

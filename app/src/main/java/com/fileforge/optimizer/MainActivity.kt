@@ -99,9 +99,11 @@ class MainActivity : AppCompatActivity() {
             cancelRun = serviceSession::cancel,
             observationWatermark = { observationSequencer.watermark }
         )
+        val restoreStartTransport = RestoreScreenTestHooks.snapshot()?.startRestore
         restoreController = RestoreScreenController(
             activity = this,
-            startRestore = { request -> OptimizationService.start(this, request) },
+            startRestore = restoreStartTransport
+                ?: { request -> OptimizationService.start(this, request) },
             cancelRun = serviceSession::cancel
         )
         buildMaterialHost()

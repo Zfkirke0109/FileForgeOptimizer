@@ -318,7 +318,7 @@ class RestoreScreenTest {
     }
 
     @Test
-    fun acceptedRestoreDispatchKeepsExactOwnershipAcrossRecreationAndRebindWithoutRedispatch() {
+    fun successfulControllerDispatchKeepsExactOwnershipAcrossRecreationWithoutRedispatch() {
         val launches = mutableListOf<ServiceRunRequest.Restore>()
         RestoreScreenTestHooks.install(
             selectedTree = SelectedTreeCapabilities.READ_WRITE_DIRECTORY,

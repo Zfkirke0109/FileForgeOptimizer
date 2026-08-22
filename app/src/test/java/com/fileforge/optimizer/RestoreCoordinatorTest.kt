@@ -181,7 +181,12 @@ class RestoreCoordinatorTest {
         val report = coordinator.restore(run, RestoreSelection.All, cancellation)
 
         assertEquals(RunStatus.CANCELLED, report.status)
-        assertEquals(listOf("docs/a.zip"), report.entries.map { it.relativePath })
+        assertEquals(listOf("docs/a.zip", "docs/b.zip"), report.entries.map { it.relativePath })
+        assertEquals(
+            listOf(RestoreEntryStatus.RESTORED, RestoreEntryStatus.UNPROCESSED_CANCELLED),
+            report.entries.map { it.status }
+        )
+        assertEquals(2, report.selectedCount)
         assertFalse(gateway.events.any { it == "write:root/docs/b.zip" })
         assertEquals(1, receipt.names.size)
     }
@@ -275,7 +280,12 @@ class RestoreCoordinatorTest {
         val report = coordinator.restore(run, RestoreSelection.All, token)
 
         assertEquals(RunStatus.CANCELLED, report.status)
-        assertEquals(listOf("docs/a.zip"), report.entries.map { it.relativePath })
+        assertEquals(listOf("docs/a.zip", "docs/b.zip"), report.entries.map { it.relativePath })
+        assertEquals(
+            listOf(RestoreEntryStatus.RESTORED, RestoreEntryStatus.UNPROCESSED_CANCELLED),
+            report.entries.map { it.status }
+        )
+        assertEquals(2, report.selectedCount)
         assertEquals(backupA.toList(), gateway.contents("docs/a.zip").toList())
         assertFalse(gateway.events.any { it == "write:root/docs/b.zip" })
         assertEquals(1, receipt.names.size)
