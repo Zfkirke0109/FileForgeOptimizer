@@ -3,6 +3,7 @@ package com.fileforge.optimizer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -58,6 +59,31 @@ class OptimizationServiceRequestCodecTest {
                 request,
                 OptimizationServiceRequestCodec.decode(encoded.action, encoded.extras)
             )
+        }
+    }
+
+    @Test
+    fun restoreEncodingKeepsAllCompactAndRejectsOversizedIndividualSubsetsBeforeBinderDispatch() {
+        val all = ServiceRunRequest.Restore(
+            treeUri = "content://tree/root",
+            undoLogId = "FileForge_Undo_v2_large.jsonl",
+            selection = RestoreSelection.All
+        )
+        val tooMany = all.copy(
+            selection = RestoreSelection.Entries((0 until 20_000).mapTo(linkedSetOf()) { "docs/$it.txt" })
+        )
+        val tooLarge = all.copy(
+            selection = RestoreSelection.Entries(setOf("docs/${"x".repeat(600_000)}.txt"))
+        )
+
+        val encodedAll = OptimizationServiceRequestCodec.encode(all)
+
+        assertEquals(all, OptimizationServiceRequestCodec.decode(encodedAll.action, encodedAll.extras))
+        assertThrows(IllegalArgumentException::class.java) {
+            OptimizationServiceRequestCodec.encode(tooMany)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            OptimizationServiceRequestCodec.encode(tooLarge)
         }
     }
 

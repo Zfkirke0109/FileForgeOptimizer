@@ -407,6 +407,203 @@ class OptimizationServiceControllerTest {
     }
 
     @Test
+    fun routerReleasesOnlyTheRejectedIncomingRestoreClaimWhileAnActiveRunAndNewerClaimRemainOwned() {
+        val fixture = Fixture()
+        val ownership = RestoreLaunchOwnership()
+        val request = restoreRequest("undo-active-rejection")
+        val router = OptimizationServiceCommandRouter(
+            fixture.controller,
+            stopIdleService = {},
+            restoreOwnership = ownership
+        )
+        assertTrue(fixture.controller.onStartCommand(optimizeRequest()).accepted)
+        val rejectedClaim = checkNotNull(ownership.tryClaim(request))
+
+        router.onCommand(
+            OptimizationServiceContract.ACTION_RESTORE,
+            OptimizationServiceRequestCodec.encode(request).extras
+        )
+
+        assertNull(ownership.current())
+        assertTrue(fixture.controller.hasActiveRun())
+        val newerClaim = checkNotNull(ownership.tryClaim(request))
+        ownership.onServiceCompleted(rejectedClaim)
+        assertTrue(ownership.current() === newerClaim)
+    }
+
+    @Test
+    fun routerReleasesTheMatchingRestoreClaimWhenForegroundEntryFailsBeforeWorkerScheduling() {
+        val fixture = Fixture()
+        val ownership = RestoreLaunchOwnership()
+        val request = restoreRequest("undo-foreground-failure")
+        val router = OptimizationServiceCommandRouter(
+            fixture.controller,
+            stopIdleService = {},
+            restoreOwnership = ownership
+        )
+        fixture.runtime.foregroundFailure = IllegalStateException("synthetic foreground failure")
+        val claim = checkNotNull(ownership.tryClaim(request))
+
+        router.onCommand(
+            OptimizationServiceContract.ACTION_RESTORE,
+            OptimizationServiceRequestCodec.encode(request).extras
+        )
+
+        assertNull(ownership.current())
+        assertFalse(fixture.controller.hasActiveRun())
+        assertTrue(fixture.runtime.requests.isEmpty())
+        ownership.onServiceCompleted(claim)
+        assertNull(ownership.current())
+    }
+
+    @Test
+    fun routerReleasesTheMatchingRestoreClaimWhenExecutorRejectsBeforeRuntimeRun() {
+        val fixture = Fixture()
+        val ownership = RestoreLaunchOwnership()
+        val request = restoreRequest("undo-executor-failure")
+        val router = OptimizationServiceCommandRouter(
+            fixture.controller,
+            stopIdleService = {},
+            restoreOwnership = ownership
+        )
+        fixture.runtime.executeFailure = IllegalStateException("synthetic executor failure")
+        val claim = checkNotNull(ownership.tryClaim(request))
+
+        router.onCommand(
+            OptimizationServiceContract.ACTION_RESTORE,
+            OptimizationServiceRequestCodec.encode(request).extras
+        )
+
+        assertNull(ownership.current())
+        assertFalse(fixture.controller.hasActiveRun())
+        assertTrue(fixture.runtime.requests.isEmpty())
+        ownership.onServiceCompleted(claim)
+        assertNull(ownership.current())
+    }
+
+    @Test
+    fun routerReleasesTheCapturedRestoreClaimWhenTimeoutFinishesBeforeRuntimeRun() {
+        val fixture = Fixture()
+        val ownership = RestoreLaunchOwnership()
+        val request = restoreRequest("undo-timeout-before-run")
+        val router = OptimizationServiceCommandRouter(
+            fixture.controller,
+            stopIdleService = {},
+            restoreOwnership = ownership
+        )
+        val claim = checkNotNull(ownership.tryClaim(request))
+
+        router.onCommand(
+            OptimizationServiceContract.ACTION_RESTORE,
+            OptimizationServiceRequestCodec.encode(request).extras
+        )
+        fixture.controller.onTimeout()
+
+        assertNull(ownership.current())
+        assertTrue(fixture.runtime.requests.isEmpty())
+        ownership.onServiceCompleted(claim)
+        assertNull(ownership.current())
+    }
+
+    @Test
+    fun routerReleasesTheCapturedRestoreClaimAfterNormalCompletion() {
+        val fixture = Fixture()
+        val ownership = RestoreLaunchOwnership()
+        val request = restoreRequest("undo-normal-completion")
+        val router = OptimizationServiceCommandRouter(
+            fixture.controller,
+            stopIdleService = {},
+            restoreOwnership = ownership
+        )
+        val claim = checkNotNull(ownership.tryClaim(request))
+
+        router.onCommand(
+            OptimizationServiceContract.ACTION_RESTORE,
+            OptimizationServiceRequestCodec.encode(request).extras
+        )
+        fixture.runtime.runNext()
+
+        assertNull(ownership.current())
+        assertEquals(listOf(request), fixture.runtime.requests)
+        ownership.onServiceCompleted(claim)
+        assertNull(ownership.current())
+    }
+
+    @Test
+    fun cancellationBeforeRestoreRuntimeStartsRetainsTheConfirmedSelectedEntryDenominator() {
+        val fixture = Fixture()
+        val request = ServiceRunRequest.Restore(
+            treeUri = "content://tree/restore",
+            undoLogId = "undo-cancel-before-run",
+            selection = RestoreSelection.Entries(setOf("docs/a.txt", "photos/b.jpg"))
+        )
+
+        assertTrue(fixture.controller.onStartCommand(request).accepted)
+        assertTrue(fixture.controller.cancelActive())
+        fixture.runtime.runNext()
+
+        val terminal = fixture.repository.currentState as RunState.Terminal
+        assertEquals(RunStatus.CANCELLED, terminal.report.status)
+        assertEquals(2, terminal.report.scanned)
+        assertEquals(2, terminal.report.errors)
+    }
+
+    @Test
+    fun restoreSetupFailureRetainsTheConfirmedSelectedEntryDenominatorBeforeCoordinatorConstruction() {
+        val fixture = Fixture()
+        fixture.runtime.executeFailure = IllegalStateException("synthetic executor failure")
+        val request = ServiceRunRequest.Restore(
+            treeUri = "content://tree/restore",
+            undoLogId = "undo-setup-failure",
+            selection = RestoreSelection.Entries(setOf("docs/a.txt", "photos/b.jpg", "videos/c.mp4"))
+        )
+
+        assertFalse(fixture.controller.onStartCommand(request).accepted)
+
+        val terminal = fixture.repository.currentState as RunState.Terminal
+        assertEquals(RunStatus.FAILED, terminal.report.status)
+        assertEquals(3, terminal.report.scanned)
+        assertEquals(3, terminal.report.errors)
+    }
+
+    @Test
+    fun restoreTimeoutBeforeRuntimeStartsRetainsTheConfirmedSelectedEntryDenominator() {
+        val fixture = Fixture()
+        val request = ServiceRunRequest.Restore(
+            treeUri = "content://tree/restore",
+            undoLogId = "undo-timeout-scope",
+            selection = RestoreSelection.Entries(setOf("a", "b", "c", "d"))
+        )
+
+        assertTrue(fixture.controller.onStartCommand(request).accepted)
+        fixture.controller.onTimeout()
+
+        val terminal = fixture.repository.currentState as RunState.Terminal
+        assertEquals(RunStatus.CANCELLED, terminal.report.status)
+        assertEquals(4, terminal.report.scanned)
+        assertEquals(4, terminal.report.errors)
+    }
+
+    @Test
+    fun restoreAllSetupFailureReportsThatTheEntryDenominatorIsUnknownInsteadOfInventingZeroScope() {
+        val fixture = Fixture()
+        fixture.runtime.executeFailure = IllegalStateException("synthetic executor failure")
+        val request = ServiceRunRequest.Restore(
+            treeUri = "content://tree/restore",
+            undoLogId = "undo-all-unknown-scope",
+            selection = RestoreSelection.All
+        )
+
+        assertFalse(fixture.controller.onStartCommand(request).accepted)
+
+        val terminal = fixture.repository.currentState as RunState.Terminal
+        assertEquals(RunStatus.FAILED, terminal.report.status)
+        assertEquals(0, terminal.report.scanned)
+        assertEquals(0, terminal.report.errors)
+        assertTrue(terminal.report.terminalFailures.any { it.contains("scope count unavailable", ignoreCase = true) })
+    }
+
+    @Test
     fun routingSeamCancelsActiveRunButStopsIdleServiceForValidCancel() {
         val activeFixture = Fixture()
         val activeStopRequests = AtomicInteger()
@@ -740,6 +937,7 @@ class OptimizationServiceControllerTest {
         val foregroundStates = mutableListOf<RunState.Running>()
         val detailedNotificationPermissions = mutableListOf<Boolean>()
         val progressToEmit = mutableListOf<ProgressSnapshot>()
+        var foregroundFailure: Throwable? = null
         var executeFailure: Throwable? = null
         var runFailure: Throwable? = null
         val runEntered = CountDownLatch(1)
@@ -760,6 +958,7 @@ class OptimizationServiceControllerTest {
             events += "foreground"
             foregroundStates += initialState
             detailedNotificationPermissions += detailedNotificationsAllowed
+            foregroundFailure?.let { throw it }
         }
 
         override fun execute(task: () -> Unit) {
@@ -867,6 +1066,12 @@ class OptimizationServiceControllerTest {
                 apkLabMode = false,
                 textMinify = true
             )
+        )
+
+        fun restoreRequest(undoLogId: String) = ServiceRunRequest.Restore(
+            treeUri = "content://tree/restore",
+            undoLogId = undoLogId,
+            selection = RestoreSelection.All
         )
 
         fun runningState(sequence: Int): RunState.Running = RunState.Running(

@@ -8,6 +8,7 @@ import androidx.test.espresso.action.ViewActions.click
 import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
 import androidx.test.espresso.matcher.ViewMatchers.isEnabled
+import androidx.test.espresso.matcher.ViewMatchers.isChecked
 import androidx.test.espresso.matcher.ViewMatchers.withContentDescription
 import androidx.test.espresso.matcher.ViewMatchers.withId
 import androidx.test.espresso.matcher.ViewMatchers.withText
@@ -16,6 +17,7 @@ import org.hamcrest.Matchers.not
 import org.hamcrest.Matchers.containsString
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -112,6 +114,22 @@ class RestoreScreenTest {
     }
 
     @Test
+    fun recreationDoesNotCopyOneDynamicEntryCheckboxStateOntoAnotherEntry() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            onView(withId(R.id.navigation_restore)).perform(click())
+            onView(withContentDescription("Select photos/holiday.jpg")).perform(click())
+
+            scenario.recreate()
+
+            onView(withContentDescription("Select docs/report.txt"))
+                .check(matches(not(isChecked())))
+            onView(withContentDescription("Select docs/report.txt")).perform(click())
+            onView(withId(R.id.restore_selected)).perform(click())
+            onView(withText("Restore 1 file?")).check(matches(isDisplayed()))
+        }
+    }
+
+    @Test
     fun restoreLaunchUsesServiceRestoreRequestWithTheSelectedEntryOnly() {
         val launches = mutableListOf<ServiceRunRequest.Restore>()
         RestoreScreenTestHooks.install(
@@ -184,19 +202,74 @@ class RestoreScreenTest {
 
     @Test
     fun selectAllTargetsTheChosenRunCardInsteadOfAlwaysTheFirstRun() {
+        val launches = mutableListOf<ServiceRunRequest.Restore>()
         val second = restoreFixture().runs.single().copy(
             undoLogId = "FileForge_Undo_v2_second.jsonl",
             run = restoreFixture().runs.single().run.copy(header = UndoHeader("second", "2026-08-13T20:00:00Z"))
         )
         RestoreScreenTestHooks.install(
             SelectedTreeCapabilities.READ_WRITE_DIRECTORY,
-            RestoreDiscoveryResult(restoreFixture().runs + second, emptyList())
+            RestoreDiscoveryResult(restoreFixture().runs + second, emptyList()),
+            startRestore = launches::add
         )
         ActivityScenario.launch(MainActivity::class.java).use {
             onView(withId(R.id.navigation_restore)).perform(click())
             onView(withContentDescription("Select all from second")).perform(click())
             onView(withId(R.id.restore_selected)).perform(click())
             onView(withText("Restore 2 files?")).check(matches(isDisplayed()))
+            onView(withId(android.R.id.button1)).perform(click())
+
+            assertEquals(
+                ServiceRunRequest.Restore(
+                    treeUri = "content://test/selected-root",
+                    undoLogId = "FileForge_Undo_v2_second.jsonl",
+                    selection = RestoreSelection.All
+                ),
+                launches.single()
+            )
+        }
+    }
+
+    @Test
+    fun synchronousRestoreStartFailureReleasesTheClaimAndShowsAnErrorWithoutCrashing() {
+        RestoreScreenTestHooks.install(
+            SelectedTreeCapabilities.READ_WRITE_DIRECTORY,
+            restoreFixture(),
+            startRestore = { throw IllegalStateException("synthetic start failure") }
+        )
+        ActivityScenario.launch(MainActivity::class.java).use {
+            onView(withId(R.id.navigation_restore)).perform(click())
+            onView(withContentDescription("Select photos/holiday.jpg")).perform(click())
+            onView(withId(R.id.restore_selected)).perform(click())
+            onView(withId(android.R.id.button1)).perform(click())
+
+            onView(withText(containsString("synthetic start failure"))).check(matches(isDisplayed()))
+            onView(withId(R.id.restore_selected)).check(matches(isEnabled()))
+        }
+    }
+
+    @Test
+    fun oversizedIndividualSelectionFailsVisiblyWithoutDispatchOrWideningToAll() {
+        val hugePath = "docs/${"x".repeat(600_000)}.txt"
+        val run = restoreFixture().runs.single()
+        val hugeEntry = run.run.entries.first().copy(
+            relativePath = hugePath,
+            backupPath = "FileForge_Backups_run-42/$hugePath"
+        )
+        val launches = mutableListOf<ServiceRunRequest.Restore>()
+        RestoreScreenTestHooks.install(
+            SelectedTreeCapabilities.READ_WRITE_DIRECTORY,
+            RestoreDiscoveryResult(listOf(run.copy(run = run.run.copy(entries = listOf(hugeEntry)))), emptyList()),
+            startRestore = launches::add
+        )
+        ActivityScenario.launch(MainActivity::class.java).use {
+            onView(withId(R.id.navigation_restore)).perform(click())
+            onView(withContentDescription("Select $hugePath")).perform(click())
+            onView(withId(R.id.restore_selected)).perform(click())
+            onView(withId(android.R.id.button1)).perform(click())
+
+            onView(withText(containsString("too large"))).check(matches(isDisplayed()))
+            assertTrue(launches.isEmpty())
         }
     }
 

@@ -124,6 +124,74 @@ class RestoreLogDiscoveryTest {
     }
 
     @Test
+    fun closingDiscoveryIsBoundedWhenAProviderCloseFails() {
+        val delegate = RecordingDocumentGateway()
+        val stream = CloseFailingBlockingInputStream()
+        val log = DocumentNode("close-fails", "FileForge_Undo_v2_close-fails.jsonl", isDirectory = false, length = 0)
+        val gateway = object : DocumentGateway by delegate {
+            override fun list(node: DocumentNode): List<DocumentNode> = listOf(log)
+            override fun openRead(node: DocumentNode): InputStream = stream
+        }
+        val discovery = RestoreLogDiscovery(gateway, delegate.root)
+        val worker = Thread {
+            try {
+                discovery.discover()
+            } catch (_: OptimizationCancelledException) {
+                // Hiding the destination must remain safe even if the provider's close is broken.
+            }
+        }
+        worker.start()
+        assertTrue(stream.started.await(1, TimeUnit.SECONDS))
+
+        val closeReturned = CountDownLatch(1)
+        val closeFailure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        Thread {
+            try {
+                discovery.close()
+            } catch (failure: Throwable) {
+                closeFailure.set(failure)
+            } finally {
+                closeReturned.countDown()
+            }
+        }.apply { isDaemon = true }.start()
+
+        assertTrue("close blocked navigation", closeReturned.await(1, TimeUnit.SECONDS))
+        assertTrue("nonfatal provider close escaped", closeFailure.get() == null)
+        worker.join(1_000)
+        assertFalse(worker.isAlive)
+    }
+
+    @Test
+    fun closingDiscoveryStillRethrowsVmFatalProviderFailures() {
+        val delegate = RecordingDocumentGateway()
+        val stream = FatalCloseBlockingInputStream()
+        val log = DocumentNode("fatal-close", "FileForge_Undo_v2_fatal-close.jsonl", isDirectory = false, length = 0)
+        val gateway = object : DocumentGateway by delegate {
+            override fun list(node: DocumentNode): List<DocumentNode> = listOf(log)
+            override fun openRead(node: DocumentNode): InputStream = stream
+        }
+        val discovery = RestoreLogDiscovery(gateway, delegate.root)
+        val worker = Thread {
+            try {
+                discovery.discover()
+            } catch (_: OptimizationCancelledException) {
+                // The active read has still been released even though close is fatal.
+            }
+        }
+        worker.start()
+        assertTrue(stream.started.await(1, TimeUnit.SECONDS))
+
+        try {
+            discovery.close()
+            throw AssertionError("Expected VM-fatal close failure")
+        } catch (failure: OutOfMemoryError) {
+            assertEquals("synthetic fatal provider close failure", failure.message)
+        }
+        worker.join(1_000)
+        assertFalse(worker.isAlive)
+    }
+
+    @Test
     fun cardProjectionShowsRunScopeVerificationAndSaturatesRecoverableBytes() {
         val run = UndoRun(
             header = UndoHeader("overflow-run", "2026-08-13T19:42:00Z"),
@@ -201,6 +269,38 @@ class RestoreLogDiscoveryTest {
         override fun close() {
             closed.countDown()
             released.countDown()
+        }
+    }
+
+    private class CloseFailingBlockingInputStream : InputStream() {
+        val started = CountDownLatch(1)
+        private val released = CountDownLatch(1)
+
+        override fun read(): Int {
+            started.countDown()
+            released.await(5, TimeUnit.SECONDS)
+            return -1
+        }
+
+        override fun close() {
+            released.countDown()
+            throw IllegalStateException("synthetic provider close failure")
+        }
+    }
+
+    private class FatalCloseBlockingInputStream : InputStream() {
+        val started = CountDownLatch(1)
+        private val released = CountDownLatch(1)
+
+        override fun read(): Int {
+            started.countDown()
+            released.await(5, TimeUnit.SECONDS)
+            return -1
+        }
+
+        override fun close() {
+            released.countDown()
+            throw OutOfMemoryError("synthetic fatal provider close failure")
         }
     }
 }

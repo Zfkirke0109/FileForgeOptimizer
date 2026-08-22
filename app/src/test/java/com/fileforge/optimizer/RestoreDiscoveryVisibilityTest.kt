@@ -1,6 +1,8 @@
 package com.fileforge.optimizer
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -27,5 +29,21 @@ class RestoreDiscoveryVisibilityTest {
 
         assertTrue(!gate.acceptCompletion(stale))
         assertTrue(gate.acceptCompletion(current))
+    }
+
+    @Test
+    fun hiddenGenerationCancelsQueuedDiscoveryBeforeItOpensAnyProviderDocument() {
+        val gate = RestoreDiscoveryVisibilityGate()
+        val generation = gate.enterRestore()
+        val gateway = RecordingDocumentGateway().apply {
+            put("FileForge_Undo_v2_queued.jsonl", v2Log("queued", "docs/queued.txt", 5, 2))
+            events.clear()
+        }
+        gate.hideRestore()
+
+        assertThrows(OptimizationCancelledException::class.java) {
+            RestoreLogDiscovery(gateway, gateway.root).discover(generation.cancellationToken())
+        }
+        assertFalse(gateway.events.any { it.startsWith("read:") })
     }
 }
