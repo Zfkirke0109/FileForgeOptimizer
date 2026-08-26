@@ -65,7 +65,7 @@ class NativeToolRegistryTest {
     }
 
     @Test
-    fun jpegPolicyChangesOnlyMetadataCopyModeForAggressiveRuns() =
+    fun jpegPolicyPreservesRenderingMetadataInEveryMode() =
         withRegistry("jpegtran", descriptorJson("jpegtran", "libfileforge_jpegtran.so", "IJG-AND-BSD-3-Clause")) { registry, root ->
             val input = File(root, "input.jpg")
             val output = File(root, "output.jpg")
@@ -74,8 +74,8 @@ class NativeToolRegistryTest {
             val aggressive = registry.commandFor(NativeToolId.JPEGTRAN, input, output, OptimizeMode.AGGRESSIVE)
 
             assertTrue("all" in safe)
-            assertTrue("none" in aggressive)
-            assertEquals(safe.filterNot { it == "all" }, aggressive.filterNot { it == "none" })
+            assertTrue("all" in aggressive)
+            assertEquals(safe, aggressive)
         }
 
     private fun withRegistry(id: String, descriptor: String, block: (NativeToolRegistry, File) -> Unit) =

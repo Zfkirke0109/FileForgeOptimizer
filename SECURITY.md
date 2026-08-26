@@ -16,7 +16,7 @@ Do not test against data or devices you do not own or have permission to assess.
 
 - FileForge uses SAF-scoped access and does not request root or all-files access.
 - Candidate files are created in app-private storage and must be smaller, structurally valid, and the same detected type before commit.
-- A real replacement requires a verified backup, post-write verification, and a durable undo record.
+- A real replacement requires a verified backup and a durable, identity-bound undo record before the original is opened for writing, followed by post-write verification.
 - Restore is bound to the exact selected v2 undo-log snapshot and to the current optimized document version. Legacy undo logs are view-only because they do not carry the identity and integrity metadata required for safe mutation.
 - Signed PDFs and animated PNGs are preserved on the native path.
 - Native commands are selected from a strict manifest; user-controlled paths are passed as process arguments, never interpolated into a shell command.

@@ -254,7 +254,9 @@ private class SharedPreferencesRunStateStorage(context: Context) : RunStateStora
     override fun read(): String? = preferences.getString(TERMINAL_STATE_KEY, null)
 
     override fun write(json: String) {
-        preferences.edit().putString(TERMINAL_STATE_KEY, json).apply()
+        check(preferences.edit().putString(TERMINAL_STATE_KEY, json).commit()) {
+            "Could not persist terminal run state"
+        }
     }
 
     private companion object {

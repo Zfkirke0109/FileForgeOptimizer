@@ -40,7 +40,7 @@ class ByteArrayOptimizerAdapterHardeningTest {
     }
 
     @Test
-    fun durableUndoFailureAfterNonZipReplacementReturnsObservableRollbackAndRestoresOriginal() {
+    fun durableUndoFailureAbortsNonZipReplacementBeforeOriginalMutation() {
         val gateway = RecordingDocumentGateway()
         val original = "%PDF-1.4\n%%EOF\ntrailing".toByteArray()
         val node = gateway.put("document.pdf", original)
@@ -56,8 +56,10 @@ class ByteArrayOptimizerAdapterHardeningTest {
             adapter.process(node, "document.pdf", FileKind.PDF, realRun, NeverCancelled)
         }
 
-        assertEquals(RollbackResult.Restored, failure.rollback)
+        assertEquals(RollbackResult.NotNeeded, failure.rollback)
         assertEquals(original.toList(), gateway.contents("document.pdf").toList())
+        assertEquals(original.toList(), gateway.contents("FileForge_Backups_run-1/document.pdf").toList())
+        assertTrue(gateway.events.none { it == "write:root/document.pdf" })
     }
 
     @Test

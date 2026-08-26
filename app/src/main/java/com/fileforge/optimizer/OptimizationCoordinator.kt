@@ -393,7 +393,8 @@ class OptimizationCoordinator(
         var backup: BackupArtifact? = null
         var originalIntegrity: StreamIntegrity? = null
         var originalMutationStarted = false
-        var transactionDurable = false
+        var mutationCommitted = false
+        var undoDurable = false
         var undoAppendStarted = false
         return try {
             val backupPath = backupPath(context.runId, relativePath)
@@ -408,23 +409,18 @@ class OptimizationCoordinator(
             check(verifiedBackup == originalSnapshot) { "Backup verification failed" }
             check(originalSnapshot == candidateSource) { "Original changed after candidate generation" }
 
-            cancellation.throwIfCancelled()
-            originalMutationStarted = true
-            val writtenCandidate = candidate.openInputStream().use { source ->
-                documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, cancellation) }
+            val expectedCandidate = candidate.openInputStream().use { source ->
+                StreamIntegrityChecker.hash(source, cancellation)
             }
-            val verifiedOriginal = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, cancellation) }
-            check(verifiedOriginal == writtenCandidate) { "Optimized document verification failed" }
-
             undoAppendStarted = true
             context.undoEntrySink.appendAndFlush(
                 UndoEntry(
                     relativePath = relativePath,
                     originalBytes = originalSnapshot.bytes,
-                    optimizedBytes = writtenCandidate.bytes,
+                    optimizedBytes = expectedCandidate.bytes,
                     backupPath = backupPath,
                     originalSha256 = originalSnapshot.sha256,
-                    optimizedSha256 = writtenCandidate.sha256,
+                    optimizedSha256 = expectedCandidate.sha256,
                     note = note,
                     fileKind = kind,
                     toolId = toolId,
@@ -432,20 +428,36 @@ class OptimizationCoordinator(
                     originalDocumentId = original.id
                 )
             )
-            transactionDurable = true
+            undoDurable = true
+
+            cancellation.throwIfCancelled()
+            val liveOriginal = documentGateway.openRead(original).use { source ->
+                StreamIntegrityChecker.hash(source, cancellation)
+            }
+            check(liveOriginal == originalSnapshot) { "Original changed immediately before replacement" }
+            cancellation.throwIfCancelled()
+            originalMutationStarted = true
+            val writtenCandidate = candidate.openInputStream().use { source ->
+                documentGateway.openWrite(original).use { destination -> StreamIntegrityChecker.copyAndHash(source, destination, cancellation) }
+            }
+            val verifiedOriginal = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, cancellation) }
+            check(writtenCandidate == expectedCandidate && verifiedOriginal == expectedCandidate) {
+                "Optimized document verification failed"
+            }
+            mutationCommitted = true
             FileOutcome.Optimized(relativePath, originalSnapshot.bytes, writtenCandidate.bytes, toolId, note)
         } catch (failure: Throwable) {
             val rollbackBackup = backup?.file
             val rollbackIntegrity = originalIntegrity
-            if (!originalMutationStarted) {
+            if (!originalMutationStarted && !undoAppendStarted) {
                 backup?.let { backupTree.cleanupBeforeOriginalMutation(it, failure) }
             }
-            val rollback = if (originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null) {
+            val rollback = if (originalMutationStarted && !mutationCommitted && rollbackBackup != null && rollbackIntegrity != null) {
                 restoreBackup(original, rollbackBackup, rollbackIntegrity)
             } else {
                 RollbackResult.NotNeeded
             }
-            if (undoAppendStarted && !transactionDurable) {
+            if (undoAppendStarted && !undoDurable) {
                 throw poisonedUndoFailure(failure, rollback)
             }
             val fatal = fatalPrimary(failure, rollback)

@@ -48,7 +48,7 @@ class OptimizerEngineTransactionHardeningTest {
     }
 
     @Test
-    fun failedEmergencyRollbackIsStructuredCriticalAndLeavesPoisonedLogUnfinalized() =
+    fun poisonedUndoEntryStopsBeforeOriginalMutationAndLeavesLogUnfinalized() =
         withEngine(realRun) { gateway, engine, _ ->
             gateway.put("a-first.zip", zipFixture)
             gateway.put("b-second.zip", zipFixture)
@@ -59,10 +59,9 @@ class OptimizerEngineTransactionHardeningTest {
             val durable = gateway.readDurableUndo()
 
             assertEquals(RunStatus.FAILED, report.status)
-            assertTrue(report.rollbackFailure!!.contains("emergency rollback write failed"))
-            assertTrue(report.terminalError!!.contains("critical", ignoreCase = true))
-            assertTrue(report.terminalError!!.contains("rollback", ignoreCase = true))
-            assertTrue(report.terminalFailures.any { it.contains("emergency rollback write failed") })
+            assertEquals(null, report.rollbackFailure)
+            assertTrue(report.terminalError!!.contains("undo", ignoreCase = true))
+            assertTrue(gateway.mutations.none { it == "open-write:a-first.zip" })
             assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.zip") })
             assertTrue(gateway.mutations.none { it == "open-write:b-second.zip" })
             assertEquals(0, gateway.undoWritesAfterPoison)

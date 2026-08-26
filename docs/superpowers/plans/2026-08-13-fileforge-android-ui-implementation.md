@@ -173,7 +173,7 @@ Call `startForegroundService` from the activity, call `startForeground` immediat
 
 - [ ] **Step 4: Implement Android 15 timeout and manifest rules**
 
-Declare `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MEDIA_PROCESSING`, and `POST_NOTIFICATIONS`. Declare the non-exported service with `android:foregroundServiceType="mediaProcessing"`. Override API-35 timeout handling to cancel, publish an actionable failure/cancel summary, and stop promptly.
+Declare `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC`, `FOREGROUND_SERVICE_MEDIA_PROCESSING`, and `POST_NOTIFICATIONS`. Declare the non-exported service with `android:foregroundServiceType="dataSync|mediaProcessing"`; request `dataSync` before API 35 and `mediaProcessing` on API 35+. Override API-35 timeout handling to cancel, publish an actionable failure/cancel summary, and stop promptly.
 
 - [ ] **Step 5: Compile instrumentation tests and commit**
 

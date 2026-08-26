@@ -22,7 +22,7 @@ The core engine:
 3. Processes ZIP-family files through a strict forward-only streaming optimizer with fixed-size buffers and app-private candidates.
 4. Routes PNG, JPEG, and PDF through a verified native tool when the native-arm64 variant can do so safely; otherwise it uses the bounded Kotlin adapter.
 5. Verifies every candidate and accepts it only when it is smaller and remains the same format.
-6. In a real run, streams and verifies a backup before replacing the original, verifies the replacement, and durably appends a v2 undo record.
+6. In a real run, streams and verifies a backup, durably journals the verified candidate before opening the original for replacement, then verifies the replacement.
 7. Emits immutable progress snapshots and a terminal report without depending on an activity.
 
 ZIP-family processing has no whole-archive RAM guard: archives are never converted into one complete byte array. The 64 MiB input limit applies to the Kotlin PNG, JPEG, PDF, JSON, XML, SVG, and TXT optimizers. Native PDF/image processing stages input and output in app-private storage instead of loading the whole document into memory.
@@ -43,7 +43,7 @@ FileForge verifies the name, type, and resolved identity returned by SAF creatio
 
 The undo reader accepts v2 JSONL and the legacy text format. Only v2 entries containing SHA-256 hashes and the original SAF document identity are selectable for automatic restore; legacy size-only records remain visible as recovery references but cannot authorize a write. Confirmation is bound to the exact undo-log identity, entry count, and raw-byte SHA-256. Before writing, FileForge also verifies that the current document still matches the recorded optimized version, then verifies the backup and the restored original. Real restore attempts create independent `FileForge_Restore_*` audit receipts without deleting backups or undo logs.
 
-If an undo entry write or flush fails, FileForge treats that writer as poisoned: it restores the current original, stops the run, and leaves the log conservatively interrupted without appending more records. Recoverable provider and orchestration errors return a terminal failed report and attempt a failed terminal record when the writer is healthy. VM-fatal failures (`OutOfMemoryError`, `StackOverflowError`, and `ThreadDeath`) are rethrown after best-effort cleanup, with secondary finalization failures attached rather than masking the primary.
+If an undo entry write or flush fails, FileForge treats that writer as poisoned, stops before mutating that file, preserves the verified backup because record durability may be ambiguous, and leaves the log conservatively interrupted without appending more records. Once the entry is durable, the verified backup remains recoverable even if the process dies during replacement; an entry whose original was never changed is handled idempotently. Recoverable provider and orchestration errors return a terminal failed report and attempt a failed terminal record when the writer is healthy. VM-fatal failures (`OutOfMemoryError`, `StackOverflowError`, and `ThreadDeath`) are rethrown after best-effort cleanup, with secondary finalization failures attached rather than masking the primary.
 
 ## Modes and formats
 

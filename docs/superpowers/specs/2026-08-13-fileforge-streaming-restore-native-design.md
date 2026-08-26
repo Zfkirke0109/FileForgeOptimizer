@@ -47,7 +47,7 @@ Views use Material Components rather than introducing a Compose migration in the
 The service:
 
 - enters the foreground immediately with a low-importance notification channel;
-- uses the `mediaProcessing` foreground-service type on supported Android versions;
+- uses the `mediaProcessing` foreground-service type on API 35+ and the compatible `dataSync` type on older supported Android versions;
 - exposes immutable progress snapshots through a local binder;
 - updates the notification at a throttled cadence rather than once per buffer;
 - provides a Cancel notification action;
@@ -84,7 +84,7 @@ The scanner opens each file only long enough to read a small header. ZIP-family 
 
 `StreamingZipOptimizer` reads a `ZipInputStream` and writes a `ZipOutputStream` backed by an app-private temporary file. It preserves directory entries and safe metadata needed for compatibility, normalizes only fields deliberately covered by the selected mode, and rejects malformed entry names such as absolute paths or parent traversal.
 
-The implementation uses a fixed-size transfer buffer. Output size is measured from the candidate file. ZIP64-capable platform APIs are used where the archive requires them. Empty archives and archives with unsupported or malformed structures are reported without modifying the original.
+The implementation uses a fixed-size transfer buffer. Output size is measured from the candidate file. Entry count, decoded-name bytes, inflated work, candidate bytes, and retained central-directory metadata all have explicit bounds. Empty archives are treated as unchanged; ZIP64, encrypted, path-aliasing, metadata-loss, and malformed structures are rejected without modifying the original.
 
 ### Real run commit
 
@@ -93,10 +93,10 @@ For each candidate that is smaller and verified:
 1. Stream the original to its unique backup path.
 2. Flush and hash the backup.
 3. Confirm the backup size and SHA-256 match the original read.
-4. Stream the candidate to the original SAF document.
-5. Reopen and verify the committed document.
-6. If verification fails, immediately attempt restoration from the verified backup.
-7. Append and flush one completed v2 undo record only after successful replacement.
+4. Hash the verified candidate and append and flush its identity-bound v2 recovery record.
+5. Rehash the live original immediately before replacement and require it to match the backup snapshot.
+6. Stream the candidate to the original SAF document.
+7. Reopen and verify the committed document; if writing or verification fails, immediately attempt restoration from the verified backup.
 
 Failures are isolated per file. A failed file increments the report error count and does not stop the remaining run unless the user cancels or the engine encounters a run-wide invariant failure.
 
@@ -143,7 +143,7 @@ Each subsequent line is an independent record containing:
 - optimizer/tool identifier;
 - note and completion timestamp.
 
-Records are appended and flushed after each committed replacement. Paths are JSON strings, so characters that break the legacy pipe-delimited format are preserved correctly.
+Records are appended and flushed after backup and candidate verification but before the original is opened for replacement. This makes a process death during the write recoverable; a record whose mutation never began is safely idempotent. Paths are JSON strings, so characters that break the legacy pipe-delimited format are preserved correctly.
 
 `UndoLogRepository` also parses the existing `FileForge_Undo_*.txt` layout. Legacy records without hashes remain visible for manual recovery reference, but the Restore UI labels them view-only and does not allow them to authorize a document write.
 
@@ -182,7 +182,7 @@ Native sources are pinned by version or commit and verified by checksum in CI. B
 | PDF | qpdf | Lossless structural and stream optimization without image resampling |
 | PNG | oxipng | Default lossless PNG optimization |
 | PNG aggressive | zopflipng | Optional slower candidate; used only when it preserves configured chunks and beats the other verified candidate |
-| JPEG | jpegtran | Lossless coefficient/Huffman optimization; metadata policy follows Safe or Aggressive mode |
+| JPEG | jpegtran | Lossless coefficient/Huffman optimization while preserving EXIF, ICC, and other application markers in every mode |
 | APK Lab | zipalign | Alignment after ZIP processing; signature-invalidating warning remains mandatory |
 
 The native APK never assumes a tool is usable. `NativeToolRegistry` checks the manifest and executable path at runtime. `NativeToolRunner` uses fixed argument templates, private staging paths, captured output, cancellation, and per-tool timeouts. Missing tools, nonzero exits, timeouts, malformed output, or candidates that are not smaller trigger the Kotlin fallback or a clear skip. Originals are not touched until the common verifier and transaction layer accepts a candidate.

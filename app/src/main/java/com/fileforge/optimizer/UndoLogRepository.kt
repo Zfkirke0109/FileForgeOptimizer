@@ -29,7 +29,7 @@ data class UndoEntry(
     val originalSha256: String?,
     val note: String,
     val verificationLevel: UndoVerificationLevel = UndoVerificationLevel.SHA_256,
-    val optimizedSha256: String? = originalSha256,
+    val optimizedSha256: String?,
     val fileKind: FileKind = FileKind.UNSUPPORTED,
     val toolId: String = "unknown",
     val completedAt: String = "unknown",

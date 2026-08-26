@@ -150,6 +150,11 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "qpdf cross configuration cannot discover host pkg-config libraries" {
+  run grep -F -- 'PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$qpdf_pkgconfig_dir"' "$REPO_ROOT/scripts/build-native-tools.sh"
+  [ "$status" -eq 0 ]
+}
+
 @test "zipalign shim provides the AOSP log include and fatal macros" {
   [ -f "$REPO_ROOT/native/zipalign-shim/include/log/log.h" ]
   grep -Fq 'LOG_FATAL_IF' "$REPO_ROOT/native/zipalign-shim/include/utils/Log.h"

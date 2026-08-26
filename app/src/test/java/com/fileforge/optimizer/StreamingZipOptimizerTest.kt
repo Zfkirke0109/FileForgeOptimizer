@@ -69,7 +69,7 @@ class StreamingZipOptimizerTest {
 
     @Test
     fun rejectsWindowsDriveAndUncAbsoluteEntries() {
-        listOf("C:\\outside.txt", "\\\\server\\share\\outside.txt").forEach { name ->
+        listOf("C:\\outside.txt", "C:outside.txt", "\\\\server\\share\\outside.txt").forEach { name ->
             val zip = zipBytes(fileEntry(name, "no".toByteArray()))
 
             assertThrows(UnsafeArchivePathException::class.java) {
@@ -88,12 +88,13 @@ class StreamingZipOptimizerTest {
     }
 
     @Test
-    fun rejectsArchiveWithNoEntriesDuringVerification() {
+    fun acceptsValidEmptyArchiveAsAnUnchangedContainer() {
         val emptyArchive = ByteArrayOutputStream().also { ZipOutputStream(it).use { } }.toByteArray()
 
-        assertThrows(ZipException::class.java) {
-            optimizer.verify(emptyArchive.inputStream(), NeverCancelled)
-        }
+        val verification = optimizer.verify(emptyArchive.inputStream(), NeverCancelled)
+
+        assertEquals(0, verification.entries)
+        assertEquals(0L, verification.bytesRead)
     }
 
     @Test
@@ -117,6 +118,17 @@ class StreamingZipOptimizerTest {
 
         assertEquals(2, verification.entries)
         assertEquals(11L, verification.bytesRead)
+    }
+
+    @Test
+    fun verificationAcceptsABoundedCentralDirectoryLargerThanTheLegacyTail() {
+        val entries = Array(5_000) { index -> fileEntry("entry-$index.txt", byteArrayOf()) }
+        val zip = zipBytes(*entries)
+
+        val verification = optimizer.verify(zip.inputStream(), NeverCancelled)
+
+        assertEquals(entries.size, verification.entries)
+        assertEquals(0L, verification.bytesRead)
     }
 
     @Test
@@ -167,6 +179,37 @@ class StreamingZipOptimizerTest {
                 OptimizeMode.SAFE,
                 NeverCancelled
             ) {}
+        }
+    }
+
+    @Test
+    fun verificationRejectsExecutableUnixAttributesThatCannotBePreserved() {
+        val executable = transformCentralDirectory(
+            zipBytes(fileEntry("script.sh", "echo safe".toByteArray()))
+        ) { central ->
+            central.clone().also {
+                writeShort(it, CENTRAL_DIRECTORY_VERSION_MADE_BY, (UNIX_PLATFORM shl 8) or 20)
+                writeInt(it, CENTRAL_DIRECTORY_EXTERNAL_ATTRIBUTES, UNIX_REGULAR_EXECUTABLE.toLong() shl 16)
+            }
+        }
+
+        assertThrows(UnsupportedZipFeatureException::class.java) {
+            optimizer.verify(executable.inputStream(), NeverCancelled)
+        }
+    }
+
+    @Test
+    fun optimizationRejectsUnicodePathExtraThatCanAliasTheValidatedName() {
+        val source = zipBytes(
+            fileEntry(
+                "safe.txt",
+                "payload".toByteArray(),
+                extra = unicodePathExtra("safe.txt", "../escape.txt")
+            )
+        )
+
+        assertThrows(UnsupportedZipFeatureException::class.java) {
+            optimizer.optimize(source.inputStream(), ByteArrayOutputStream(), OptimizeMode.SAFE, NeverCancelled) {}
         }
     }
 
@@ -483,6 +526,32 @@ class StreamingZipOptimizerTest {
         }
     }
 
+    @Test
+    fun rejectsArchivesWhoseEntryCountExceedsTheConfiguredMetadataLimit() {
+        val limited = StreamingZipOptimizer(maxEntries = 1)
+        val archive = zipBytes(
+            fileEntry("one.txt", byteArrayOf()),
+            fileEntry("two.txt", byteArrayOf())
+        )
+
+        assertThrows(ArchiveResourceLimitException::class.java) {
+            limited.optimize(archive.inputStream(), ByteArrayOutputStream(), OptimizeMode.SAFE, NeverCancelled) {}
+        }
+        assertThrows(ArchiveResourceLimitException::class.java) {
+            limited.verify(archive.inputStream(), NeverCancelled)
+        }
+    }
+
+    @Test
+    fun rejectsArchivesWhoseRememberedNamesExceedTheConfiguredMetadataLimit() {
+        val limited = StreamingZipOptimizer(maxNameBytes = 8)
+        val archive = zipBytes(fileEntry("123456789.txt", byteArrayOf()))
+
+        assertThrows(ArchiveResourceLimitException::class.java) {
+            limited.verify(archive.inputStream(), NeverCancelled)
+        }
+    }
+
     private data class EntryFixture(
         val name: String,
         val contents: ByteArray,
@@ -504,6 +573,19 @@ class StreamingZipOptimizerTest {
 
     private fun fileEntry(name: String, contents: ByteArray, extra: ByteArray? = null, time: Long? = null) =
         EntryFixture(name, contents, extra = extra, time = time)
+
+    private fun unicodePathExtra(originalName: String, alternateName: String): ByteArray {
+        val original = originalName.toByteArray(Charsets.UTF_8)
+        val alternate = alternateName.toByteArray(Charsets.UTF_8)
+        val crc = CRC32().apply { update(original) }.value
+        return ByteArrayOutputStream().also { output ->
+            writeShort(output, UNICODE_PATH_EXTRA_ID)
+            writeShort(output, 1 + 4 + alternate.size)
+            output.write(1)
+            writeInt(output, crc)
+            output.write(alternate)
+        }.toByteArray()
+    }
 
     private fun zipBytes(vararg entries: EntryFixture): ByteArray {
         val output = ByteArrayOutputStream()
@@ -798,11 +880,16 @@ class StreamingZipOptimizerTest {
     private companion object {
         const val EOCD_BYTES = 22
         const val CENTRAL_DIRECTORY_FIXED_BYTES = 46
+        const val CENTRAL_DIRECTORY_VERSION_MADE_BY = 4
+        const val CENTRAL_DIRECTORY_EXTERNAL_ATTRIBUTES = 38
         const val CENTRAL_DIRECTORY_LOCAL_OFFSET = 42
         const val CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50L
         const val CENTRAL_DIRECTORY_DIGITAL_SIGNATURE = 0x05054b50L
         const val EOCD_SIGNATURE = 0x06054b50L
         const val ZIP64_SENTINEL = 0xffffffffL
+        const val UNIX_PLATFORM = 3
+        const val UNIX_REGULAR_EXECUTABLE = 0x81ed
+        const val UNICODE_PATH_EXTRA_ID = 0x7075
         val testExtra = byteArrayOf(0x34, 0x12, 0x01, 0x00, 0x7f)
     }
 }

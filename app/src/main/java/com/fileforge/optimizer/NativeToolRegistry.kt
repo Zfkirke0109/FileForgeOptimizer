@@ -58,7 +58,7 @@ class NativeToolRegistry(
             )
             NativeToolId.JPEGTRAN -> listOf(
                 executable.absolutePath,
-                "-copy", if (mode == OptimizeMode.AGGRESSIVE) "none" else "all",
+                "-copy", "all",
                 "-optimize", "-progressive", "-outfile", outputPath, inputPath
             )
             NativeToolId.ZOPFLIPNG -> listOf(

@@ -176,6 +176,12 @@ class NativeDocumentOptimizerTest {
             assertEquals("qpdf", undo.entries.single().toolId)
             assertEquals(original.sha256(), undo.entries.single().originalSha256)
             assertEquals(optimized.sha256(), undo.entries.single().optimizedSha256)
+            gateway.events.assertOrdered(
+                "read:root/FileForge_Backups_$RUN_ID/document.pdf",
+                "undo-entry-appended-and-flushed",
+                "read:root/document.pdf",
+                "write:root/document.pdf"
+            )
             assertEquals(emptyList<String>(), cache.list().orEmpty().sorted())
         } finally {
             cache.deleteRecursively()

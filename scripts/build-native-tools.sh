@@ -35,6 +35,8 @@ command -v cargo-ndk >/dev/null || { echo "cargo-ndk is required" >&2; exit 1; }
 bash "$repo_root/scripts/fetch-native-sources.sh" --verify-only
 rm -rf "$build_root"
 mkdir -p "$build_root" "$output_dir" "$asset_dir/licenses"
+qpdf_pkgconfig_dir="$build_root/empty-pkgconfig"
+mkdir -p "$qpdf_pkgconfig_dir"
 find "$output_dir" -maxdepth 1 -type f -name '*.so' -delete
 find "$asset_dir/licenses" -maxdepth 1 -type f -delete
 
@@ -61,7 +63,8 @@ cmake -S "$source_root/zopflipng" -B "$build_root/zopflipng" "${common_cmake[@]}
   -DBUILD_SHARED_LIBS=OFF -DZOPFLI_BUILD_INSTALL=OFF
 cmake --build "$build_root/zopflipng" --target zopflipng
 
-cmake -S "$source_root/qpdf" -B "$build_root/qpdf" "${common_cmake[@]}" \
+env PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$qpdf_pkgconfig_dir" \
+  cmake -S "$source_root/qpdf" -B "$build_root/qpdf" "${common_cmake[@]}" \
   -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_DOC=OFF \
   -DINSTALL_MANUAL=OFF -DINSTALL_EXAMPLES=OFF -DINSTALL_PKGCONFIG=OFF \
   -DINSTALL_CMAKE_PACKAGE=OFF -DUSE_IMPLICIT_CRYPTO=OFF -DALLOW_CRYPTO_NATIVE=ON \

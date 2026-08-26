@@ -396,7 +396,8 @@ private class NativeCandidateCommitter(private val documentGateway: DocumentGate
         var backup: BackupArtifact? = null
         var originalIntegrity: StreamIntegrity? = null
         var originalMutationStarted = false
-        var transactionDurable = false
+        var mutationCommitted = false
+        var undoDurable = false
         var undoAppendStarted = false
         return try {
             val backupPath = backupPath(context.runId, relativePath)
@@ -414,6 +415,32 @@ private class NativeCandidateCommitter(private val documentGateway: DocumentGate
             }
             check(verifiedBackup == expectedOriginal) { "Backup verification failed" }
 
+            val expectedCandidate = candidate.openInputStream().use { source ->
+                StreamIntegrityChecker.hash(source, cancellation)
+            }
+            undoAppendStarted = true
+            context.undoEntrySink.appendAndFlush(
+                UndoEntry(
+                    relativePath = relativePath,
+                    originalBytes = expectedOriginal.bytes,
+                    optimizedBytes = expectedCandidate.bytes,
+                    backupPath = backupPath,
+                    originalSha256 = expectedOriginal.sha256,
+                    optimizedSha256 = expectedCandidate.sha256,
+                    note = note,
+                    fileKind = kind,
+                    toolId = toolId,
+                    completedAt = context.completedAt(),
+                    originalDocumentId = original.id
+                )
+            )
+            undoDurable = true
+
+            cancellation.throwIfCancelled()
+            val liveOriginal = documentGateway.openRead(original).use { source ->
+                StreamIntegrityChecker.hash(source, cancellation)
+            }
+            check(liveOriginal == expectedOriginal) { "Original changed immediately before replacement" }
             cancellation.throwIfCancelled()
             originalMutationStarted = true
             val writtenCandidate = candidate.openInputStream().use { source ->
@@ -424,34 +451,21 @@ private class NativeCandidateCommitter(private val documentGateway: DocumentGate
             val verifiedOriginal = documentGateway.openRead(original).use {
                 StreamIntegrityChecker.hash(it, cancellation)
             }
-            check(verifiedOriginal == writtenCandidate) { "Optimized document verification failed" }
-
-            undoAppendStarted = true
-            context.undoEntrySink.appendAndFlush(
-                UndoEntry(
-                    relativePath = relativePath,
-                    originalBytes = expectedOriginal.bytes,
-                    optimizedBytes = writtenCandidate.bytes,
-                    backupPath = backupPath,
-                    originalSha256 = expectedOriginal.sha256,
-                    optimizedSha256 = writtenCandidate.sha256,
-                    note = note,
-                    fileKind = kind,
-                    toolId = toolId,
-                    completedAt = context.completedAt(),
-                    originalDocumentId = original.id
-                )
-            )
-            transactionDurable = true
+            check(writtenCandidate == expectedCandidate && verifiedOriginal == expectedCandidate) {
+                "Optimized document verification failed"
+            }
+            mutationCommitted = true
             FileOutcome.Optimized(relativePath, expectedOriginal.bytes, writtenCandidate.bytes, toolId, note)
         } catch (failure: Throwable) {
             val rollbackBackup = backup?.file
             val rollbackIntegrity = originalIntegrity
-            if (!originalMutationStarted) backup?.let { backupTree.cleanupBeforeOriginalMutation(it, failure) }
+            if (!originalMutationStarted && !undoAppendStarted) {
+                backup?.let { backupTree.cleanupBeforeOriginalMutation(it, failure) }
+            }
             val rollback = if (
-                originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null
+                originalMutationStarted && !mutationCommitted && rollbackBackup != null && rollbackIntegrity != null
             ) restoreBackup(original, rollbackBackup, rollbackIntegrity) else RollbackResult.NotNeeded
-            if (undoAppendStarted && !transactionDurable) throw poisonedUndoFailure(failure, rollback)
+            if (undoAppendStarted && !undoDurable) throw poisonedUndoFailure(failure, rollback)
             val fatal = fatalPrimary(failure, rollback)
             if (fatal != null) {
                 attachSecondaryFailure(fatal, failure, rollback)

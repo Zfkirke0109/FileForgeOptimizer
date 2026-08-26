@@ -296,7 +296,7 @@ git commit -m "feat: add crash-resilient undo logs"
 
 - [ ] **Step 1: Write failing transaction-order tests**
 
-Use the recording gateway to assert this order: candidate verified, backup written, backup verified, original written, original verified, undo entry appended. Inject failures at every stage and assert no earlier unsafe mutation occurs.
+Use the recording gateway to assert this order: candidate verified, backup written, backup verified, recovery entry appended and flushed, live original revalidated, original written, original verified. Inject failures at every stage and assert no earlier unsafe mutation occurs.
 
 - [ ] **Step 2: Write failing restore tests**
 

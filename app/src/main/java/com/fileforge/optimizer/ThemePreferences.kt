@@ -55,14 +55,13 @@ class ThemePreferences internal constructor(
         val previous = read()
         save(mode)
         apply(mode)
-        if (isAmoledOnlyTransition(previous, mode)) runtime.requestRecreation()
+        if (requiresAmoledRecreation(previous, mode)) runtime.requestRecreation()
     }
 
     internal fun applySavedMode(): ThemeMode = read().also(::apply)
 
-    private fun isAmoledOnlyTransition(previous: ThemeMode, selected: ThemeMode): Boolean =
-        (previous == ThemeMode.DARK && selected == ThemeMode.AMOLED) ||
-            (previous == ThemeMode.AMOLED && selected == ThemeMode.DARK)
+    private fun requiresAmoledRecreation(previous: ThemeMode, selected: ThemeMode): Boolean =
+        previous != selected && (previous == ThemeMode.AMOLED || selected == ThemeMode.AMOLED)
 
     companion object {
         fun forAndroid(context: Context): ThemePreferences = ThemePreferences(

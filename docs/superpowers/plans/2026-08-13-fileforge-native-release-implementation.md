@@ -91,7 +91,7 @@ zopflipng --keepchunks=gAMA,cHRM,sRGB,iCCP,pHYs,tEXt,zTXt,iTXt INPUT OUTPUT
 zipalign -f -P 16 4 INPUT OUTPUT
 ```
 
-Aggressive JPEG changes only metadata copy policy to `-copy none`; APK zipalign remains gated by APK Lab Mode.
+JPEG always uses `-copy all` so EXIF orientation, ICC profiles, and other rendering-critical application markers survive both modes; APK zipalign remains gated by APK Lab Mode.
 
 - [ ] **Step 5: Run tests and commit**
 

@@ -49,6 +49,7 @@ class OptimizationServiceTest {
         val requestedPermissions = packageInfo.requestedPermissions.orEmpty().toSet()
 
         assertTrue(Manifest.permission.FOREGROUND_SERVICE in requestedPermissions)
+        assertTrue(Manifest.permission.FOREGROUND_SERVICE_DATA_SYNC in requestedPermissions)
         assertTrue(Manifest.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING in requestedPermissions)
         assertTrue(Manifest.permission.POST_NOTIFICATIONS in requestedPermissions)
         val serviceInfo = context.packageManager.getServiceInfo(
@@ -59,6 +60,10 @@ class OptimizationServiceTest {
         assertTrue(
             serviceInfo.foregroundServiceType and
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING != 0
+        )
+        assertTrue(
+            serviceInfo.foregroundServiceType and
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC != 0
         )
     }
 

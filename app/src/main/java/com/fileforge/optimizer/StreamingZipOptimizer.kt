@@ -42,14 +42,18 @@ object ArchivePathPolicy {
 
     private fun isAbsolute(path: String): Boolean =
         path.startsWith('/') || path.startsWith('\\') ||
-            (path.length >= 3 && path[0].isLetter() && path[1] == ':' && (path[2] == '/' || path[2] == '\\'))
+            (path.length >= 2 && path[0].isLetter() && path[1] == ':')
 }
 
 open class StreamingZipOptimizer(
-    private val maxInflatedBytes: Long = DEFAULT_MAX_INFLATED_BYTES
+    private val maxInflatedBytes: Long = DEFAULT_MAX_INFLATED_BYTES,
+    private val maxEntries: Int = DEFAULT_MAX_ENTRIES,
+    private val maxNameBytes: Long = DEFAULT_MAX_NAME_BYTES
 ) {
     init {
         require(maxInflatedBytes > 0) { "Inflated payload limit must be positive" }
+        require(maxEntries > 0) { "Entry limit must be positive" }
+        require(maxNameBytes > 0) { "Entry-name limit must be positive" }
     }
 
     fun optimize(
@@ -66,6 +70,7 @@ open class StreamingZipOptimizer(
         var inputBytes = 0L
         val level = if (mode == OptimizeMode.AGGRESSIVE) Deflater.BEST_COMPRESSION else 7
         val names = HashSet<String>()
+        var nameBytes = 0L
         val localEntries = mutableListOf<LocalEntryMetadata>()
         var nextLocalOffset = 0L
 
@@ -77,9 +82,8 @@ open class StreamingZipOptimizer(
                     val source = zipIn.nextEntry ?: break
                     val localHeader = trackedInput.requireLocalHeader(nextLocalOffset, source)
                     ArchivePathPolicy.requireSafe(source.name)
-                    if (!names.add(ArchivePathPolicy.normalizedName(source.name))) {
-                        throw ZipException("Duplicate archive entry: ${source.name}")
-                    }
+                    requireSafeExtraFields(source.extra)
+                    nameBytes = requireMetadataBudget(entries, nameBytes, source.name, names)
 
                     val preserveEpubMimetype = entries == 0 &&
                         source.name == EPUB_MIMETYPE_ENTRY &&
@@ -115,7 +119,6 @@ open class StreamingZipOptimizer(
             }
         }
 
-        if (entries == 0) throw ZipException("Archive contains no entries")
         return ZipOptimizationSummary(
             entries = entries,
             inputBytes = inputBytes,
@@ -130,6 +133,7 @@ open class StreamingZipOptimizer(
         var entries = 0
         var bytesRead = 0L
         val names = HashSet<String>()
+        var nameBytes = 0L
         val localEntries = mutableListOf<LocalEntryMetadata>()
         var nextLocalOffset = 0L
         val buffer = ByteArray(BUFFER_BYTES)
@@ -140,9 +144,8 @@ open class StreamingZipOptimizer(
                 val entry = zipIn.nextEntry ?: break
                 val localHeader = trackedInput.requireLocalHeader(nextLocalOffset, entry)
                 ArchivePathPolicy.requireSafe(entry.name)
-                if (!names.add(ArchivePathPolicy.normalizedName(entry.name))) {
-                    throw ZipException("Duplicate archive entry: ${entry.name}")
-                }
+                requireSafeExtraFields(entry.extra)
+                nameBytes = requireMetadataBudget(entries, nameBytes, entry.name, names)
                 val possibleEpubMimetype = entries == 0 && entry.name == EPUB_MIMETYPE_ENTRY
                 val mimetypePrefix = if (possibleEpubMimetype) ByteArray(EPUB_MIMETYPE_BYTES.size) else null
                 var entryBytes = 0L
@@ -184,7 +187,6 @@ open class StreamingZipOptimizer(
             cancellation
         )
 
-        if (entries == 0) throw ZipException("Archive contains no entries")
         return ZipVerification(entries, bytesRead)
     }
 
@@ -204,6 +206,47 @@ open class StreamingZipOptimizer(
     }
 
     protected open fun createZipOutputStream(output: OutputStream): ZipOutputStream = ZipOutputStream(output)
+
+    private fun requireMetadataBudget(
+        entries: Int,
+        currentNameBytes: Long,
+        name: String,
+        names: MutableSet<String>
+    ): Long {
+        if (entries >= maxEntries) {
+            throw ArchiveResourceLimitException("Archive exceeded the $maxEntries-entry metadata limit")
+        }
+        val normalized = ArchivePathPolicy.normalizedName(name)
+        val updatedNameBytes = try {
+            Math.addExact(currentNameBytes, normalized.toByteArray(Charsets.UTF_8).size.toLong())
+        } catch (_: ArithmeticException) {
+            throw ArchiveResourceLimitException("Archive entry names exceeded their metadata limit")
+        }
+        if (updatedNameBytes > maxNameBytes) {
+            throw ArchiveResourceLimitException("Archive entry names exceeded the $maxNameBytes-byte metadata limit")
+        }
+        if (!names.add(normalized)) throw ZipException("Duplicate archive entry: $name")
+        return updatedNameBytes
+    }
+
+    private fun requireSafeExtraFields(extra: ByteArray?) {
+        if (extra == null) return
+        var cursor = 0
+        while (cursor < extra.size) {
+            if (extra.size - cursor < EXTRA_FIELD_HEADER_BYTES) {
+                throw ZipException("Malformed ZIP extra field")
+            }
+            val id = (extra[cursor].toInt() and 0xff) or ((extra[cursor + 1].toInt() and 0xff) shl 8)
+            val size = (extra[cursor + 2].toInt() and 0xff) or ((extra[cursor + 3].toInt() and 0xff) shl 8)
+            if (size > extra.size - cursor - EXTRA_FIELD_HEADER_BYTES) {
+                throw ZipException("Malformed ZIP extra field length")
+            }
+            if (id == UNICODE_PATH_EXTRA_ID) {
+                throw UnsupportedZipFeatureException("Alternate Unicode ZIP paths")
+            }
+            cursor += EXTRA_FIELD_HEADER_BYTES + size
+        }
+    }
 
     private fun addInflatedBytes(total: Long, read: Int): Long {
         val updated = try {
@@ -321,13 +364,7 @@ open class StreamingZipOptimizer(
 
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
             val read = input.read(buffer, offset, length)
-            if (read > 0) {
-                var index = offset
-                repeat(read) {
-                    record(buffer[index])
-                    index++
-                }
-            }
+            if (read > 0) record(buffer, offset, read)
             return read
         }
 
@@ -445,6 +482,7 @@ open class StreamingZipOptimizer(
 
                 val flags = unsignedShortAt(cursor + 8)
                 if (flags and ENCRYPTED_FLAG != 0) throw UnsupportedZipFeatureException("Encrypted ZIP entries")
+                requirePreservableExternalAttributes(cursor)
                 val method = unsignedShortAt(cursor + 10)
                 val crc = unsignedIntAt(cursor + 16)
                 val compressedSize = unsignedIntAt(cursor + 20)
@@ -458,6 +496,7 @@ open class StreamingZipOptimizer(
                 }
                 val nameBytes = ByteArray(nameLength) { index -> byteAt(cursor + CENTRAL_DIRECTORY_FIXED_BYTES + index).toByte() }
                 val name = nameBytes.toString(if (flags and UTF8_FLAG != 0) Charsets.UTF_8 else ZIP_LEGACY_CHARSET)
+                requireSafeCentralExtra(cursor + CENTRAL_DIRECTORY_FIXED_BYTES + nameLength, extraLength)
                 val local = remainingLocalEntries.remove(name)
                     ?: throw ZipException("Central directory does not match local ZIP entries")
                 if (localOffset != local.localOffset || flags != local.flags || method != local.method || crc != local.crc ||
@@ -503,6 +542,54 @@ open class StreamingZipOptimizer(
             nextTailIndex = (nextTailIndex + 1) % tail.size
             if (tailSize < tail.size) tailSize++
             totalBytesRead++
+        }
+
+        private fun record(buffer: ByteArray, offset: Int, length: Int) {
+            if (length >= tail.size) {
+                buffer.copyInto(tail, 0, offset + length - tail.size, offset + length)
+                tailSize = tail.size
+                nextTailIndex = 0
+            } else {
+                val firstLength = minOf(length, tail.size - nextTailIndex)
+                buffer.copyInto(tail, nextTailIndex, offset, offset + firstLength)
+                val remaining = length - firstLength
+                if (remaining > 0) {
+                    buffer.copyInto(tail, 0, offset + firstLength, offset + length)
+                }
+                nextTailIndex = (nextTailIndex + length) % tail.size
+                tailSize = minOf(tail.size, tailSize + length)
+            }
+            totalBytesRead += length.toLong()
+        }
+
+        private fun requireSafeCentralExtra(offset: Int, length: Int) {
+            var cursor = offset
+            val end = offset + length
+            while (cursor < end) {
+                if (end - cursor < EXTRA_FIELD_HEADER_BYTES) throw ZipException("Malformed central ZIP extra field")
+                val id = unsignedShortAt(cursor)
+                val size = unsignedShortAt(cursor + 2)
+                if (size > end - cursor - EXTRA_FIELD_HEADER_BYTES) {
+                    throw ZipException("Malformed central ZIP extra field length")
+                }
+                if (id == UNICODE_PATH_EXTRA_ID) {
+                    throw UnsupportedZipFeatureException("Alternate Unicode ZIP paths")
+                }
+                cursor += EXTRA_FIELD_HEADER_BYTES + size
+            }
+        }
+
+        private fun requirePreservableExternalAttributes(cursor: Int) {
+            val platform = unsignedShortAt(cursor + 4) ushr 8
+            if (platform != UNIX_PLATFORM) return
+            val mode = (unsignedIntAt(cursor + 38) ushr 16).toInt() and 0xffff
+            val fileType = mode and UNIX_FILE_TYPE_MASK
+            if (fileType == UNIX_SYMLINK ||
+                (fileType != 0 && fileType != UNIX_REGULAR_FILE && fileType != UNIX_DIRECTORY) ||
+                mode and UNIX_EXECUTE_BITS != 0
+            ) {
+                throw UnsupportedZipFeatureException("Unix ZIP links, special files, or executable modes")
+            }
         }
 
         private fun byteAt(offset: Int): Int {
@@ -552,7 +639,7 @@ open class StreamingZipOptimizer(
             const val EOCD_MIN_BYTES = 22
             const val CENTRAL_DIRECTORY_FIXED_BYTES = 46
             const val CENTRAL_DIRECTORY_DIGITAL_SIGNATURE_FIXED_BYTES = 6
-            const val MAX_EOCD_TAIL_BYTES = 256 * 1024
+            const val MAX_EOCD_TAIL_BYTES = 4 * 1024 * 1024
             const val ZIP64_ENTRY_SENTINEL = 0xffff
             const val ENCRYPTED_FLAG = 1
             const val UTF8_FLAG = 1 shl 11
@@ -566,10 +653,20 @@ open class StreamingZipOptimizer(
 
     private companion object {
         const val BUFFER_BYTES = 32 * 1024
+        const val EXTRA_FIELD_HEADER_BYTES = 4
         const val DATA_DESCRIPTOR_FLAG = 1 shl 3
         const val ZIP64_SENTINEL = 0xffffffffL
         const val DEFAULT_MAX_INFLATED_BYTES = 1024L * 1024L * 1024L
+        const val DEFAULT_MAX_ENTRIES = 10_000
+        const val DEFAULT_MAX_NAME_BYTES = 1024L * 1024L
         const val EPUB_MIMETYPE_ENTRY = "mimetype"
+        const val UNICODE_PATH_EXTRA_ID = 0x7075
+        const val UNIX_PLATFORM = 3
+        const val UNIX_FILE_TYPE_MASK = 0xf000
+        const val UNIX_REGULAR_FILE = 0x8000
+        const val UNIX_DIRECTORY = 0x4000
+        const val UNIX_SYMLINK = 0xa000
+        const val UNIX_EXECUTE_BITS = 0x49
         val EPUB_MIMETYPE_BYTES = "application/epub+zip".toByteArray(Charsets.US_ASCII)
         val ZIP_LEGACY_CHARSET: Charset = Charset.forName("IBM437")
 

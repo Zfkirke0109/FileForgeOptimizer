@@ -391,7 +391,7 @@ class UndoLogRepositoryTest {
     }
 
     @Test
-    fun originalPositionalUndoModelConstructorsRemainSourceCompatible() {
+    fun legacyPositionalUndoModelExplicitlyDeclaresNoOptimizedDigest() {
         val header = UndoHeader("id", "start", 1)
         val legacyEntry = UndoEntry(
             "legacy.txt",
@@ -400,7 +400,8 @@ class UndoLogRepositoryTest {
             "FileForge_Backups_id/legacy.txt",
             null,
             "legacy note",
-            UndoVerificationLevel.LEGACY_SIZE_ONLY
+            UndoVerificationLevel.LEGACY_SIZE_ONLY,
+            null
         )
 
         assertEquals(1, header.schemaVersion)

@@ -10,7 +10,7 @@ import java.nio.file.Files
 
 class OptimizationTransactionTest {
     @Test
-    fun acceptedVerifiedGainWritesAndReopensVerifiedBackupBeforeReplacingAndLogging() = withCoordinator { gateway, coordinator, undo ->
+    fun acceptedVerifiedGainFlushesRecoveryEntryBeforeReplacingOriginal() = withCoordinator { gateway, coordinator, undo ->
         gateway.maximumTransferRequest = 32 * 1024
         val outcome = coordinator.process(gateway.node("archive.zip")!!, "archive.zip", realRun, NeverCancelled)
 
@@ -21,9 +21,10 @@ class OptimizationTransactionTest {
             "create-file:root/FileForge_Backups_run-1:archive.zip",
             "write:root/FileForge_Backups_run-1/archive.zip",
             "read:root/FileForge_Backups_run-1/archive.zip",
-            "write:root/archive.zip",
+            "undo-entry-appended-and-flushed",
             "read:root/archive.zip",
-            "undo-entry-appended-and-flushed"
+            "write:root/archive.zip",
+            "read:root/archive.zip"
         )
         assertEquals(1, undo.entries.size)
         assertEquals("archive.zip", undo.entries.single().relativePath)
@@ -76,7 +77,7 @@ class OptimizationTransactionTest {
                     "read:root/archive.zip"
                 )
                 assertEquals(original.toList(), gateway.contents("archive.zip").toList())
-                assertTrue(undo.entries.isEmpty())
+                assertEquals(1, undo.entries.size)
             }
         }
     }
@@ -95,19 +96,20 @@ class OptimizationTransactionTest {
 
         assertTrue(failure.message!!.contains("rollback", ignoreCase = true))
         assertTrue(failure.cause!!.message!!.contains("rollback write failed"))
-        assertTrue(undo.entries.isEmpty())
+        assertEquals(1, undo.entries.size)
     }
 
     @Test
-    fun undoAppendFailureAfterVerifiedOriginalRollsBackAndLeavesNoUnloggedReplacement() = withCoordinator { gateway, coordinator, undo ->
+    fun undoAppendFailureAbortsBeforeOriginalMutationAndPreservesVerifiedBackup() = withCoordinator { gateway, coordinator, undo ->
         undo.failure = IOException("undo append failed")
 
         val failure = assertThrows(UndoDurabilityException::class.java) {
             coordinator.process(gateway.node("archive.zip")!!, "archive.zip", realRun, NeverCancelled)
         }
-        assertEquals(RollbackResult.Restored, failure.rollback)
+        assertEquals(RollbackResult.NotNeeded, failure.rollback)
         assertEquals(original.toList(), gateway.contents("archive.zip").toList())
-        assertEquals(2, gateway.events.count { it == "read:root/FileForge_Backups_run-1/archive.zip" })
+        assertFalse(gateway.events.contains("write:root/archive.zip"))
+        assertEquals(original.toList(), gateway.contents("FileForge_Backups_run-1/archive.zip").toList())
         assertTrue(undo.entries.isEmpty())
     }
 

@@ -75,7 +75,7 @@ class ThemePreferencesTest {
     }
 
     @Test
-    fun liveSelectionPersistsAndAppliesButExplicitlyRecreatesOnlyBetweenDarkAndAmoled() {
+    fun liveSelectionRecreatesForEveryTransitionIntoOrOutOfAmoled() {
         val expectedApplications = mapOf(
             ThemeMode.SYSTEM to ThemeApplication(ThemeNightMode.FOLLOW_SYSTEM, amoledOverlay = false),
             ThemeMode.LIGHT to ThemeApplication(ThemeNightMode.FORCE_LIGHT, amoledOverlay = false),
@@ -100,8 +100,8 @@ class ThemePreferencesTest {
                     runtime.applications
                 )
                 val expectedRecreations = if (
-                    (previous == ThemeMode.DARK && selected == ThemeMode.AMOLED) ||
-                    (previous == ThemeMode.AMOLED && selected == ThemeMode.DARK)
+                    previous != selected &&
+                    (previous == ThemeMode.AMOLED || selected == ThemeMode.AMOLED)
                 ) 1 else 0
                 assertEquals(
                     "explicit recreation $previous -> $selected",

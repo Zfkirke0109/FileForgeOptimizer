@@ -46,7 +46,8 @@ class ByteArrayOptimizerAdapter(
                 ?: return FileOutcome.Skipped(relativePath, SkipReason.NO_CHANGE)
             if (result.bytes.size >= original.size) return FileOutcome.Skipped(relativePath, SkipReason.NO_GAIN)
             if (FileTypeDetector.detect(node.name, result.bytes) != kind || !Optimizers.verify(kind, result.bytes, settings)) {
-                return FileOutcome.Skipped(relativePath, SkipReason.VERIFICATION_FAILED)
+                val failure = IOException("Optimizer output failed format verification")
+                return FileOutcome.Failed(relativePath, failure.message!!, failure)
             }
 
             val oldBytes = original.size.toLong()
@@ -106,7 +107,8 @@ class ByteArrayOptimizerAdapter(
         var backup: BackupArtifact? = null
         var originalIntegrity: StreamIntegrity? = null
         var originalMutationStarted = false
-        var transactionDurable = false
+        var mutationCommitted = false
+        var undoDurable = false
         var undoAppendStarted = false
         return try {
             val expectedOriginal = originalBytes.inputStream().use { StreamIntegrityChecker.hash(it, cancellation) }
@@ -124,6 +126,32 @@ class ByteArrayOptimizerAdapter(
             val verifiedBackup = documentGateway.openRead(backupNode).use { StreamIntegrityChecker.hash(it, cancellation) }
             check(verifiedBackup == expectedOriginal) { "Backup verification failed" }
 
+            val expectedCandidate = result.bytes.inputStream().use { source ->
+                StreamIntegrityChecker.hash(source, cancellation)
+            }
+            undoAppendStarted = true
+            context.undoEntrySink.appendAndFlush(
+                UndoEntry(
+                    relativePath = relativePath,
+                    originalBytes = expectedOriginal.bytes,
+                    optimizedBytes = expectedCandidate.bytes,
+                    backupPath = backupPath,
+                    originalSha256 = expectedOriginal.sha256,
+                    optimizedSha256 = expectedCandidate.sha256,
+                    note = result.note,
+                    fileKind = kind,
+                    toolId = TOOL_ID,
+                    completedAt = context.completedAt(),
+                    originalDocumentId = originalNode.id
+                )
+            )
+            undoDurable = true
+
+            cancellation.throwIfCancelled()
+            val liveOriginal = documentGateway.openRead(originalNode).use { source ->
+                StreamIntegrityChecker.hash(source, cancellation)
+            }
+            check(liveOriginal == expectedOriginal) { "Original changed immediately before replacement" }
             cancellation.throwIfCancelled()
             originalMutationStarted = true
             val writtenCandidate = result.bytes.inputStream().use { source ->
@@ -132,38 +160,23 @@ class ByteArrayOptimizerAdapter(
                 }
             }
             val verifiedOriginal = documentGateway.openRead(originalNode).use { StreamIntegrityChecker.hash(it, cancellation) }
-            check(verifiedOriginal == writtenCandidate) { "Optimized document verification failed" }
-
-            undoAppendStarted = true
-            context.undoEntrySink.appendAndFlush(
-                UndoEntry(
-                    relativePath = relativePath,
-                    originalBytes = expectedOriginal.bytes,
-                    optimizedBytes = writtenCandidate.bytes,
-                    backupPath = backupPath,
-                    originalSha256 = expectedOriginal.sha256,
-                    optimizedSha256 = writtenCandidate.sha256,
-                    note = result.note,
-                    fileKind = kind,
-                    toolId = TOOL_ID,
-                    completedAt = context.completedAt(),
-                    originalDocumentId = originalNode.id
-                )
-            )
-            transactionDurable = true
+            check(writtenCandidate == expectedCandidate && verifiedOriginal == expectedCandidate) {
+                "Optimized document verification failed"
+            }
+            mutationCommitted = true
             FileOutcome.Optimized(relativePath, expectedOriginal.bytes, writtenCandidate.bytes, TOOL_ID, result.note)
         } catch (failure: Throwable) {
             val rollbackBackup = backup?.file
             val rollbackIntegrity = originalIntegrity
-            if (!originalMutationStarted) {
+            if (!originalMutationStarted && !undoAppendStarted) {
                 backup?.let { backupTree.cleanupBeforeOriginalMutation(it, failure) }
             }
-            val rollback = if (originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null) {
+            val rollback = if (originalMutationStarted && !mutationCommitted && rollbackBackup != null && rollbackIntegrity != null) {
                 restoreBackup(originalNode, rollbackBackup, rollbackIntegrity)
             } else {
                 RollbackResult.NotNeeded
             }
-            if (undoAppendStarted && !transactionDurable) {
+            if (undoAppendStarted && !undoDurable) {
                 throw poisonedUndoFailure(failure, rollback)
             }
             val fatal = fatalPrimary(failure, rollback)
