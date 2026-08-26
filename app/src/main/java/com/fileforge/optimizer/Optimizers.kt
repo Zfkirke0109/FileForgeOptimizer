@@ -62,6 +62,8 @@ class ByteArrayOptimizerAdapter(
             throw cancelled
         } catch (poisoned: UndoDurabilityException) {
             throw poisoned
+        } catch (invariant: RunInvariantException) {
+            throw invariant
         } catch (_: InputLimitExceededException) {
             FileOutcome.Skipped(relativePath, SkipReason.MEMORY_LIMIT, "Input exceeded the $maxInputBytes-byte in-memory limit while reading.")
         } catch (failure: Exception) {
@@ -100,7 +102,8 @@ class ByteArrayOptimizerAdapter(
         context: CommitContext,
         cancellation: CancellationToken
     ): FileOutcome {
-        var backup: DocumentNode? = null
+        val backupTree = BackupTree(documentGateway)
+        var backup: BackupArtifact? = null
         var originalIntegrity: StreamIntegrity? = null
         var originalMutationStarted = false
         var transactionDurable = false
@@ -108,8 +111,9 @@ class ByteArrayOptimizerAdapter(
         return try {
             val expectedOriginal = originalBytes.inputStream().use { StreamIntegrityChecker.hash(it, cancellation) }
             val backupPath = backupPath(context.runId, relativePath)
-            val backupNode = createBackup(context.selectedRoot, backupPath)
-            backup = backupNode
+            val backupArtifact = backupTree.create(context.selectedRoot, backupPath)
+            backup = backupArtifact
+            val backupNode = backupArtifact.file
             val backedUp = documentGateway.openRead(originalNode).use { source ->
                 documentGateway.openWrite(backupNode).use { destination ->
                     StreamIntegrityChecker.copyAndHash(source, destination, cancellation)
@@ -142,14 +146,18 @@ class ByteArrayOptimizerAdapter(
                     note = result.note,
                     fileKind = kind,
                     toolId = TOOL_ID,
-                    completedAt = context.completedAt()
+                    completedAt = context.completedAt(),
+                    originalDocumentId = originalNode.id
                 )
             )
             transactionDurable = true
             FileOutcome.Optimized(relativePath, expectedOriginal.bytes, writtenCandidate.bytes, TOOL_ID, result.note)
         } catch (failure: Throwable) {
-            val rollbackBackup = backup
+            val rollbackBackup = backup?.file
             val rollbackIntegrity = originalIntegrity
+            if (!originalMutationStarted) {
+                backup?.let { backupTree.cleanupBeforeOriginalMutation(it, failure) }
+            }
             val rollback = if (originalMutationStarted && !transactionDurable && rollbackBackup != null && rollbackIntegrity != null) {
                 restoreBackup(originalNode, rollbackBackup, rollbackIntegrity)
             } else {
@@ -163,8 +171,10 @@ class ByteArrayOptimizerAdapter(
                 attachSecondaryFailure(fatal, failure, rollback)
                 throw fatal
             }
+            if (rollback is RollbackResult.Failed) {
+                throw EmergencyRollbackException(failure, rollback.cause)
+            }
             if (failure is OptimizationCancelledException) {
-                if (rollback is RollbackResult.Failed) failure.addSuppressed(rollback.cause)
                 throw failure
             }
             FileOutcome.Failed(relativePath, failure.message ?: failure.javaClass.name, failure, rollback)
@@ -175,22 +185,6 @@ class ByteArrayOptimizerAdapter(
         DocumentPathPolicy.requireSafeSegment(runId)
         DocumentPathPolicy.requireSafeRelative(relativePath)
         return "$BACKUP_PREFIX$runId/$relativePath"
-    }
-
-    private fun createBackup(root: DocumentNode, backupPath: String): DocumentNode {
-        val segments = DocumentPathPolicy.requireSafeRelative(backupPath)
-        var parent = root
-        segments.dropLast(1).forEach { name ->
-            val existing = documentGateway.resolve(parent, name)
-            parent = when {
-                existing == null -> documentGateway.createDirectoryExact(parent, name)
-                existing.isDirectory -> existing
-                else -> throw IOException("Backup path component is not a directory: $name")
-            }
-        }
-        val name = segments.last()
-        check(documentGateway.resolve(parent, name) == null) { "Backup already exists: $backupPath" }
-        return documentGateway.createFileExact(parent, "application/octet-stream", name)
     }
 
     private fun restoreBackup(original: DocumentNode, backup: DocumentNode, expected: StreamIntegrity): RollbackResult = try {

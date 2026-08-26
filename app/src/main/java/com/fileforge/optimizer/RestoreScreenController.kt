@@ -41,6 +41,7 @@ class RestoreScreenController(
     private var discoveryResult = testFixture?.discovery ?: RestoreDiscoveryResult(emptyList(), emptyList())
     private var selectedUndoLogId: String? = null
     private val selectedPaths = linkedSetOf<String>()
+    private val visibleEntryCounts = mutableMapOf<String, Int>()
     private var allSelected = false
     private var latestRunState: RunState = RunState.Idle
     private var closed = false
@@ -232,7 +233,13 @@ class RestoreScreenController(
     }
 
     private fun runCard(discovered: DiscoveredUndoLog): View {
-        val card = RestoreRunCard.from(discovered.undoLogId, discovered.run)
+        val visibleEntryCount = visibleEntryCounts.getOrPut(discovered.undoLogId) { ENTRY_PAGE_SIZE }
+            .coerceAtMost(discovered.run.entries.size)
+        val card = RestoreRunCard.from(
+            discovered.undoLogId,
+            discovered.run,
+            visibleEntryLimit = visibleEntryCount
+        )
         return MaterialCardView(activity).apply {
             addView(LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
@@ -243,14 +250,17 @@ class RestoreScreenController(
                 addView(MaterialButton(activity).apply {
                     text = activity.getString(R.string.restore_select_all)
                     contentDescription = "Select all from ${card.runId}"
+                    isEnabled = discovered.run.entries.any { it.isRestoreEligible }
                     setOnClickListener { selectAll(discovered) }
                 })
                 card.entries.forEach { entry ->
+                    val sourceEntry = discovered.run.entries.first { it.relativePath == entry.relativePath }
                     addView(CheckBox(activity).apply {
                         id = View.generateViewId()
                         isSaveEnabled = false
                         text = entry.relativePath
                         contentDescription = activity.getString(R.string.restore_select_entry, entry.relativePath)
+                        isEnabled = sourceEntry.isRestoreEligible
                         isChecked = selectedUndoLogId == card.undoLogId &&
                             (allSelected || entry.relativePath in selectedPaths)
                         setOnCheckedChangeListener { _, checked -> updateSelection(card.undoLogId, entry.relativePath, checked) }
@@ -269,11 +279,32 @@ class RestoreScreenController(
                         setPadding(dp(32), 0, 0, dp(8))
                     })
                 }
+                val remaining = card.entryCount - card.entries.size
+                if (remaining > 0) {
+                    val revealCount = minOf(ENTRY_PAGE_SIZE, remaining)
+                    addView(MaterialButton(activity).apply {
+                        text = activity.getString(R.string.restore_show_more, revealCount)
+                        contentDescription = activity.getString(
+                            R.string.restore_show_more_description,
+                            card.runId
+                        )
+                        setOnClickListener {
+                            visibleEntryCounts[discovered.undoLogId] = card.entries.size + revealCount
+                            render()
+                        }
+                    })
+                }
             })
         }
     }
 
     private fun updateSelection(undoLogId: String, path: String, checked: Boolean) {
+        val entry = discoveryResult.runs
+            .firstOrNull { it.undoLogId == undoLogId }
+            ?.run
+            ?.entries
+            ?.firstOrNull { it.relativePath == path }
+        if (entry?.isRestoreEligible != true) return
         if (checked && selectedUndoLogId != undoLogId) {
             selectedUndoLogId = undoLogId
             selectedPaths.clear()
@@ -287,6 +318,7 @@ class RestoreScreenController(
                     ?.run
                     ?.entries
                     ?.asSequence()
+                    ?.filter { it.isRestoreEligible }
                     ?.map { it.relativePath }
                     ?.filter { it != path }
                     ?.toCollection(selectedPaths)
@@ -307,9 +339,11 @@ class RestoreScreenController(
     }
 
     private fun selectAll(run: DiscoveredUndoLog) {
-        selectedUndoLogId = run.undoLogId
+        val restorable = run.run.entries.filter { it.isRestoreEligible }.mapTo(linkedSetOf()) { it.relativePath }
+        selectedUndoLogId = run.undoLogId.takeIf { restorable.isNotEmpty() }
         selectedPaths.clear()
-        allSelected = true
+        selectedPaths += restorable
+        allSelected = restorable.isNotEmpty() && restorable.size == run.run.entries.size
         render()
     }
 
@@ -325,13 +359,25 @@ class RestoreScreenController(
             .setPositiveButton(R.string.restore_confirm) { _, _ ->
                 if (latestRunState is RunState.Running) return@setPositiveButton
                 val treeUri = selectedTreeUri ?: return@setPositiveButton
+                val confirmedRun = discoveryResult.runs
+                    .firstOrNull { it.undoLogId == undoLogId }
+                    ?: return@setPositiveButton
                 val request = ServiceRunRequest.Restore(
                     treeUri = treeUri,
                     undoLogId = undoLogId,
                     selection = if (allSelected) {
-                        RestoreSelection.All
+                        RestoreSelection.ConfirmedAll(
+                            undoDocumentId = confirmedRun.documentId,
+                            entryCount = confirmedRun.run.entries.size,
+                            undoSha256 = confirmedRun.contentSha256
+                        )
                     } else {
-                        RestoreSelection.Entries(selectedPaths.toSet())
+                        RestoreSelection.Entries(
+                            relativePaths = selectedPaths.toSet(),
+                            undoDocumentId = confirmedRun.documentId,
+                            entryCount = confirmedRun.run.entries.size,
+                            undoSha256 = confirmedRun.contentSha256
+                        )
                     }
                 )
                 try {
@@ -370,6 +416,7 @@ class RestoreScreenController(
         selectedUndoLogId = null
         selectedPaths.clear()
         allSelected = false
+        visibleEntryCounts.clear()
     }
 
     private fun showRestoreStartFailure(failure: Throwable) {
@@ -438,6 +485,7 @@ class RestoreScreenController(
         const val PREFERENCES_NAME = "fileforge_optimize"
         const val KEY_TREE_URI = "tree_uri"
         const val LEGACY_KEY_TREE_URI = "treeUri"
+        const val ENTRY_PAGE_SIZE = 100
     }
 }
 

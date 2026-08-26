@@ -128,8 +128,18 @@ object OptimizationServiceRequestCodec {
                 if (value.strictKeySet() != ALL_SELECTION_KEYS) return null
                 RestoreSelection.All
             }
+            SELECTION_CONFIRMED_ALL -> {
+                if (value.strictKeySet() != CONFIRMED_ALL_SELECTION_KEYS) return null
+                val documentId = value.strictString("undoDocumentId") ?: return null
+                val entryCount = value.strictNonnegativeInt("entryCount") ?: return null
+                val undoSha256 = value.strictString("undoSha256") ?: return null
+                safelyConstruct { RestoreSelection.ConfirmedAll(documentId, entryCount, undoSha256) } ?: return null
+            }
             SELECTION_ENTRIES -> {
                 if (value.strictKeySet() != ENTRY_SELECTION_KEYS) return null
+                val documentId = value.strictString("undoDocumentId") ?: return null
+                val entryCount = value.strictNonnegativeInt("entryCount") ?: return null
+                val undoSha256 = value.strictString("undoSha256") ?: return null
                 val encodedPaths = value.opt("relativePaths") as? JSONArray ?: return null
                 val paths = linkedSetOf<String>()
                 for (index in 0 until encodedPaths.length()) {
@@ -137,7 +147,7 @@ object OptimizationServiceRequestCodec {
                     if (!paths.add(path)) return null
                 }
                 validateEntrySelection(paths)
-                RestoreSelection.Entries(paths)
+                safelyConstruct { RestoreSelection.Entries(paths, documentId, entryCount, undoSha256) } ?: return null
             }
             else -> return null
         }
@@ -153,12 +163,31 @@ object OptimizationServiceRequestCodec {
 
     private fun encodeSelection(selection: RestoreSelection): String = when (selection) {
         RestoreSelection.All -> JSONObject().put("kind", SELECTION_ALL).toString()
+        is RestoreSelection.ConfirmedAll -> {
+            validateSnapshotIdentity(selection.undoDocumentId)
+            JSONObject()
+                .put("kind", SELECTION_CONFIRMED_ALL)
+                .put("undoDocumentId", selection.undoDocumentId)
+                .put("entryCount", selection.entryCount)
+                .put("undoSha256", selection.undoSha256)
+                .toString()
+        }
         is RestoreSelection.Entries -> {
             validateEntrySelection(selection.relativePaths)
+            validateSnapshotIdentity(selection.undoDocumentId)
             JSONObject()
                 .put("kind", SELECTION_ENTRIES)
                 .put("relativePaths", JSONArray(selection.relativePaths.sorted()))
+                .put("undoDocumentId", selection.undoDocumentId)
+                .put("entryCount", selection.entryCount)
+                .put("undoSha256", selection.undoSha256)
                 .toString()
+        }
+    }
+
+    private fun validateSnapshotIdentity(undoDocumentId: String) {
+        require(undoDocumentId.toByteArray(Charsets.UTF_8).size <= MAX_CONFIRMED_UNDO_DOCUMENT_ID_BYTES) {
+            "Undo document identity is too large to send safely"
         }
     }
 
@@ -175,6 +204,12 @@ object OptimizationServiceRequestCodec {
         }
     }
 
+    private inline fun <T> safelyConstruct(constructor: () -> T): T? = try {
+        constructor()
+    } catch (_: IllegalArgumentException) {
+        null
+    }
+
     private fun parseObject(serialized: String): JSONObject? {
         if (!StrictServiceJsonSyntax.isObject(serialized)) return null
         val tokenizer = JSONTokener(serialized)
@@ -184,6 +219,11 @@ object OptimizationServiceRequestCodec {
 
     private fun JSONObject.strictString(name: String): String? = opt(name) as? String
     private fun JSONObject.strictBoolean(name: String): Boolean? = opt(name) as? Boolean
+    private fun JSONObject.strictNonnegativeInt(name: String): Int? = when (val value = opt(name)) {
+        is Int -> value.takeIf { it >= 0 }
+        is Long -> value.takeIf { it in 0..Int.MAX_VALUE.toLong() }?.toInt()
+        else -> null
+    }
     private fun JSONObject.strictKeySet(): Set<String> = buildSet {
         val iterator = keys()
         while (iterator.hasNext()) add(iterator.next())
@@ -200,12 +240,15 @@ object OptimizationServiceRequestCodec {
     )
     private val RUN_INTENT_KEYS = setOf("mode", "dryRun", "apkLabMode", "textMinify")
     private val ALL_SELECTION_KEYS = setOf("kind")
-    private val ENTRY_SELECTION_KEYS = setOf("kind", "relativePaths")
+    private val CONFIRMED_ALL_SELECTION_KEYS = setOf("kind", "undoDocumentId", "entryCount", "undoSha256")
+    private val ENTRY_SELECTION_KEYS = setOf("kind", "relativePaths", "undoDocumentId", "entryCount", "undoSha256")
     private const val SELECTION_ALL = "ALL"
+    private const val SELECTION_CONFIRMED_ALL = "CONFIRMED_ALL"
     private const val SELECTION_ENTRIES = "ENTRIES"
     private const val MAX_RESTORE_ENTRY_SELECTION_COUNT = 10_000
     private const val MAX_RESTORE_ENTRY_SELECTION_BYTES = 512L * 1024L
     private const val RESTORE_SELECTION_ENVELOPE_BYTES = 128L
+    private const val MAX_CONFIRMED_UNDO_DOCUMENT_ID_BYTES = 16 * 1024
 }
 
 /** Strict RFC-8259 syntax gate independent of the platform's lenient JSONTokener. */
@@ -449,7 +492,13 @@ class OptimizationServiceController(
             },
             confirmedRestoreScope = (request as? ServiceRunRequest.Restore)
                 ?.selection
-                ?.let { selection -> (selection as? RestoreSelection.Entries)?.relativePaths?.size },
+                ?.let { selection ->
+                    when (selection) {
+                        RestoreSelection.All -> null
+                        is RestoreSelection.ConfirmedAll -> selection.entryCount
+                        is RestoreSelection.Entries -> selection.relativePaths.size
+                    }
+                },
             onFinished = onFinished
         )
         if (!active.compareAndSet(null, claimed)) return ServiceStartResult(accepted = false)
@@ -500,20 +549,11 @@ class OptimizationServiceController(
 
     fun onTimeout() {
         val claimed = active.get() ?: return
-        claimed.cancellation.cancel()
-        finish(
-            claimed,
-            RunState.Terminal(
-                terminalReport(
-                    claimed = claimed,
-                    status = RunStatus.CANCELLED,
-                    error = TIMEOUT_MESSAGE
-                ),
-                dryRun = claimed.dryRun,
-                operationKind = claimed.operationKind
-            ),
-            timeoutDelivery = true
-        )
+        synchronized(claimed.finalityLock) {
+            if (claimed.finalized.get()) return
+            claimed.timeoutRequested.set(true)
+            claimed.cancellation.cancel()
+        }
     }
 
     private fun runClaimed(claimed: ActiveRun, request: ServiceRunRequest) {
@@ -527,7 +567,11 @@ class OptimizationServiceController(
             }
         } catch (_: OptimizationCancelledException) {
             RunState.Terminal(
-                terminalReport(claimed, RunStatus.CANCELLED),
+                terminalReport(
+                    claimed,
+                    RunStatus.CANCELLED,
+                    TIMEOUT_MESSAGE.takeIf { claimed.timeoutRequested.get() }
+                ),
                 dryRun = claimed.dryRun,
                 operationKind = claimed.operationKind
             )
@@ -535,7 +579,7 @@ class OptimizationServiceController(
             val failed = failedTerminal(failure, claimed)
             if (failure.isVmFatal()) {
                 try {
-                    finish(claimed, failed)
+                    finish(claimed, failed, timeoutDelivery = claimed.timeoutRequested.get())
                 } catch (finalizationFailure: Throwable) {
                     if (finalizationFailure !== failure) failure.addSuppressed(finalizationFailure)
                 }
@@ -543,7 +587,7 @@ class OptimizationServiceController(
             }
             failed
         }
-        finish(claimed, terminal)
+        finish(claimed, terminal, timeoutDelivery = claimed.timeoutRequested.get())
     }
 
     private fun publishProgress(claimed: ActiveRun, snapshot: ProgressSnapshot) {
@@ -671,6 +715,7 @@ class OptimizationServiceController(
     ) {
         val cancellation = AtomicCancellationSource()
         val finalized = AtomicBoolean(false)
+        val timeoutRequested = AtomicBoolean(false)
         val finalityLock = Any()
     }
 
@@ -684,6 +729,7 @@ class OptimizationServiceController(
 class OptimizationServiceCommandRouter(
     private val controller: OptimizationServiceController,
     private val restoreOwnership: RestoreLaunchOwnership? = null,
+    private val optimizeOwnership: OptimizeDispatchOwnership? = null,
     private val requireRestoreClaimId: Boolean = false,
     private val stopIdleService: () -> Unit
 ) : AutoCloseable {
@@ -720,7 +766,11 @@ class OptimizationServiceCommandRouter(
                 } else if (request is ServiceRunRequest.Restore) {
                     routeRestore(request, restoreClaimId)
                 } else {
-                    controller.onStartCommand(request)
+                    val claim = optimizeOwnership?.current()
+                    val result = controller.onStartCommand(request)
+                    if (!result.accepted && claim != null) {
+                        optimizeOwnership.onServiceFinished(claim)
+                    }
                 }
             }
             OptimizationServiceContract.ACTION_CANCEL -> {

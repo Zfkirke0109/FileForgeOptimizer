@@ -67,6 +67,7 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         commandRouter = OptimizationServiceCommandRouter(
             controller = controller,
             restoreOwnership = ProcessRestoreLaunchOwnership.instance,
+            optimizeOwnership = ProcessOptimizeDispatchOwnership.instance,
             requireRestoreClaimId = true,
             stopIdleService = { stopSelf() }
         )
@@ -198,7 +199,8 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
             startedAt = ::eventTimestamp,
             completedAt = ::eventTimestamp,
             appVersion = appVersion(),
-            buildVariant = "standard"
+            buildVariant = BuildConfig.FILEFORGE_VARIANT,
+            nativeToolExecutor = NativeToolRuntime.executorOrNull(this)
         )
         return RunState.Terminal(
             engine.run(cancellation, onProgress),
@@ -212,16 +214,21 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         cancellation: CancellationToken,
         onProgress: (ProgressSnapshot) -> Unit
     ): RunState.Terminal {
+        request.selection.requireServiceSnapshot()
         DocumentPathPolicy.requireSafeSegment(request.undoLogId)
         val gateway = gatewayFor(request)
         val undoNode = gateway.resolve(gateway.rootNode, request.undoLogId)
             ?: throw IllegalArgumentException("Undo log is missing")
         require(!undoNode.isDirectory) { "Undo log must be a file" }
+        lateinit var undoIntegrity: StreamIntegrity
         val undoRun = gateway.openRead(undoNode).use { input ->
-            InputStreamReader(input, Charsets.UTF_8).use { reader ->
+            val trackedInput = IntegrityTrackingInputStream(input)
+            InputStreamReader(trackedInput, Charsets.UTF_8).use { reader ->
                 UndoLogRepository().readStreamingForRestore(reader, cancellation)
+                    .also { undoIntegrity = trackedInput.finish() }
             }
         }
+        request.selection.requireMatchingSnapshot(undoNode, undoRun, undoIntegrity.sha256)
         require(undoRun.header.runId.isNotBlank()) { "Undo log is not recognized" }
         val receiptWriter = DocumentGatewayRestoreReceiptWriter(gateway, gateway.rootNode)
         val restore = RestoreCoordinator(
@@ -243,23 +250,8 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
             },
             clock = ::safeTimestamp
         ).restore(undoRun, request.selection, cancellation)
-        val failures = restore.entries.filter { it.status != RestoreEntryStatus.RESTORED }
         return RunState.Terminal(
-            OptimizationReport(
-                scanned = restore.selectedCount,
-                optimized = restore.restoredCount,
-                skipped = restore.entries.count { it.status == RestoreEntryStatus.UNPROCESSED_CANCELLED || it.status == RestoreEntryStatus.UNPROCESSED_AUDIT_STOPPED },
-                errors = restore.failedCount,
-                status = restore.status,
-                terminalError = restore.receiptError,
-                terminalFailures = failures.map { result ->
-                    buildString {
-                        append(result.relativePath).append(": ").append(result.status.name)
-                        if (result.message.isNotBlank()) append(" — ").append(result.message)
-                    }
-                },
-                restoreReceiptName = restore.receiptName
-            ),
+            restore.toOptimizationReport(),
             dryRun = false,
             operationKind = RunOperationKind.RESTORE
         )

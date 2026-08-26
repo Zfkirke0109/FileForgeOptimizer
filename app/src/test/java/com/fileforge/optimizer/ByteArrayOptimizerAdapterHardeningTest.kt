@@ -60,6 +60,29 @@ class ByteArrayOptimizerAdapterHardeningTest {
         assertEquals(original.toList(), gateway.contents("document.pdf").toList())
     }
 
+    @Test
+    fun failedNonZipBackupIsDeletedBeforeTheOriginalCanBeMutated() {
+        val gateway = RecordingDocumentGateway()
+        val original = "%PDF-1.4\n%%EOF\ntrailing".toByteArray()
+        val node = gateway.put("document.pdf", original)
+        gateway.events.clear()
+        gateway.fail = { event ->
+            if (event == "write:root/FileForge_Backups_run-1/document.pdf") IOException("backup write failed") else null
+        }
+        val adapter = ByteArrayOptimizerAdapter(
+            gateway,
+            CommitContext(gateway.root, "run-1", UndoEntrySink { }) { "2026-08-13T20:00:00Z" }
+        )
+
+        expectType<FileOutcome.Failed>(
+            adapter.process(node, "document.pdf", FileKind.PDF, realRun, NeverCancelled)
+        )
+
+        assertEquals(null, gateway.node("FileForge_Backups_run-1/document.pdf"))
+        assertEquals(null, gateway.node("FileForge_Backups_run-1"))
+        assertEquals(original.toList(), gateway.contents("document.pdf").toList())
+    }
+
     private class LengthOverrideGateway(
         private val delegate: DocumentGateway,
         private val reportedLength: Long

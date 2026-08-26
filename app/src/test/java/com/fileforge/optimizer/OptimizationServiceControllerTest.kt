@@ -97,7 +97,7 @@ class OptimizationServiceControllerTest {
             ServiceRunRequest.Restore(
                 treeUri = "content://tree/restore",
                 undoLogId = "FileForge_Undo_run-17.jsonl",
-                selection = RestoreSelection.Entries(setOf("docs/a.txt", "images/b.png"))
+                selection = confirmedEntries("docs/a.txt", "images/b.png")
             )
         )
 
@@ -383,7 +383,7 @@ class OptimizationServiceControllerTest {
             ServiceRunRequest.Restore(
                 treeUri = "content://tree/restore",
                 undoLogId = "undo-valid",
-                selection = RestoreSelection.Entries(setOf("docs/a.zip", "images/b.png"))
+                selection = confirmedEntries("docs/a.zip", "images/b.png")
             )
         )
 
@@ -430,6 +430,31 @@ class OptimizationServiceControllerTest {
         val newerClaim = checkNotNull(ownership.tryClaim(request))
         ownership.onServiceCompleted(rejectedClaim)
         assertTrue(ownership.current() === newerClaim)
+    }
+
+    @Test
+    fun routerReleasesTheOptimizeDispatchClaimWhenAnActiveRestoreRejectsTheCommand() {
+        val fixture = Fixture()
+        val ownership = OptimizeDispatchOwnership()
+        val completionNotifications = AtomicInteger()
+        ownership.observeServiceFinished {
+            completionNotifications.incrementAndGet()
+        }
+        val router = OptimizationServiceCommandRouter(
+            controller = fixture.controller,
+            optimizeOwnership = ownership,
+            stopIdleService = {}
+        )
+        assertTrue(fixture.controller.onStartCommand(restoreRequest("undo-active")).accepted)
+        checkNotNull(ownership.tryClaim("idle"))
+        val encoded = OptimizationServiceRequestCodec.encode(optimizeRequest())
+
+        router.onCommand(encoded.action, encoded.extras)
+
+        assertNull(ownership.current())
+        assertEquals(1, completionNotifications.get())
+        assertEquals(1, fixture.runtime.pendingTaskCount)
+        assertTrue(fixture.runtime.requests.isEmpty())
     }
 
     @Test
@@ -510,7 +535,7 @@ class OptimizationServiceControllerTest {
     }
 
     @Test
-    fun routerReleasesTheCapturedRestoreClaimWhenTimeoutFinishesBeforeRuntimeRun() {
+    fun routerReleasesTheCapturedRestoreClaimAfterTimedOutWorkerFinishes() {
         val fixture = Fixture()
         val ownership = RestoreLaunchOwnership()
         val request = restoreRequest("undo-timeout-before-run")
@@ -527,8 +552,10 @@ class OptimizationServiceControllerTest {
         )
         fixture.controller.onTimeout()
 
-        assertNull(ownership.current())
+        assertTrue(ownership.current() === claim)
         assertTrue(fixture.runtime.requests.isEmpty())
+        fixture.runtime.runNext()
+        assertNull(ownership.current())
         ownership.onServiceCompleted(claim)
         assertNull(ownership.current())
     }
@@ -603,7 +630,7 @@ class OptimizationServiceControllerTest {
         val request = ServiceRunRequest.Restore(
             treeUri = "content://tree/restore",
             undoLogId = "undo-cancel-before-run",
-            selection = RestoreSelection.Entries(setOf("docs/a.txt", "photos/b.jpg"))
+            selection = confirmedEntries("docs/a.txt", "photos/b.jpg")
         )
 
         assertTrue(fixture.controller.onStartCommand(request).accepted)
@@ -623,7 +650,7 @@ class OptimizationServiceControllerTest {
         val request = ServiceRunRequest.Restore(
             treeUri = "content://tree/restore",
             undoLogId = "undo-setup-failure",
-            selection = RestoreSelection.Entries(setOf("docs/a.txt", "photos/b.jpg", "videos/c.mp4"))
+            selection = confirmedEntries("docs/a.txt", "photos/b.jpg", "videos/c.mp4")
         )
 
         assertFalse(fixture.controller.onStartCommand(request).accepted)
@@ -640,11 +667,13 @@ class OptimizationServiceControllerTest {
         val request = ServiceRunRequest.Restore(
             treeUri = "content://tree/restore",
             undoLogId = "undo-timeout-scope",
-            selection = RestoreSelection.Entries(setOf("a", "b", "c", "d"))
+            selection = confirmedEntries("a", "b", "c", "d")
         )
 
         assertTrue(fixture.controller.onStartCommand(request).accepted)
         fixture.controller.onTimeout()
+        assertTrue(fixture.repository.currentState is RunState.Running)
+        fixture.runtime.runNext()
 
         val terminal = fixture.repository.currentState as RunState.Terminal
         assertEquals(RunStatus.CANCELLED, terminal.report.status)
@@ -749,6 +778,10 @@ class OptimizationServiceControllerTest {
         fixture.controller.onStartCommand(optimizeRequest())
 
         fixture.controller.onTimeout()
+        assertTrue(fixture.repository.currentState is RunState.Running)
+        assertEquals(0, fixture.events.count { it == "stop" })
+        fixture.runtime.runNext()
+        fixture.runtime.timeoutDeliveryThread.get()?.join(2_000)
 
         val terminal = fixture.repository.currentState as RunState.Terminal
         assertActionableTimeout(terminal)
@@ -759,8 +792,6 @@ class OptimizationServiceControllerTest {
             fixture.events.indexOf("timeout-notification") < fixture.events.indexOf("stop")
         )
         assertFalse(fixture.controller.cancelActive())
-        fixture.runtime.runNext()
-        fixture.runtime.timeoutDeliveryThread.get()?.join(2_000)
         subscription.close()
 
         assertTrue(fixture.runtime.requests.isEmpty())
@@ -770,7 +801,7 @@ class OptimizationServiceControllerTest {
     }
 
     @Test
-    fun api35TimeoutFinalizesPromptlyWhileActiveWorkerLaterCancelsReturnsOrFails() {
+    fun api35TimeoutWaitsForActiveWorkerOutcomeBeforePublishingAndStopping() {
         LateWorkerOutcome.entries.forEach { lateOutcome ->
             val fixture = Fixture()
             fixture.runtime.lateWorkerOutcome = lateOutcome
@@ -808,15 +839,10 @@ class OptimizationServiceControllerTest {
             assertTrue("timeout waited for active worker for $lateOutcome", timeoutReturned.await(1, TimeUnit.SECONDS))
             assertNull(timeoutFailure.get())
             assertTrue("worker unexpectedly returned before release for $lateOutcome", worker.isAlive)
-            val timeoutTerminal = fixture.repository.currentState as RunState.Terminal
-            assertActionableTimeout(timeoutTerminal)
-            assertEquals(1, fixture.storage.writes.size)
-            assertEquals(1, fixture.runtime.timeoutTerminalNotifications.size)
-            assertActionableTimeout(fixture.runtime.timeoutTerminalNotifications.single())
-            assertEquals(1, fixture.events.count { it == "stop" })
-            assertTrue(
-                fixture.events.indexOf("timeout-notification") < fixture.events.indexOf("stop")
-            )
+            assertTrue(fixture.repository.currentState is RunState.Running)
+            assertTrue(fixture.storage.writes.isEmpty())
+            assertTrue(fixture.runtime.timeoutTerminalNotifications.isEmpty())
+            assertEquals(0, fixture.events.count { it == "stop" })
 
             fixture.runtime.releaseRun.countDown()
             worker.join(2_000)
@@ -826,6 +852,20 @@ class OptimizationServiceControllerTest {
             assertFalse("worker did not finish for $lateOutcome", worker.isAlive)
             assertNull(workerFailure.get())
             assertNull(fixture.runtime.timeoutDeliveryFailure.get())
+            val terminal = fixture.repository.currentState as RunState.Terminal
+            when (lateOutcome) {
+                LateWorkerOutcome.CANCELLED -> assertActionableTimeout(terminal)
+                LateWorkerOutcome.RESULT -> assertEquals(RunStatus.COMPLETED, terminal.report.status)
+                LateWorkerOutcome.FAILURE -> {
+                    assertEquals(RunStatus.FAILED, terminal.report.status)
+                    assertTrue(terminal.report.terminalError!!.contains("late worker failure"))
+                }
+            }
+            assertEquals(1, fixture.storage.writes.size)
+            assertEquals(1, fixture.runtime.timeoutTerminalNotifications.size)
+            assertTrue(
+                fixture.events.indexOf("timeout-notification") < fixture.events.indexOf("stop")
+            )
             assertEquals(1, observed.count { it is RunState.Terminal })
             assertEquals(1, fixture.events.count { it == "terminal" })
             assertEquals(1, fixture.events.count { it == "stop" })
@@ -833,7 +873,36 @@ class OptimizationServiceControllerTest {
     }
 
     @Test
-    fun api35TimeoutCommitsAndStopsWhileProgressListenerIsBlockedThenRetiresLateDelivery() {
+    fun api35TimeoutDefersTerminalAndStopUntilTheActiveWorkerFinishesRepair() {
+        val fixture = Fixture()
+        fixture.runtime.lateWorkerOutcome = LateWorkerOutcome.FAILURE
+        fixture.controller.onStartCommand(optimizeRequest())
+        val worker = Thread { fixture.runtime.runNext() }.apply {
+            isDaemon = true
+            start()
+        }
+        assertTrue(fixture.runtime.runEntered.await(2, TimeUnit.SECONDS))
+
+        fixture.controller.onTimeout()
+
+        assertTrue(fixture.repository.currentState is RunState.Running)
+        assertEquals(0, fixture.events.count { it == "stop" })
+        assertTrue(fixture.runtime.timeoutTerminalNotifications.isEmpty())
+
+        fixture.runtime.releaseRun.countDown()
+        worker.join(2_000)
+        fixture.runtime.timeoutDeliveryThread.get()?.join(2_000)
+
+        assertFalse(worker.isAlive)
+        val terminal = fixture.repository.currentState as RunState.Terminal
+        assertEquals(RunStatus.FAILED, terminal.report.status)
+        assertTrue(terminal.report.terminalError!!.contains("late worker failure"))
+        assertEquals(1, fixture.events.count { it == "stop" })
+        assertEquals(1, fixture.runtime.timeoutTerminalNotifications.size)
+    }
+
+    @Test
+    fun api35TimeoutDefersTerminalWhileProgressDeliveryAndWorkerAreStillActive() {
         val fixture = Fixture(recordPersistenceEvents = true)
         fixture.runtime.progressToEmit += ProgressSnapshot(
             phase = "optimizing",
@@ -879,21 +948,23 @@ class OptimizationServiceControllerTest {
             assertTrue("timeout waited for progress listener delivery", returnedPromptly)
             assertNull(timeoutFailure.get())
             assertTrue(worker.isAlive)
-            assertEquals(RunStatus.CANCELLED, (fixture.repository.currentState as RunState.Terminal).report.status)
-            assertEquals(1, fixture.storage.writes.size)
-            assertTrue(fixture.events.indexOf("persist") < fixture.events.indexOf("stop"))
-            assertEquals(1, fixture.events.count { it == "stop" })
+            assertTrue(fixture.repository.currentState is RunState.Running)
+            assertTrue(fixture.storage.writes.isEmpty())
+            assertEquals(0, fixture.events.count { it == "stop" })
         } finally {
             releaseProgressDelivery.countDown()
             worker.join(2_000)
             timeoutThread.join(2_000)
+            fixture.runtime.timeoutDeliveryThread.get()?.join(2_000)
             subscription.close()
         }
 
         assertFalse(worker.isAlive)
         assertFalse(timeoutThread.isAlive)
         assertNull(workerFailure.get())
-        assertEquals(RunStatus.CANCELLED, (fixture.repository.currentState as RunState.Terminal).report.status)
+        assertEquals(RunStatus.COMPLETED, (fixture.repository.currentState as RunState.Terminal).report.status)
+        assertEquals(1, fixture.storage.writes.size)
+        assertTrue(fixture.events.indexOf("persist") < fixture.events.indexOf("stop"))
         assertEquals(1, observed.count { it is RunState.Terminal })
         val terminalIndex = observed.indexOfFirst { it is RunState.Terminal }
         assertFalse(observed.drop(terminalIndex + 1).any { it is RunState.Running })
@@ -916,24 +987,17 @@ class OptimizationServiceControllerTest {
             }
         }
         fixture.controller.onStartCommand(optimizeRequest())
-        val timeoutReturned = CountDownLatch(1)
-        val timeoutFailure = AtomicReference<Throwable?>()
-        val timeoutThread = Thread {
-            try {
-                fixture.controller.onTimeout()
-            } catch (failure: Throwable) {
-                timeoutFailure.set(failure)
-            } finally {
-                timeoutReturned.countDown()
-            }
-        }.apply { isDaemon = true }
-        timeoutThread.start()
+        fixture.controller.onTimeout()
+        assertTrue(fixture.repository.currentState is RunState.Running)
+        val worker = Thread { fixture.runtime.runNext() }.apply {
+            isDaemon = true
+            start()
+        }
 
         assertTrue("terminal delivery did not start", terminalDeliveryEntered.await(2, TimeUnit.SECONDS))
-        val returnedPromptly = timeoutReturned.await(1, TimeUnit.SECONDS)
+        worker.join(2_000)
         try {
-            assertTrue("timeout waited for its terminal observer", returnedPromptly)
-            assertNull(timeoutFailure.get())
+            assertFalse("worker waited for terminal observer", worker.isAlive)
             assertEquals(
                 RunStatus.CANCELLED,
                 (fixture.repository.currentState as RunState.Terminal).report.status
@@ -956,11 +1020,8 @@ class OptimizationServiceControllerTest {
         }
 
         assertTrue(terminalDeliveryCompleted.await(2, TimeUnit.SECONDS))
-        timeoutThread.join(2_000)
         fixture.runtime.timeoutDeliveryThread.get()?.join(2_000)
-        fixture.runtime.runNext()
 
-        assertFalse(timeoutThread.isAlive)
         assertNull(fixture.runtime.timeoutDeliveryFailure.get())
         assertEquals(1, observed.count { it is RunState.Terminal })
         assertEquals(1, fixture.runtime.timeoutTerminalNotifications.size)
@@ -1140,6 +1201,13 @@ class OptimizationServiceControllerTest {
             treeUri = "content://tree/restore",
             undoLogId = undoLogId,
             selection = RestoreSelection.All
+        )
+
+        fun confirmedEntries(vararg paths: String) = RestoreSelection.Entries(
+            relativePaths = paths.toCollection(linkedSetOf()),
+            undoDocumentId = "undo-node",
+            entryCount = paths.size,
+            undoSha256 = "a".repeat(64)
         )
 
         fun runningState(sequence: Int): RunState.Running = RunState.Running(

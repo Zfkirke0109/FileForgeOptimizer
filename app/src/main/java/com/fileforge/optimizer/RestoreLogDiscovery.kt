@@ -1,5 +1,6 @@
 package com.fileforge.optimizer
 
+import java.io.FilterInputStream
 import java.io.InputStreamReader
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
@@ -9,8 +10,19 @@ import java.util.concurrent.atomic.AtomicReference
 
 data class DiscoveredUndoLog(
     val undoLogId: String,
-    val run: UndoRun
-)
+    val run: UndoRun,
+    val documentId: String,
+    val contentSha256: String
+) {
+    init {
+        require(undoLogId.isNotBlank() && documentId.isNotBlank()) {
+            "Undo log identity is required"
+        }
+        require(contentSha256.length == 64 && contentSha256.all { it in '0'..'9' || it in 'a'..'f' }) {
+            "Undo log SHA-256 must be lowercase hexadecimal"
+        }
+    }
+}
 
 data class RestoreDiscoveryFailure(
     val undoLogId: String,
@@ -21,6 +33,23 @@ data class RestoreDiscoveryResult(
     val runs: List<DiscoveredUndoLog>,
     val failures: List<RestoreDiscoveryFailure>
 )
+
+data class RestoreDiscoveryLimits(
+    val maxDirectChildren: Int = RestoreLogDiscovery.MAX_DIRECT_CHILDREN,
+    val maxUndoLogs: Int = 128,
+    val maxAggregateEntries: Int = 10_000,
+    val maxAggregateBytes: Long = 64L * 1024L * 1024L,
+    val maxFailures: Int = 128
+) {
+    init {
+        require(maxDirectChildren >= 0 && maxUndoLogs >= 0 && maxAggregateEntries >= 0) {
+            "Restore discovery count limits must be nonnegative"
+        }
+        require(maxAggregateBytes >= 0 && maxFailures > 0) {
+            "Restore discovery byte/failure limits are invalid"
+        }
+    }
+}
 
 class RestoreDiscoveryVisibilityGate {
     class Generation internal constructor(val id: Long) {
@@ -183,7 +212,8 @@ class RestoreDiscoverySession(
 class RestoreLogDiscovery(
     private val documentGateway: DocumentGateway,
     private val selectedRoot: DocumentNode,
-    private val undoLogs: UndoLogRepository = UndoLogRepository()
+    private val undoLogs: UndoLogRepository = UndoLogRepository(),
+    private val limits: RestoreDiscoveryLimits = RestoreDiscoveryLimits()
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
     private val activeInput = AtomicReference<InputStream?>(null)
@@ -193,9 +223,20 @@ class RestoreLogDiscovery(
         checkOpen(cancellation)
         val runs = mutableListOf<DiscoveredUndoLog>()
         val failures = mutableListOf<RestoreDiscoveryFailure>()
-        documentGateway.list(selectedRoot).forEach { child ->
+        var undoLogsSeen = 0
+        var aggregateEntries = 0
+        var aggregateBytes = 0L
+        fun recordFailure(undoLogId: String, message: String) {
+            if (failures.size < limits.maxFailures) failures += RestoreDiscoveryFailure(undoLogId, message)
+        }
+        for (child in documentGateway.listBounded(selectedRoot, limits.maxDirectChildren)) {
             checkOpen(cancellation)
-            if (child.isDirectory || !isRecognizedUndoLogName(child.name)) return@forEach
+            if (child.isDirectory || !isRecognizedUndoLogName(child.name)) continue
+            if (undoLogsSeen == limits.maxUndoLogs) {
+                recordFailure("selected folder", "Undo log count exceeds the discovery log count budget")
+                break
+            }
+            undoLogsSeen++
             try {
                 val input = documentGateway.openRead(child)
                 try {
@@ -211,9 +252,25 @@ class RestoreLogDiscovery(
                     }
                     throw failure
                 }
+                val budgetedInput = object : FilterInputStream(input) {
+                    private fun consume(read: Int): Int {
+                        if (read > 0) {
+                            if (aggregateBytes > limits.maxAggregateBytes - read) {
+                                throw IllegalArgumentException("Aggregate undo-log byte budget exceeded")
+                            }
+                            aggregateBytes += read
+                        }
+                        return read
+                    }
+
+                    override fun read(): Int = super.read().also { if (it >= 0) consume(1) }
+                    override fun read(target: ByteArray, offset: Int, length: Int): Int =
+                        consume(super.read(target, offset, length))
+                }
+                val trackedInput = IntegrityTrackingInputStream(budgetedInput)
                 var reader: InputStreamReader? = null
                 val run = try {
-                    reader = InputStreamReader(input, Charsets.UTF_8)
+                    reader = InputStreamReader(trackedInput, Charsets.UTF_8)
                     undoLogs.readStreamingForRestore(
                         reader,
                         CancellationToken { checkOpen(cancellation) }
@@ -224,15 +281,18 @@ class RestoreLogDiscovery(
                     }
                 }
                 validate(run)
-                runs += DiscoveredUndoLog(child.name, run)
+                if (run.entries.isNotEmpty()) {
+                    if (run.entries.size > limits.maxAggregateEntries - aggregateEntries) {
+                        throw IllegalArgumentException("Aggregate undo-log entry budget exceeded")
+                    }
+                    aggregateEntries += run.entries.size
+                    runs += DiscoveredUndoLog(child.name, run, child.id, trackedInput.finish().sha256)
+                }
             } catch (cancelled: OptimizationCancelledException) {
                 throw cancelled
             } catch (failure: Throwable) {
                 if (failure.isVmFatal()) throw failure
-                failures += RestoreDiscoveryFailure(
-                    child.name,
-                    failure.message ?: "Undo log could not be parsed"
-                )
+                recordFailure(child.name, failure.message ?: "Undo log could not be parsed")
             }
         }
         return RestoreDiscoveryResult(runs, failures)
@@ -287,16 +347,19 @@ class RestoreLogDiscovery(
 
     private fun validate(run: UndoRun) {
         DocumentPathPolicy.requireSafeSegment(run.header.runId)
-        require(run.entries.isNotEmpty()) { "Undo log has no restorable entries" }
+        require(run.entries.isNotEmpty() || run.terminal?.entriesCommitted == 0) {
+            "Undo log has no restorable entries"
+        }
     }
 
     private fun isRecognizedUndoLogName(name: String): Boolean =
         V2_NAME.matches(name) || LEGACY_NAME.matches(name)
 
-    private companion object {
-        const val CLOSE_WAIT_MILLIS = 250L
-        val V2_NAME = Regex("FileForge_Undo_v2_[^/\\\\]+\\.jsonl")
-        val LEGACY_NAME = Regex("FileForge_Undo_(?!v2_)[^/\\\\]+\\.txt")
+    internal companion object {
+        const val MAX_DIRECT_CHILDREN = 10_000
+        private const val CLOSE_WAIT_MILLIS = 250L
+        private val V2_NAME = Regex("FileForge_Undo_v2_[^/\\\\]+\\.jsonl")
+        private val LEGACY_NAME = Regex("FileForge_Undo_(?!v2_)[^/\\\\]+\\.txt")
     }
 }
 
@@ -319,8 +382,13 @@ data class RestoreRunCard(
     val entries: List<RestoreRunEntryCard>
 ) {
     companion object {
-        fun from(undoLogId: String, run: UndoRun): RestoreRunCard {
-            val entries = run.entries.map { entry ->
+        fun from(
+            undoLogId: String,
+            run: UndoRun,
+            visibleEntryLimit: Int = Int.MAX_VALUE
+        ): RestoreRunCard {
+            require(visibleEntryLimit >= 0) { "Visible entry limit must be nonnegative" }
+            val entries = run.entries.asSequence().take(visibleEntryLimit).map { entry ->
                 RestoreRunEntryCard(
                     entry.relativePath,
                     entry.originalBytes,
@@ -328,13 +396,13 @@ data class RestoreRunCard(
                     entry.backupPath,
                     verificationLabel(entry.verificationLevel)
                 )
-            }
+            }.toList()
             return RestoreRunCard(
                 undoLogId = undoLogId,
                 runId = run.header.runId,
                 runDate = run.header.startedAt,
                 status = run.status,
-                entryCount = entries.size,
+                entryCount = run.entries.size,
                 recoverableBytes = run.entries.fold(0L) { total, entry ->
                     if (Long.MAX_VALUE - total < entry.originalBytes) Long.MAX_VALUE
                     else total + entry.originalBytes
@@ -350,7 +418,7 @@ data class RestoreRunCard(
 
         fun verificationLabel(level: UndoVerificationLevel): String = when (level) {
             UndoVerificationLevel.SHA_256 -> "SHA-256 verified"
-            UndoVerificationLevel.LEGACY_SIZE_ONLY -> "Legacy size-only verification"
+            UndoVerificationLevel.LEGACY_SIZE_ONLY -> "Legacy record — view only"
         }
     }
 }

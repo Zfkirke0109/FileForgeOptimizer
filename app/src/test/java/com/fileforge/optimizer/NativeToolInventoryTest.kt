@@ -9,7 +9,7 @@ class NativeToolInventoryTest {
     fun currentInjectableInventoryHonestlyReportsNativeToolsUnavailable() {
         val tools = UnavailableNativeToolInventory.snapshot()
 
-        assertEquals(listOf("pngquant", "jpegoptim", "oxipng", "ffmpeg"), tools.map { it.name })
+        assertEquals(listOf("qpdf", "oxipng", "jpegtran", "zopflipng", "zipalign"), tools.map { it.name })
         assertFalse(tools.any { it.available })
         assertEquals(setOf("Unavailable in this build"), tools.map { it.detail }.toSet())
     }

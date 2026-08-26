@@ -89,16 +89,17 @@ internal object StreamIntegrityChecker {
 internal object DocumentPathPolicy {
     fun requireSafeSegment(value: String): String {
         requireWellFormedUtf16(value)
-        require(value.isNotBlank() && value != "." && value != ".." &&
-            value.none { it == '/' || it == '\\' || it == ':' }) { "Unsafe path segment" }
+        require(value.isNotEmpty() && value != "." && value != ".." && '/' !in value) {
+            "Unsafe path segment"
+        }
         return value
     }
 
     fun requireSafeRelative(path: String): List<String> {
         requireWellFormedUtf16(path)
-        require(path.isNotBlank() && !path.startsWith('/') && !path.startsWith('\\')) { "Path must be relative" }
+        require(path.isNotEmpty() && !path.startsWith('/')) { "Path must be relative" }
         val segments = path.split('/')
-        require(segments.none { it.isEmpty() || it == "." || it == ".." || it.contains('\\') || it.contains(':') }) {
+        require(segments.none { it.isEmpty() || it == "." || it == ".." }) {
             "Unsafe relative path"
         }
         return segments

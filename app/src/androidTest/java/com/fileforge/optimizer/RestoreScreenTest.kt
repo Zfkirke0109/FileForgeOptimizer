@@ -5,6 +5,8 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.action.ViewActions.click
+import androidx.test.espresso.action.ViewActions.scrollTo
+import androidx.test.espresso.assertion.ViewAssertions.doesNotExist
 import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
 import androidx.test.espresso.matcher.ViewMatchers.isEnabled
@@ -72,14 +74,41 @@ class RestoreScreenTest {
             onView(withId(R.id.navigation_restore)).perform(click())
 
             onView(withText("SHA-256 verified")).check(matches(isDisplayed()))
-            onView(withText("Legacy size-only verification")).check(matches(isDisplayed()))
+            onView(withText("Legacy record — view only")).check(matches(isDisplayed()))
             onView(withText("run-42")).check(matches(isDisplayed()))
+            onView(withContentDescription("Select docs/report.txt")).check(matches(not(isEnabled())))
             onView(withContentDescription("Select all from run-42")).perform(click())
-            onView(withContentDescription("Select docs/report.txt")).perform(click())
             onView(withId(R.id.restore_selected)).check(matches(isEnabled())).perform(click())
 
             onView(withText("Restore 1 file?")).check(matches(isDisplayed()))
             onView(withText("Backups and undo logs remain after restore.")).check(matches(isDisplayed()))
+        }
+    }
+
+    @Test
+    fun largeUndoRunCreatesEntryViewsOnePageAtATime() {
+        val discovered = restoreFixture().runs.single()
+        val template = discovered.run.entries.first()
+        val entries = List(101) { index ->
+            template.copy(
+                relativePath = "bulk/$index.txt",
+                backupPath = "FileForge_Backups_run-42/bulk/$index.txt"
+            )
+        }
+        RestoreScreenTestHooks.install(
+            selectedTree = SelectedTreeCapabilities.READ_WRITE_DIRECTORY,
+            discovery = RestoreDiscoveryResult(
+                listOf(discovered.copy(run = discovered.run.copy(entries = entries))),
+                emptyList()
+            )
+        )
+
+        ActivityScenario.launch(MainActivity::class.java).use {
+            onView(withId(R.id.navigation_restore)).perform(click())
+
+            onView(withContentDescription("Select bulk/100.txt")).check(doesNotExist())
+            onView(withContentDescription("Show more entries from run-42")).perform(scrollTo(), click())
+            onView(withContentDescription("Select bulk/100.txt")).perform(scrollTo()).check(matches(isDisplayed()))
         }
     }
 
@@ -129,8 +158,7 @@ class RestoreScreenTest {
             scenario.recreate()
 
             onView(withContentDescription("Select docs/report.txt"))
-                .check(matches(not(isChecked())))
-            onView(withContentDescription("Select docs/report.txt")).perform(click())
+                .check(matches(not(isChecked()))).check(matches(not(isEnabled())))
             onView(withId(R.id.restore_selected)).perform(click())
             onView(withText("Restore 1 file?")).check(matches(isDisplayed()))
         }
@@ -156,7 +184,12 @@ class RestoreScreenTest {
                     ServiceRunRequest.Restore(
                         treeUri = "content://test/selected-root",
                         undoLogId = "FileForge_Undo_v2_run-42.jsonl",
-                        selection = RestoreSelection.Entries(setOf("photos/holiday.jpg"))
+                        selection = RestoreSelection.Entries(
+                            relativePaths = setOf("photos/holiday.jpg"),
+                            undoDocumentId = "provider/document/undo-run-42",
+                            entryCount = 2,
+                            undoSha256 = "c".repeat(64)
+                        )
                     )
                 ),
                 launches
@@ -212,7 +245,21 @@ class RestoreScreenTest {
         val launches = mutableListOf<ServiceRunRequest.Restore>()
         val second = restoreFixture().runs.single().copy(
             undoLogId = "FileForge_Undo_v2_second.jsonl",
-            run = restoreFixture().runs.single().run.copy(header = UndoHeader("second", "2026-08-13T20:00:00Z"))
+            documentId = "provider/document/undo-second",
+            contentSha256 = "d".repeat(64),
+            run = restoreFixture().runs.single().run.let { run ->
+                run.copy(
+                    header = UndoHeader("second", "2026-08-13T20:00:00Z"),
+                    entries = run.entries.map { entry ->
+                        if (entry.isRestoreEligible) entry else entry.copy(
+                            originalSha256 = "c".repeat(64),
+                            optimizedSha256 = "d".repeat(64),
+                            originalDocumentId = "provider/document/${entry.relativePath}",
+                            verificationLevel = UndoVerificationLevel.SHA_256
+                        )
+                    }
+                )
+            }
         )
         RestoreScreenTestHooks.install(
             SelectedTreeCapabilities.READ_WRITE_DIRECTORY,
@@ -230,7 +277,11 @@ class RestoreScreenTest {
                 ServiceRunRequest.Restore(
                     treeUri = "content://test/selected-root",
                     undoLogId = "FileForge_Undo_v2_second.jsonl",
-                    selection = RestoreSelection.All
+                    selection = RestoreSelection.ConfirmedAll(
+                        undoDocumentId = "provider/document/undo-second",
+                        entryCount = 2,
+                        undoSha256 = "d".repeat(64)
+                    )
                 ),
                 launches.single()
             )
@@ -376,7 +427,8 @@ class RestoreScreenTest {
                             "FileForge_Backups_run-42/photos/holiday.jpg",
                             "a".repeat(64), "verified backup",
                             optimizedSha256 = "b".repeat(64), fileKind = FileKind.JPEG,
-                            toolId = "image-optimizer", completedAt = "2026-08-13T19:43:00Z"
+                            toolId = "image-optimizer", completedAt = "2026-08-13T19:43:00Z",
+                            originalDocumentId = "provider/document/photos-holiday"
                         ),
                         UndoEntry(
                             "docs/report.txt", 1_024, 512,
@@ -387,7 +439,9 @@ class RestoreScreenTest {
                         )
                     ),
                     RunStatus.COMPLETED
-                )
+                ),
+                documentId = "provider/document/undo-run-42",
+                contentSha256 = "c".repeat(64)
             )
         ),
         failures = emptyList()

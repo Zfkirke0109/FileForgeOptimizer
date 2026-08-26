@@ -2,6 +2,7 @@ package com.fileforge.optimizer
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.InputStream
@@ -13,6 +14,105 @@ import java.util.concurrent.TimeUnit
  * Guards the Restore destination's read-only, selected-root-only discovery boundary.
  */
 class RestoreLogDiscoveryTest {
+    @Test
+    fun discoveryRequestsABoundedProviderListingInsteadOfMaterializingUnlimitedChildren() {
+        val delegate = RecordingDocumentGateway().apply {
+            put("FileForge_Undo_v2_bounded.jsonl", v2Log("bounded", "docs/a.txt", 10, 5))
+            events.clear()
+        }
+        var requestedLimit = -1
+        val gateway = object : DocumentGateway by delegate {
+            override fun list(node: DocumentNode): List<DocumentNode> =
+                throw AssertionError("unbounded listing must not be used")
+
+            override fun listBounded(node: DocumentNode, maxChildren: Int): List<DocumentNode> {
+                requestedLimit = maxChildren
+                return delegate.list(node)
+            }
+        }
+
+        val result = RestoreLogDiscovery(gateway, delegate.root).discover()
+
+        assertEquals(RestoreLogDiscovery.MAX_DIRECT_CHILDREN, requestedLimit)
+        assertEquals(listOf("bounded"), result.runs.map { it.run.header.runId })
+    }
+
+    @Test
+    fun discoveryStopsAtTheAggregateUndoLogBudget() {
+        val gateway = RecordingDocumentGateway().apply {
+            (1..3).forEach { index ->
+                put("FileForge_Undo_v2_run-$index.jsonl", v2Log("run-$index", "docs/$index.txt", 10, 5))
+            }
+            events.clear()
+        }
+
+        val result = RestoreLogDiscovery(
+            gateway,
+            gateway.root,
+            limits = RestoreDiscoveryLimits(maxUndoLogs = 2)
+        ).discover()
+
+        assertEquals(2, result.runs.size)
+        assertEquals(1, result.failures.size)
+        assertTrue(result.failures.single().message.contains("log count", ignoreCase = true))
+    }
+
+    @Test
+    fun discoveryStopsRetainingRunsAtTheAggregateEntryBudget() {
+        val gateway = RecordingDocumentGateway().apply {
+            put("FileForge_Undo_v2_first.jsonl", v2Log("first", "docs/first.txt", 10, 5))
+            put("FileForge_Undo_v2_second.jsonl", v2Log("second", "docs/second.txt", 10, 5))
+            events.clear()
+        }
+
+        val result = RestoreLogDiscovery(
+            gateway,
+            gateway.root,
+            limits = RestoreDiscoveryLimits(maxAggregateEntries = 1)
+        ).discover()
+
+        assertEquals(listOf("first"), result.runs.map { it.run.header.runId })
+        assertEquals(1, result.failures.size)
+        assertTrue(result.failures.single().message.contains("entry budget", ignoreCase = true))
+    }
+
+    @Test
+    fun discoveryCapsAggregateRawBytesAndRetainedFailures() {
+        val first = v2Log("first", "docs/first.txt", 10, 5)
+        val gateway = RecordingDocumentGateway().apply {
+            put("FileForge_Undo_v2_first.jsonl", first)
+            put("FileForge_Undo_v2_second.jsonl", v2Log("second", "docs/second.txt", 10, 5))
+            put("FileForge_Undo_v2_third.jsonl", "malformed".encodeToByteArray())
+            events.clear()
+        }
+
+        val result = RestoreLogDiscovery(
+            gateway,
+            gateway.root,
+            limits = RestoreDiscoveryLimits(maxAggregateBytes = first.size.toLong() + 8L, maxFailures = 1)
+        ).discover()
+
+        assertEquals(listOf("first"), result.runs.map { it.run.header.runId })
+        assertEquals(1, result.failures.size)
+        assertTrue(result.failures.single().message.contains("byte budget", ignoreCase = true))
+    }
+
+    @Test
+    fun discoveryBindsEachRunToTheExactRawUndoDocumentBytes() {
+        val firstBytes = v2Log("first", "docs/report.txt", 100, 50)
+        val gateway = RecordingDocumentGateway().apply {
+            put("FileForge_Undo_v2_first.jsonl", firstBytes)
+            put("FileForge_Undo_v2_second.jsonl", firstBytes + '\n'.code.toByte())
+            events.clear()
+        }
+
+        val hashes = RestoreLogDiscovery(gateway, gateway.root).discover().runs.map { it.contentSha256 }
+
+        assertEquals(2, hashes.size)
+        assertTrue(hashes.all { it.length == 64 })
+        assertNotEquals(hashes[0], hashes[1])
+    }
+
     @Test
     fun discoversOnlyDirectRecognizedNonEmptyUndoLogsWithoutWritingDocuments() {
         val gateway = RecordingDocumentGateway().apply {
@@ -56,6 +156,26 @@ class RestoreLogDiscoveryTest {
             result.failures.map { it.undoLogId }.toSet()
         )
         assertFalse(gateway.events.any { it.startsWith("write:") || it.startsWith("create-file:") || it.startsWith("mkdir:") })
+    }
+
+    @Test
+    fun ignoresValidFinalizedRunsThatCommittedNoRestorableEntries() {
+        val gateway = RecordingDocumentGateway().apply {
+            put(
+                "FileForge_Undo_v2_no-op.jsonl",
+                (v2Header("no-op") + "\n" +
+                    "{\"schemaVersion\":2,\"recordType\":\"terminal\",\"status\":\"COMPLETED\"," +
+                    "\"completedAt\":\"2026-08-13T19:44:00Z\",\"entriesCommitted\":0,\"scanned\":1," +
+                    "\"optimized\":0,\"skipped\":1,\"errors\":0,\"savedBytes\":0," +
+                    "\"bytesRead\":1,\"bytesWritten\":0,\"potentialSavingsBytes\":0}\n").encodeToByteArray()
+            )
+            events.clear()
+        }
+
+        val result = RestoreLogDiscovery(gateway, gateway.root).discover()
+
+        assertTrue(result.runs.isEmpty())
+        assertTrue(result.failures.isEmpty())
     }
 
     @Test
@@ -103,6 +223,7 @@ class RestoreLogDiscoveryTest {
         val log = DocumentNode("blocked", "FileForge_Undo_v2_blocked.jsonl", isDirectory = false, length = 0)
         val gateway = object : DocumentGateway by delegate {
             override fun list(node: DocumentNode): List<DocumentNode> = listOf(log)
+            override fun listBounded(node: DocumentNode, maxChildren: Int): List<DocumentNode> = list(node)
             override fun openRead(node: DocumentNode): InputStream = stream
         }
         val discovery = RestoreLogDiscovery(gateway, delegate.root)
@@ -130,6 +251,7 @@ class RestoreLogDiscoveryTest {
         val log = DocumentNode("close-fails", "FileForge_Undo_v2_close-fails.jsonl", isDirectory = false, length = 0)
         val gateway = object : DocumentGateway by delegate {
             override fun list(node: DocumentNode): List<DocumentNode> = listOf(log)
+            override fun listBounded(node: DocumentNode, maxChildren: Int): List<DocumentNode> = list(node)
             override fun openRead(node: DocumentNode): InputStream = stream
         }
         val discovery = RestoreLogDiscovery(gateway, delegate.root)
@@ -168,6 +290,7 @@ class RestoreLogDiscoveryTest {
         val log = DocumentNode("fatal-close", "FileForge_Undo_v2_fatal-close.jsonl", isDirectory = false, length = 0)
         val gateway = object : DocumentGateway by delegate {
             override fun list(node: DocumentNode): List<DocumentNode> = listOf(log)
+            override fun listBounded(node: DocumentNode, maxChildren: Int): List<DocumentNode> = list(node)
             override fun openRead(node: DocumentNode): InputStream = stream
         }
         val discovery = RestoreLogDiscovery(gateway, delegate.root)
@@ -215,6 +338,26 @@ class RestoreLogDiscoveryTest {
         assertEquals(7, card.entries.first().optimizedBytes)
         assertEquals("FileForge_Backups_overflow-run/photos/a.jpg", card.entries.first().backupPath)
         assertEquals("SHA-256 verified", card.entries.first().verificationLabel)
+    }
+
+    @Test
+    fun cardProjectionMaterializesOnlyTheRequestedEntryPage() {
+        val entries = List(101) { index -> entry("docs/$index.txt", 1, 1) }
+        val run = UndoRun(
+            header = UndoHeader("paged-run", "2026-08-13T19:42:00Z"),
+            entries = entries,
+            status = RunStatus.COMPLETED
+        )
+
+        val card = RestoreRunCard.from(
+            "FileForge_Undo_v2_paged-run.jsonl",
+            run,
+            visibleEntryLimit = 100
+        )
+
+        assertEquals(101, card.entryCount)
+        assertEquals(100, card.entries.size)
+        assertEquals("docs/99.txt", card.entries.last().relativePath)
     }
 
     private fun entry(path: String, originalBytes: Long, optimizedBytes: Long) = UndoEntry(

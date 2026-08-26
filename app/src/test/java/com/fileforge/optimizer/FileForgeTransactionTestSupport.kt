@@ -62,6 +62,22 @@ internal class RecordingDocumentGateway : DocumentGateway {
         bytes[node.id] = contents.copyOf()
     }
 
+    fun replaceDocumentIdentity(relativePath: String, replacementId: String, contents: ByteArray) {
+        val segments = relativePath.split('/')
+        var parent = root
+        segments.dropLast(1).forEach { name ->
+            parent = resolve(parent, name) ?: error("No directory at $name")
+        }
+        val name = segments.last()
+        val oldId = children[parent.id]?.get(name) ?: error("No node at $relativePath")
+        val old = nodes.remove(oldId) ?: error("No node for $oldId")
+        bytes.remove(oldId)
+        val replacement = DocumentNode(replacementId, old.name, isDirectory = false, length = contents.size.toLong())
+        nodes[replacementId] = replacement
+        children.getValue(parent.id)[name] = replacementId
+        bytes[replacementId] = contents.copyOf()
+    }
+
     fun node(relativePath: String): DocumentNode? {
         var current = root
         relativePath.split('/').forEach { name ->
@@ -115,6 +131,18 @@ internal class RecordingDocumentGateway : DocumentGateway {
     override fun createFile(parent: DocumentNode, mimeType: String, name: String): DocumentNode {
         event("create-file:${parent.id}:$name")
         return create(parent, name, false).also { bytes[it.id] = byteArrayOf() }
+    }
+
+    override fun delete(node: DocumentNode): Boolean {
+        event("delete:${node.id}")
+        if (node.isDirectory && list(node).isNotEmpty()) return false
+        val parentId = children.entries.firstOrNull { (_, namedChildren) -> node.id in namedChildren.values }?.key
+            ?: return false
+        children.getValue(parentId).entries.removeIf { it.value == node.id }
+        children.remove(node.id)
+        bytes.remove(node.id)
+        nodes.remove(node.id)
+        return true
     }
 
     override fun length(node: DocumentNode): Long = bytes[node.id]?.size?.toLong() ?: node.length

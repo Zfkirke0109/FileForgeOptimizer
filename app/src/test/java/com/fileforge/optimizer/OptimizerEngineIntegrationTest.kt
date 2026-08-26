@@ -203,11 +203,30 @@ class OptimizerEngineIntegrationTest {
         assertEquals(1, report.errors)
         assertEquals(0, report.optimized)
         assertEquals(RunStatus.COMPLETED_WITH_ERRORS, report.status)
+        assertEquals(listOf("broken.zip: provider interrupted the read"), report.terminalFailures)
         val undo = readUndo(gateway)
         assertEquals(RunStatus.COMPLETED_WITH_ERRORS, undo.status)
         assertNotNull(undo.terminal)
         assertEquals(0, undo.terminal!!.entriesCommitted)
         assertEquals(1, undo.terminal!!.errors)
+    }
+
+    @Test
+    fun fileFailureDetailsAreBoundedInCountAndLength() = withCache { cache ->
+        val gateway = EngineDocumentGateway().apply {
+            repeat(25) { index ->
+                val path = "broken-${index.toString().padStart(2, '0')}.zip"
+                put(path, compressibleZip)
+                failRead(path, IOException("provider failure ${"x".repeat(1_024)}"))
+            }
+            resetObservations()
+        }
+
+        val report = engine(gateway, cache, realRun).run(NeverCancelled) {}
+
+        assertEquals(25, report.errors)
+        assertEquals(20, report.terminalFailures.size)
+        assertTrue(report.terminalFailures.all { it.length <= 512 })
     }
 
     private fun engine(gateway: EngineDocumentGateway, cache: File, intent: RunIntent): OptimizerEngine =

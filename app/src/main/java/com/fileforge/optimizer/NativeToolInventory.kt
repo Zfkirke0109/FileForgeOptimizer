@@ -13,9 +13,9 @@ fun interface NativeToolInventory {
 
 object UnavailableNativeToolInventory : NativeToolInventory {
     override fun snapshot(): List<NativeToolAvailability> =
-        listOf("pngquant", "jpegoptim", "oxipng", "ffmpeg").map { name ->
+        NativeToolId.entries.map { tool ->
             NativeToolAvailability(
-                name,
+                tool.manifestId,
                 available = false,
                 detail = "Unavailable in this build",
                 licenseNotice = "Not bundled"

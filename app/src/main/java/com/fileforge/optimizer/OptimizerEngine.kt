@@ -21,7 +21,8 @@ class OptimizerEngine(
     private val startedAt: () -> String,
     private val completedAt: () -> String,
     private val appVersion: String,
-    private val buildVariant: String
+    private val buildVariant: String,
+    private val nativeToolExecutor: NativeToolExecutor? = null
 ) {
     private val undoRepository = UndoLogRepository()
     private val runClaimed = AtomicBoolean(false)
@@ -60,7 +61,8 @@ class OptimizerEngine(
         startedAt = bridge::timestamp,
         completedAt = bridge::timestamp,
         appVersion = bridge.appVersion,
-        buildVariant = "standard"
+        buildVariant = bridge.buildVariant,
+        nativeToolExecutor = bridge.nativeToolExecutor
     ) {
         compatibilityLogger = logger
     }
@@ -130,16 +132,26 @@ class OptimizerEngine(
                 )
             }
             val streamingCoordinator = if (commitContext == null) {
-                OptimizationCoordinator(documentGateway, candidateStore, runId)
+                OptimizationCoordinator(documentGateway, candidateStore, runId, nativeToolExecutor)
             } else {
                 OptimizationCoordinator(
                     documentGateway,
                     candidateStore,
                     StrictStreamingZipCandidateProcessor,
-                    commitContext
+                    commitContext,
+                    nativeToolExecutor
                 )
             }
             val byteArrayAdapter = ByteArrayOptimizerAdapter(documentGateway, commitContext)
+            val nativeDocumentOptimizer = nativeToolExecutor?.let { executor ->
+                NativeDocumentOptimizer(
+                    documentGateway = documentGateway,
+                    candidateStore = candidateStore,
+                    executor = executor,
+                    fallback = byteArrayAdapter,
+                    commitContext = commitContext
+                )
+            }
 
             val files = TreeCursor(cancellation) { report.errors = checkedIncrement(report.errors) }
             while (true) {
@@ -148,7 +160,13 @@ class OptimizerEngine(
                 filesDiscovered = checkedIncrement(filesDiscovered)
                 report.scanned = checkedIncrement(report.scanned)
                 progress(if (runIntent.dryRun) "analyzing" else "optimizing", file.relativePath)
-                val outcome = process(file, streamingCoordinator, byteArrayAdapter, cancellation)
+                val outcome = process(
+                    file,
+                    streamingCoordinator,
+                    byteArrayAdapter,
+                    nativeDocumentOptimizer,
+                    cancellation
+                )
                 aggregate(report, outcome)
                 filesProcessed = checkedIncrement(filesProcessed)
                 progress(if (runIntent.dryRun) "analyzing" else "optimizing", file.relativePath)
@@ -156,6 +174,17 @@ class OptimizerEngine(
             report.status = if (report.errors == 0) RunStatus.COMPLETED else RunStatus.COMPLETED_WITH_ERRORS
         } catch (_: OptimizationCancelledException) {
             report.status = RunStatus.CANCELLED
+        } catch (rollback: EmergencyRollbackException) {
+            report.errors = saturatingIncrement(report.errors)
+            report.status = RunStatus.FAILED
+            val detail = rollback.rollbackFailure.message ?: rollback.rollbackFailure.javaClass.name
+            report.rollbackFailure = detail
+            report.terminalFailures = TerminalFailureDetails.append(
+                report.terminalFailures,
+                "Emergency rollback failed: $detail",
+                priority = true
+            )
+            report.terminalError = rollback.message ?: "CRITICAL: emergency rollback failed: $detail"
         } catch (poisoned: UndoDurabilityException) {
             undoPoisoned = true
             report.errors = saturatingIncrement(report.errors)
@@ -166,7 +195,11 @@ class OptimizerEngine(
             } else {
                 val detail = rollbackFailure.message ?: rollbackFailure.javaClass.name
                 report.rollbackFailure = detail
-                report.terminalFailures = report.terminalFailures + "Emergency rollback failed: $detail"
+                report.terminalFailures = TerminalFailureDetails.append(
+                    report.terminalFailures,
+                    "Emergency rollback failed: $detail",
+                    priority = true
+                )
                 report.terminalError = "CRITICAL: undo log durability failed and emergency rollback failed: $detail"
             }
             poisoned.fatalPrimary?.let { vmFatal = it }
@@ -231,6 +264,7 @@ class OptimizerEngine(
         file: ScannedFile,
         streamingCoordinator: OptimizationCoordinator,
         byteArrayAdapter: ByteArrayOptimizerAdapter,
+        nativeDocumentOptimizer: NativeDocumentOptimizer?,
         cancellation: CancellationToken
     ): FileOutcome = try {
         val kind = FileTypeDetector.detect(file.node.name, readHeader(file.node, cancellation))
@@ -240,12 +274,16 @@ class OptimizerEngine(
                 FileOutcome.Skipped(file.relativePath, SkipReason.APK_GUARD)
             kind == FileKind.ZIP_LIKE || kind == FileKind.APK ->
                 streamingCoordinator.process(file.node, file.relativePath, runIntent, cancellation)
+            nativeDocumentOptimizer != null ->
+                nativeDocumentOptimizer.process(file.node, file.relativePath, kind, runIntent, cancellation)
             else -> byteArrayAdapter.process(file.node, file.relativePath, kind, runIntent, cancellation)
         }
     } catch (cancelled: OptimizationCancelledException) {
         throw cancelled
     } catch (poisoned: UndoDurabilityException) {
         throw poisoned
+    } catch (invariant: RunInvariantException) {
+        throw invariant
     } catch (failure: Exception) {
         FileOutcome.Failed(file.relativePath, failure.message ?: failure.javaClass.name, failure)
     }
@@ -256,6 +294,8 @@ class OptimizerEngine(
     ) {
         private val frames = ArrayDeque<DirectoryFrame>()
         private val directorySegments = ArrayDeque<String>()
+        private val visitedDirectories = hashSetOf(selectedRoot.id)
+        private var nodesSeen = 0
 
         init {
             frames.addLast(DirectoryFrame(children(selectedRoot)))
@@ -271,7 +311,24 @@ class OptimizerEngine(
                     continue
                 }
                 val child = frame.children.next()
+                nodesSeen = checkedIncrement(nodesSeen)
+                if (nodesSeen > MAX_TRAVERSAL_NODES) {
+                    throw RunInvariantException("Selected tree exceeded the traversal node limit")
+                }
+                try {
+                    DocumentPathPolicy.requireSafeSegment(child.name)
+                } catch (_: IllegalArgumentException) {
+                    onListError()
+                    continue
+                }
                 if (child.isDirectory) {
+                    if (!visitedDirectories.add(child.id)) {
+                        onListError()
+                        continue
+                    }
+                    if (frames.size >= MAX_TRAVERSAL_DEPTH) {
+                        throw RunInvariantException("Selected tree exceeded the traversal depth limit")
+                    }
                     val childIterator = children(child)
                     directorySegments.addLast(child.name)
                     frames.addLast(DirectoryFrame(childIterator))
@@ -289,7 +346,7 @@ class OptimizerEngine(
         private fun children(directory: DocumentNode): Iterator<DocumentNode> {
             cancellation.throwIfCancelled()
             val listed = try {
-                documentGateway.list(directory)
+                documentGateway.listBounded(directory, MAX_DIRECTORY_CHILDREN)
             } catch (invariant: RunInvariantException) {
                 throw invariant
             } catch (_: Exception) {
@@ -338,7 +395,13 @@ class OptimizerEngine(
                 updated[outcome.reason] = checkedIncrement(updated[outcome.reason] ?: 0)
                 report.skipsByReason = updated
             }
-            is FileOutcome.Failed -> report.errors = checkedIncrement(report.errors)
+            is FileOutcome.Failed -> {
+                report.errors = checkedIncrement(report.errors)
+                report.terminalFailures = TerminalFailureDetails.append(
+                    report.terminalFailures,
+                    "${outcome.relativePath}: ${outcome.note}"
+                )
+            }
         }
     }
 
@@ -389,7 +452,11 @@ class OptimizerEngine(
 
     private fun recordFinalizationFailure(report: OptimizationReport, failure: Throwable, mutateStatus: Boolean) {
         val message = failure.message ?: failure.javaClass.name
-        report.terminalFailures = report.terminalFailures + message
+        report.terminalFailures = TerminalFailureDetails.append(
+            report.terminalFailures,
+            message,
+            priority = true
+        )
         if (mutateStatus) {
             report.errors = saturatingIncrement(report.errors)
             report.status = RunStatus.FAILED
@@ -408,6 +475,8 @@ class OptimizerEngine(
         val runId: String = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) +
             "_${UUID.randomUUID().toString().take(12)}"
         val candidateStore = CandidateStore(context.cacheDir, runId)
+        val buildVariant: String = BuildConfig.FILEFORGE_VARIANT
+        val nativeToolExecutor: NativeToolExecutor? = NativeToolRuntime.executorOrNull(context)
         val appVersion: String = try {
             context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
         } catch (_: Exception) {
@@ -415,10 +484,14 @@ class OptimizerEngine(
         }
 
         fun timestamp(): String = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date())
+
     }
 
     private companion object {
         const val HEADER_BYTES = 8 * 1024
+        const val MAX_TRAVERSAL_DEPTH = 16_384
+        const val MAX_TRAVERSAL_NODES = 100_000
+        const val MAX_DIRECTORY_CHILDREN = 100_000
         val MANAGED_PREFIXES = listOf(
             "FileForge_Backups_",
             "FileForge_Undo_",

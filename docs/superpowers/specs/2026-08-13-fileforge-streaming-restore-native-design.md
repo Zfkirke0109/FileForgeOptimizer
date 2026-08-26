@@ -145,21 +145,22 @@ Each subsequent line is an independent record containing:
 
 Records are appended and flushed after each committed replacement. Paths are JSON strings, so characters that break the legacy pipe-delimited format are preserved correctly.
 
-`UndoLogRepository` also parses the existing `FileForge_Undo_*.txt` layout. Legacy records without hashes remain restorable after size and path checks, and the Restore UI clearly labels them as legacy verification.
+`UndoLogRepository` also parses the existing `FileForge_Undo_*.txt` layout. Legacy records without hashes remain visible for manual recovery reference, but the Restore UI labels them view-only and does not allow them to authorize a document write.
 
 ## Restore Behavior
 
-The Restore destination lists discovered logs by date, status, entry count, and recoverable bytes. It supports restoring all entries or selected entries.
+The Restore destination lists discovered logs by date, status, entry count, and recoverable bytes. It supports restoring all eligible v2 entries or selected eligible entries. The confirmed request carries the undo document identity, entry count, and exact raw-byte SHA-256 so the service can reject a changed log.
 
 For every selected record, `RestoreCoordinator`:
 
 1. Resolves the backup and original path within the selected root.
 2. Rejects path traversal and paths outside the granted tree.
-3. Verifies that the backup exists and matches the recorded size.
-4. Verifies SHA-256 for v2 records.
-5. Streams the backup to the original document.
-6. Reopens and verifies the restored size and SHA-256 when available.
-7. Records an independent result and continues with remaining entries.
+3. Requires a v2 SHA-256 record bound to the original SAF document identity.
+4. Verifies that the current original still matches the recorded optimized size and SHA-256.
+5. Verifies that the backup exists and matches the recorded original size and SHA-256.
+6. Streams the backup to the original document.
+7. Reopens and verifies the restored size and SHA-256.
+8. Records an independent result and continues with remaining entries.
 
 A restore creates `FileForge_Restore_<run-id>_<timestamp>.jsonl` as an audit receipt. It does not delete or alter the backup or original undo log. Repeated restoration is therefore safe and auditable.
 
@@ -315,7 +316,7 @@ The work is complete when:
 2. A user-started run continues with visible notification progress after leaving the activity and can be cancelled safely.
 3. Dry run reports exact verified potential savings and produces no writes under the selected SAF tree.
 4. Every successful real replacement has a verified streamed backup and a flushed v2 undo record.
-5. The Restore screen can restore all or selected v2 entries and can restore valid legacy entries.
+5. The Restore screen can restore all or selected identity-bound v2 entries and presents legacy size-only entries as view-only recovery references.
 6. Standard and native-arm64 APKs build and share the same signing identity.
 7. Native routing uses the intended tool when available and safely falls back when it is not.
 8. Material You, Samsung-friendly Dark/AMOLED modes, Optimize/Restore/About navigation, Zachary Kirke's GitHub link, notices, and manual update checking work on the target device class.

@@ -27,6 +27,7 @@ class OptimizationTransactionTest {
         )
         assertEquals(1, undo.entries.size)
         assertEquals("archive.zip", undo.entries.single().relativePath)
+        assertEquals("root/archive.zip", undo.entries.single().originalDocumentId)
         assertEquals(original.sha256(), undo.entries.single().originalSha256)
         assertEquals(candidate.sha256(), undo.entries.single().optimizedSha256)
         assertEquals(candidate.toList(), gateway.contents("archive.zip").toList())
@@ -47,6 +48,8 @@ class OptimizationTransactionTest {
                 expectType<FileOutcome.Failed>(outcome)
                 assertFalse("original was written after $failingEvent", gateway.events.contains("write:root/archive.zip"))
                 assertTrue("undo was appended after $failingEvent", undo.entries.isEmpty())
+                assertEquals(null, gateway.node("FileForge_Backups_run-1/archive.zip"))
+                assertEquals(null, gateway.node("FileForge_Backups_run-1"))
             }
         }
     }
@@ -79,17 +82,19 @@ class OptimizationTransactionTest {
     }
 
     @Test
-    fun rollbackFailureIsObservableWhenOriginalMutationCannotBeRepaired() = withCoordinator { gateway, coordinator, undo ->
+    fun rollbackFailureEscalatesWhenOriginalMutationCannotBeRepaired() = withCoordinator { gateway, coordinator, undo ->
         var originalWrites = 0
         gateway.corruptAfterWrite = { it.id == "root/archive.zip" }
         gateway.fail = { event ->
             if (event == "write:root/archive.zip" && ++originalWrites == 2) IOException("rollback write failed") else null
         }
 
-        val outcome = coordinator.process(gateway.node("archive.zip")!!, "archive.zip", realRun, NeverCancelled)
+        val failure = assertThrows(RunInvariantException::class.java) {
+            coordinator.process(gateway.node("archive.zip")!!, "archive.zip", realRun, NeverCancelled)
+        }
 
-        val failure = expectType<FileOutcome.Failed>(outcome)
-        expectType<RollbackResult.Failed>(failure.rollback)
+        assertTrue(failure.message!!.contains("rollback", ignoreCase = true))
+        assertTrue(failure.cause!!.message!!.contains("rollback write failed"))
         assertTrue(undo.entries.isEmpty())
     }
 
@@ -134,8 +139,13 @@ class OptimizationTransactionTest {
                 assertThrows(OptimizationCancelledException::class.java) {
                     coordinator.process(gateway.node("archive.zip")!!, "archive.zip", realRun, token)
                 }
-                if (phase == "backup") assertFalse(gateway.events.any { it == "write:root/archive.zip" })
-                else assertEquals(original.toList(), gateway.contents("archive.zip").toList())
+                if (phase == "backup") {
+                    assertFalse(gateway.events.any { it == "write:root/archive.zip" })
+                    assertEquals(null, gateway.node("FileForge_Backups_run-1/archive.zip"))
+                    assertEquals(null, gateway.node("FileForge_Backups_run-1"))
+                } else {
+                    assertEquals(original.toList(), gateway.contents("archive.zip").toList())
+                }
             }
         }
     }

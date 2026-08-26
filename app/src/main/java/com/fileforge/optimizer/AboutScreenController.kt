@@ -41,7 +41,7 @@ class AboutScreenController(
     }
     private val worker: Executor = fixture?.worker ?: ownedWorker!!
     private val startIntent: (Intent) -> Boolean = fixture?.startIntent ?: ::startExternalIntent
-    private val nativeInventory = fixture?.nativeInventory ?: UnavailableNativeToolInventory
+    private val nativeInventory = fixture?.nativeInventory ?: NativeToolRuntime.inventory(activity)
     private val buildMetadata = AboutBuildMetadata.fromGeneratedValues(
         distribution = BuildConfig.DISTRIBUTION_VARIANT,
         releaseAssetKind = BuildConfig.RELEASE_ASSET_KIND,

@@ -98,11 +98,54 @@ class RestoreCoordinatorTest {
     }
 
     @Test
+    fun changedDocumentIdentityAtTheRecordedPathIsRejectedBeforeAnyWrite() = withRestore(
+        entries = listOf(entry("docs/a.zip", originalDocumentId = "root/docs/a.zip"))
+    ) { gateway, coordinator, receipt, run ->
+        gateway.replaceDocumentIdentity("docs/a.zip", "provider/replacement-a", byteArrayOf(8))
+        gateway.events.clear()
+
+        val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+        assertEquals(RestoreEntryStatus.ORIGINAL_IDENTITY_MISMATCH, report.entries.single().status)
+        assertFalse(gateway.events.any { it.startsWith("write:") })
+        assertTrue(receipt.names.isEmpty())
+    }
+
+    @Test
+    fun v2EntryWithoutRecordedDocumentIdentityIsRejectedBeforeAnyWrite() = withRestore(
+        entries = listOf(entry("docs/a.zip", originalDocumentId = null))
+    ) { gateway, coordinator, receipt, run ->
+        val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+        assertEquals(RestoreEntryStatus.ORIGINAL_IDENTITY_MISMATCH, report.entries.single().status)
+        assertFalse(gateway.events.any { it.startsWith("write:") })
+        assertTrue(receipt.names.isEmpty())
+    }
+
+    @Test
+    fun targetChangedSinceOptimizationIsRejectedBeforeAnyWrite() = withRestore(
+        entries = listOf(
+            entry("docs/a.zip", originalDocumentId = "root/docs/a.zip")
+                .copy(optimizedSha256 = byteArrayOf(7).sha256())
+        )
+    ) { gateway, coordinator, receipt, run ->
+        val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+        assertEquals(RestoreEntryStatus.ORIGINAL_VERSION_MISMATCH, report.entries.single().status)
+        assertFalse(gateway.events.any { it.startsWith("write:") })
+        assertTrue(receipt.names.isEmpty())
+    }
+
+    @Test
     fun selectedSubsetRestoresOnlyRequestedEntriesAndResultIsUiUsable() = withRestore(entries = listOf(entry("docs/a.zip"), entry("docs/b.zip"))) {
             gateway, coordinator, receipt, run ->
         gateway.put("docs/b.zip", byteArrayOf(7))
         gateway.put("FileForge_Backups_run-1/docs/b.zip", backupB)
-        val report = coordinator.restore(run, RestoreSelection.Entries(setOf("docs/b.zip")), NeverCancelled)
+        val report = coordinator.restore(
+            run,
+            RestoreSelection.Entries(setOf("docs/b.zip"), "undo-node", run.entries.size, "a".repeat(64)),
+            NeverCancelled
+        )
 
         assertEquals(listOf("docs/b.zip"), report.entries.map { it.relativePath })
         assertEquals(backupB.toList(), gateway.contents("docs/b.zip").toList())
@@ -139,7 +182,15 @@ class RestoreCoordinatorTest {
             gateway, coordinator, receipt, run ->
         gateway.put("FileForge_Backups_run-1/docs/b.zip", backupB)
         gateway.put("docs/b.zip", byteArrayOf(7))
-        gateway.fail = { event -> if (event == "write:root/docs/a.zip") IllegalStateException("provider write failed") else null }
+        var failed = false
+        gateway.fail = { event ->
+            if (event == "write:root/docs/a.zip" && !failed) {
+                failed = true
+                IllegalStateException("provider write failed")
+            } else {
+                null
+            }
+        }
 
         val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
 
@@ -151,21 +202,20 @@ class RestoreCoordinatorTest {
     }
 
     @Test
-    fun validLegacyEntryUsesSizeOnlyVerificationAndRepeatedRestoreIsIdempotent() = withRestore(
+    fun legacySizeOnlyEntryIsDiscoveryOnlyAndCannotAuthorizeAWrite() = withRestore(
         entries = listOf(entry("docs/a.zip").copy(
             originalSha256 = null,
             optimizedSha256 = null,
             verificationLevel = UndoVerificationLevel.LEGACY_SIZE_ONLY
         ))
     ) { gateway, coordinator, receipt, run ->
-        val first = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
-        val second = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+        val before = gateway.contents("docs/a.zip")
+        val result = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
 
-        assertEquals(RestoreEntryStatus.RESTORED, first.entries.single().status)
-        assertEquals(UndoVerificationLevel.LEGACY_SIZE_ONLY, first.entries.single().verification)
-        assertEquals(RestoreEntryStatus.RESTORED, second.entries.single().status)
-        assertEquals(2, receipt.names.size)
-        assertEquals(backupA.toList(), gateway.contents("docs/a.zip").toList())
+        assertEquals(RestoreEntryStatus.LEGACY_UNVERIFIED, result.entries.single().status)
+        assertEquals(UndoVerificationLevel.LEGACY_SIZE_ONLY, result.entries.single().verification)
+        assertTrue(receipt.names.isEmpty())
+        assertEquals(before.toList(), gateway.contents("docs/a.zip").toList())
     }
 
     @Test
@@ -233,14 +283,13 @@ class RestoreCoordinatorTest {
     }
 
     @Test
-    fun receiptUsesAnExclusiveUniqueNameForRepeatedSameTickRestore() = withRestore { _, coordinator, receipt, run ->
+    fun repeatedAlreadyRestoredDocumentDoesNotCreateASecondMutationReceipt() = withRestore { _, coordinator, receipt, run ->
         val first = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
         val second = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
 
         assertEquals(RestoreEntryStatus.RESTORED, first.entries.single().status)
         assertEquals(RestoreEntryStatus.RESTORED, second.entries.single().status)
-        assertEquals("FileForge_Restore_run-1_20260813T200000Z.jsonl", receipt.names.first())
-        assertEquals("FileForge_Restore_run-1_20260813T200000Z-1.jsonl", receipt.names.last())
+        assertEquals(listOf("FileForge_Restore_run-1_20260813T200000Z.jsonl"), receipt.names)
     }
 
     @Test
@@ -305,6 +354,34 @@ class RestoreCoordinatorTest {
     }
 
     @Test
+    fun failedEmergencyRepairFailsTheRunAndStopsBeforeTheNextEntry() = withRestore(
+        entries = listOf(entry("docs/a.zip"), entry("docs/b.zip"))
+    ) { gateway, coordinator, _, run ->
+        gateway.put("docs/b.zip", byteArrayOf(7))
+        gateway.put("FileForge_Backups_run-1/docs/b.zip", backupB)
+        var originalCloses = 0
+        var originalWrites = 0
+        gateway.corruptAfterWrite = { node ->
+            node.id == "root/docs/a.zip" && ++originalCloses == 1
+        }
+        gateway.fail = { event ->
+            if (event == "write:root/docs/a.zip" && ++originalWrites == 2) {
+                IllegalStateException("emergency repair write failed")
+            } else {
+                null
+            }
+        }
+
+        val report = coordinator.restore(run, RestoreSelection.All, NeverCancelled)
+
+        assertEquals(RunStatus.FAILED, report.status)
+        assertTrue(report.criticalError!!.contains("emergency repair write failed"))
+        assertEquals(RestoreRepairResult.Failed::class, report.entries.first().repair::class)
+        assertEquals(RestoreEntryStatus.UNPROCESSED_AUDIT_STOPPED, report.entries.last().status)
+        assertFalse(gateway.events.any { it == "write:root/docs/b.zip" })
+    }
+
+    @Test
     fun receiptContainsOnlyEntriesWhoseOriginalWriteWasAttempted() = withRestore(entries = listOf(entry("docs/a.zip"), entry("docs/b.zip"))) {
             gateway, coordinator, receipt, run ->
         gateway.put("docs/b.zip", byteArrayOf(7))
@@ -330,7 +407,7 @@ class RestoreCoordinatorTest {
     }
 
     @Test
-    fun freshCoordinatorNeverOverwritesExistingExclusiveReceiptAndRetriesSuffix() {
+    fun freshCoordinatorDoesNotCreateAReceiptWhenTheDocumentAlreadyMatchesTheBackup() {
         val receipts = RecordingReceiptWriter()
         withRestore(receiptWriter = receipts) { gateway, _, _, run ->
             val first = RestoreCoordinator(gateway, gateway.root, receipts) { "20260813T200000Z" }
@@ -339,7 +416,7 @@ class RestoreCoordinatorTest {
             assertEquals(RestoreEntryStatus.RESTORED, first.restore(run, RestoreSelection.All, NeverCancelled).entries.single().status)
             assertEquals(RestoreEntryStatus.RESTORED, second.restore(run, RestoreSelection.All, NeverCancelled).entries.single().status)
             assertEquals(
-                listOf("FileForge_Restore_run-1_20260813T200000Z.jsonl", "FileForge_Restore_run-1_20260813T200000Z-1.jsonl"),
+                listOf("FileForge_Restore_run-1_20260813T200000Z.jsonl"),
                 receipts.names
             )
         }
@@ -393,17 +470,19 @@ class RestoreCoordinatorTest {
 
     private fun entry(
         relativePath: String,
-        backupPath: String = "FileForge_Backups_run-1/$relativePath"
+        backupPath: String = "FileForge_Backups_run-1/$relativePath",
+        originalDocumentId: String? = "root/$relativePath"
     ) = UndoEntry(
         relativePath = relativePath,
         originalBytes = if (relativePath.endsWith("b.zip")) backupB.size.toLong() else backupA.size.toLong(),
         optimizedBytes = 1,
         backupPath = backupPath,
         originalSha256 = if (relativePath.endsWith("b.zip")) backupB.sha256() else backupA.sha256(),
-        optimizedSha256 = "0".repeat(64),
+        optimizedSha256 = byteArrayOf(if (relativePath.endsWith("b.zip")) 7 else 9).sha256(),
         note = "transaction",
         fileKind = FileKind.ZIP_LIKE,
         toolId = "streaming",
+        originalDocumentId = originalDocumentId,
         completedAt = "2026-08-13T19:01:00Z"
     )
 

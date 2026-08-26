@@ -1,10 +1,27 @@
 package com.fileforge.optimizer
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RestoreLaunchOwnershipTest {
+    private fun confirmedEntries(vararg paths: String) = RestoreSelection.Entries(
+        relativePaths = paths.toCollection(linkedSetOf()),
+        undoDocumentId = "undo-node",
+        entryCount = paths.size,
+        undoSha256 = "a".repeat(64)
+    )
+
+    @Test
+    fun serviceRestoreRejectsTheUnconfirmedAllSelection() {
+        assertThrows(IllegalArgumentException::class.java) {
+            RestoreSelection.All.requireServiceSnapshot()
+        }
+
+        confirmedEntries("docs/report.pdf").requireServiceSnapshot()
+    }
+
     @Test
     fun activityRecreationSharesTheInProcessClaimAndStillBlocksPendingOptimize() {
         val request = ServiceRunRequest.Restore("content://tree/root", "FileForge_Undo_v2_saved.jsonl", RestoreSelection.All)
@@ -48,10 +65,10 @@ class RestoreLaunchOwnershipTest {
     fun exactRestoreClaimSurvivesRecreationReplayAndOnlyItsAcknowledgementReleasesIt() {
         val ownership = RestoreLaunchOwnership()
         val first = ServiceRunRequest.Restore(
-            "content://tree/root", "FileForge_Undo_v2_first.jsonl", RestoreSelection.Entries(setOf("a.txt"))
+            "content://tree/root", "FileForge_Undo_v2_first.jsonl", confirmedEntries("a.txt")
         )
         val second = ServiceRunRequest.Restore(
-            "content://tree/root", "FileForge_Undo_v2_second.jsonl", RestoreSelection.Entries(setOf("b.txt"))
+            "content://tree/root", "FileForge_Undo_v2_second.jsonl", confirmedEntries("b.txt")
         )
 
         val firstClaim = checkNotNull(ownership.tryClaim(first))

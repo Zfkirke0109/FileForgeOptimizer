@@ -32,8 +32,12 @@ data class UndoEntry(
     val optimizedSha256: String? = originalSha256,
     val fileKind: FileKind = FileKind.UNSUPPORTED,
     val toolId: String = "unknown",
-    val completedAt: String = "unknown"
+    val completedAt: String = "unknown",
+    val originalDocumentId: String? = null
 ) {
+    val isRestoreEligible: Boolean
+        get() = verificationLevel == UndoVerificationLevel.SHA_256 && originalDocumentId != null
+
     init {
         require(originalBytes >= 0) { "originalBytes must be nonnegative" }
         require(optimizedBytes >= 0) { "optimizedBytes must be nonnegative" }
@@ -43,6 +47,9 @@ data class UndoEntry(
             }
         } else {
             require(originalSha256 == null && optimizedSha256 == null) { "Legacy entries cannot claim SHA-256 verification" }
+        }
+        require(originalDocumentId == null || originalDocumentId.isNotBlank()) {
+            "Original document identity must be nonblank when present"
         }
     }
 }
@@ -91,13 +98,15 @@ class UndoLogRepository {
 
     fun appendEntry(writer: Writer, entry: UndoEntry) {
         require(entry.verificationLevel == UndoVerificationLevel.SHA_256) { "v2 entries require SHA-256 verification" }
-        writeLine(writer, jsonObject(
+        val fields = mutableListOf<Pair<String, Any>>(
             "schemaVersion" to V2_SCHEMA_VERSION, "recordType" to "entry", "relativePath" to entry.relativePath,
             "originalBytes" to entry.originalBytes, "optimizedBytes" to entry.optimizedBytes, "backupPath" to entry.backupPath,
             "originalSha256" to entry.originalSha256!!, "optimizedSha256" to entry.optimizedSha256!!,
             "fileKind" to entry.fileKind.name, "toolId" to entry.toolId,
             "verificationLevel" to entry.verificationLevel.name, "note" to entry.note, "completedAt" to entry.completedAt
-        ))
+        )
+        entry.originalDocumentId?.let { fields += "originalDocumentId" to it }
+        writeLine(writer, jsonObject(*fields.toTypedArray()))
     }
 
     fun appendTerminal(writer: Writer, terminal: UndoTerminalSummary) {
@@ -243,7 +252,8 @@ class UndoLogRepository {
             optimizedSha256 = fields.string("optimizedSha256") ?: return@safely null,
             fileKind = fileKind,
             toolId = fields.requiredText("toolId") ?: return@safely null,
-            completedAt = fields.requiredText("completedAt") ?: return@safely null
+            completedAt = fields.requiredText("completedAt") ?: return@safely null,
+            originalDocumentId = fields.string("originalDocumentId")?.takeIf { it.isNotBlank() }
         )
     }
 
@@ -265,33 +275,41 @@ class UndoLogRepository {
     private fun parseLegacyEntry(line: String, stamp: String): UndoEntry? {
         if (line.length > MAX_LEGACY_LINE_LENGTH) return null
         val boundaries = separatorBoundaries(line) ?: return null
+        val backupPrefix = "FileForge_Backups_$stamp/"
         var candidate: UndoEntry? = null
-        for (first in 0 until boundaries.size) for (second in first + 1 until boundaries.size)
-            for (third in second + 1 until boundaries.size) for (fourth in third + 1 until boundaries.size) {
-                val relativePath = line.substring(0, boundaries[first])
-                val originalBytes = line.substring(boundaries[first] + LEGACY_SEPARATOR.length, boundaries[second]).trim().toLongOrNull()
-                val optimizedBytes = line.substring(boundaries[second] + LEGACY_SEPARATOR.length, boundaries[third]).trim().toLongOrNull()
-                val backupPath = line.substring(boundaries[third] + LEGACY_SEPARATOR.length, boundaries[fourth])
-                val note = line.substring(boundaries[fourth] + LEGACY_SEPARATOR.length)
-                if (relativePath.isNotEmpty() && originalBytes != null && optimizedBytes != null && originalBytes >= 0 && optimizedBytes >= 0 &&
-                    backupPath == "FileForge_Backups_$stamp/$relativePath"
-                ) {
-                    if (candidate != null) return null
-                    candidate = UndoEntry(
-                        relativePath = relativePath,
-                        originalBytes = originalBytes,
-                        optimizedBytes = optimizedBytes,
-                        backupPath = backupPath,
-                        originalSha256 = null,
-                        note = note,
-                        verificationLevel = UndoVerificationLevel.LEGACY_SIZE_ONLY,
-                        optimizedSha256 = null,
-                        fileKind = FileKind.UNSUPPORTED,
-                        toolId = "legacy",
-                        completedAt = ""
-                    )
-                }
-            }
+        for (thirdIndex in 2 until boundaries.size) {
+            val first = boundaries[thirdIndex - 2]
+            val second = boundaries[thirdIndex - 1]
+            val third = boundaries[thirdIndex]
+            val backupStart = third + LEGACY_SEPARATOR.length
+            if (!line.regionMatches(backupStart, backupPrefix, 0, backupPrefix.length)) continue
+
+            val relativePath = line.substring(0, first)
+            if (relativePath.isEmpty()) continue
+            val backupEnd = backupStart + backupPrefix.length + relativePath.length
+            if (backupEnd + LEGACY_SEPARATOR.length > line.length ||
+                !line.regionMatches(backupStart + backupPrefix.length, relativePath, 0, relativePath.length) ||
+                !line.regionMatches(backupEnd, LEGACY_SEPARATOR, 0, LEGACY_SEPARATOR.length)
+            ) continue
+
+            val originalBytes = line.substring(first + LEGACY_SEPARATOR.length, second).trim().toLongOrNull()
+            val optimizedBytes = line.substring(second + LEGACY_SEPARATOR.length, third).trim().toLongOrNull()
+            if (originalBytes == null || optimizedBytes == null || originalBytes < 0 || optimizedBytes < 0) continue
+            if (candidate != null) return null
+            candidate = UndoEntry(
+                relativePath = relativePath,
+                originalBytes = originalBytes,
+                optimizedBytes = optimizedBytes,
+                backupPath = line.substring(backupStart, backupEnd),
+                originalSha256 = null,
+                note = line.substring(backupEnd + LEGACY_SEPARATOR.length),
+                verificationLevel = UndoVerificationLevel.LEGACY_SIZE_ONLY,
+                optimizedSha256 = null,
+                fileKind = FileKind.UNSUPPORTED,
+                toolId = "legacy",
+                completedAt = ""
+            )
+        }
         return candidate
     }
 

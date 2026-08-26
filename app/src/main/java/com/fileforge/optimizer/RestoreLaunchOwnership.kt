@@ -2,7 +2,7 @@ package com.fileforge.optimizer
 
 import java.util.UUID
 
-data class RestoreLaunchClaim internal constructor(val id: String, val requestKey: String)
+class RestoreLaunchClaim internal constructor(val id: String, val requestKey: String)
 
 /**
  * Exact restore-dispatch gate. The owner is intentionally process-memory-only: Activities in the
@@ -67,6 +67,18 @@ private fun ServiceRunRequest.Restore.key(): String = buildString {
     append(undoLogId.length).append(':').append(undoLogId)
     when (selection) {
         RestoreSelection.All -> append("all")
-        is RestoreSelection.Entries -> selection.relativePaths.sorted().forEach { append(it.length).append(':').append(it) }
+        is RestoreSelection.ConfirmedAll -> {
+            append("confirmed:")
+            append(selection.undoDocumentId.length).append(':').append(selection.undoDocumentId)
+            append(':').append(selection.entryCount)
+            append(':').append(selection.undoSha256)
+        }
+        is RestoreSelection.Entries -> {
+            append("entries:")
+            append(selection.undoDocumentId.length).append(':').append(selection.undoDocumentId)
+            append(':').append(selection.entryCount)
+            append(':').append(selection.undoSha256)
+            selection.relativePaths.sorted().forEach { append(it.length).append(':').append(it) }
+        }
     }
 }

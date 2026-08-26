@@ -11,6 +11,31 @@ class UndoLogRepositoryTest {
     private val repository = UndoLogRepository()
 
     @Test
+    fun onlyHashedEntriesWithOriginalDocumentIdentityAreRestoreEligible() {
+        val verified = UndoEntry(
+            relativePath = "docs/report.txt",
+            originalBytes = 100,
+            optimizedBytes = 50,
+            backupPath = "FileForge_Backups_run/docs/report.txt",
+            originalSha256 = "a".repeat(64),
+            optimizedSha256 = "b".repeat(64),
+            originalDocumentId = "provider/document/report",
+            note = "verified"
+        )
+        val missingIdentity = verified.copy(originalDocumentId = null)
+        val legacy = verified.copy(
+            originalSha256 = null,
+            optimizedSha256 = null,
+            originalDocumentId = null,
+            verificationLevel = UndoVerificationLevel.LEGACY_SIZE_ONLY
+        )
+
+        assertTrue(verified.isRestoreEligible)
+        assertTrue(!missingIdentity.isRestoreEligible)
+        assertTrue(!legacy.isRestoreEligible)
+    }
+
+    @Test
     fun v2RoundTripPreservesPathsWithSpacesUnicodeAndPipes() {
         val output = FlushRecordingWriter()
         val header = UndoHeader(
@@ -32,6 +57,7 @@ class UndoLogRepositoryTest {
             optimizedSha256 = "b".repeat(64),
             fileKind = FileKind.ZIP_LIKE,
             toolId = "streaming-zip-v1",
+            originalDocumentId = "content://provider/document/original-42",
             note = "streamed safely",
             completedAt = "2026-08-13T19:42:30Z"
         )
@@ -220,6 +246,17 @@ class UndoLogRepositoryTest {
         val legacyLog = legacyLog("20260813_121314", "field" + " | field".repeat(33))
 
         assertTrue(repository.read(legacyLog.reader()).entries.isEmpty())
+    }
+
+    @Test(timeout = 2_000)
+    fun maximumAllowedLegacySeparatorsAreParsedWithBoundedLinearWork() {
+        val adversarialRow = "field" + " | field".repeat(UndoLogRepository.MAX_LEGACY_SEPARATORS)
+        val rows = List(2_048) { adversarialRow }.joinToString("\n")
+        val legacyLog = "FileForge Undo Log 20260813_121314\n" +
+            "Mode=OptimizerSettings(mode=SAFE, apkLabMode=false, textMinify=false)\n" +
+            "${UndoLogRepository.LEGACY_FORMAT}\n\n$rows\n"
+
+        assertTrue(repository.readStreamingForRestore(legacyLog.reader()).entries.isEmpty())
     }
 
     @Test

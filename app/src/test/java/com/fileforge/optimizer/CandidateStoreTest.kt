@@ -17,7 +17,7 @@ class CandidateStoreTest {
 
             assertEquals(
                 File(cacheDirectory, "fileforge/run-a").canonicalFile,
-                candidate.file.parentFile.canonicalFile
+                requireNotNull(candidate.file.parentFile).canonicalFile
             )
             assertTrue(candidate.file.name.startsWith("candidate-"))
             candidate.close()
@@ -29,7 +29,7 @@ class CandidateStoreTest {
     fun explicitStaleCleanupRemovesPriorRunContent() {
         withCacheDirectory { cacheDirectory ->
             val staleFile = File(cacheDirectory, "fileforge/stale-run/candidate-stale.zip")
-            staleFile.parentFile.mkdirs()
+            requireNotNull(staleFile.parentFile).mkdirs()
             staleFile.writeText("stale")
 
             CandidateStore.cleanupStale(cacheDirectory)
@@ -87,8 +87,8 @@ class CandidateStoreTest {
             val first = store.create("run-a", ".zip")
             val second = store.create("run-b", ".zip")
 
-            assertEquals(File(cacheDirectory, "fileforge/run-a").canonicalFile, first.file.parentFile.canonicalFile)
-            assertEquals(File(cacheDirectory, "fileforge/run-b").canonicalFile, second.file.parentFile.canonicalFile)
+            assertEquals(File(cacheDirectory, "fileforge/run-a").canonicalFile, requireNotNull(first.file.parentFile).canonicalFile)
+            assertEquals(File(cacheDirectory, "fileforge/run-b").canonicalFile, requireNotNull(second.file.parentFile).canonicalFile)
             first.close()
             assertTrue(second.file.exists())
             second.close()
@@ -118,6 +118,38 @@ class CandidateStoreTest {
         }
     }
 
+    @Test
+    fun candidateWritesPreserveTheConfiguredFreeSpaceReserve() {
+        withCacheDirectory { cacheDirectory ->
+            val fileSystem = FaultInjectingCandidateFileSystem(
+                usableSpace = CandidateStore.MIN_FREE_SPACE_BYTES + 8
+            )
+            val candidate = CandidateStore(cacheDirectory, "run-a", fileSystem).create(".zip")
+
+            assertThrows(CandidateSizeLimitExceededException::class.java) {
+                candidate.openOutputStream().use { it.write(ByteArray(9)) }
+            }
+
+            candidate.close()
+            assertFalse(File(cacheDirectory, "fileforge").exists())
+        }
+    }
+
+    @Test
+    fun externalWriterGuardDetectsTheLimitWhileTheWriterIsStillRunning() {
+        withCacheDirectory { cacheDirectory ->
+            val candidate = CandidateStore(cacheDirectory, "run-a", maxCandidateBytes = 8).create(".native-output")
+            val guardedCancellation = candidate.guardExternalWrite(NeverCancelled)
+            candidate.file.writeBytes(ByteArray(9))
+
+            assertThrows(CandidateSizeLimitExceededException::class.java) {
+                guardedCancellation.throwIfCancelled()
+            }
+
+            candidate.close()
+        }
+    }
+
     private fun withCacheDirectory(block: (File) -> Unit) {
         val directory = Files.createTempDirectory("fileforge-candidates").toFile()
         try {
@@ -128,7 +160,8 @@ class CandidateStoreTest {
     }
 
     private class FaultInjectingCandidateFileSystem(
-        private val failCreate: Boolean = false
+        private val failCreate: Boolean = false,
+        private val usableSpace: Long = Long.MAX_VALUE
     ) : CandidateFileSystem {
         var failDelete = false
 
@@ -149,5 +182,7 @@ class CandidateStoreTest {
             !failDelete && (!directory.exists() || directory.deleteRecursively())
 
         override fun list(directory: File): Array<String>? = directory.list()
+
+        override fun usableSpace(directory: File): Long = usableSpace
     }
 }

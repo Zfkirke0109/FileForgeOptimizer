@@ -31,6 +31,7 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
     var readFailure: Throwable? = null
     var finalizeFailure: AssertionError? = null
     var failEmergencyRollbackForPath: String? = null
+    var corruptFirstWriteForPath: String? = null
     var undoWritesAfterPoison = 0
     var undoFlushesAfterPoison = 0
     var undoCloses = 0
@@ -206,7 +207,16 @@ internal open class FaultInjectingEngineGateway : DocumentGateway {
     }
 
     private fun persist(node: DocumentNode, output: ByteArrayOutputStream) {
-        bytes[node.id] = output.toByteArray()
+        val persisted = output.toByteArray()
+        val relativePath = path(node)
+        if (
+            relativePath == corruptFirstWriteForPath &&
+            writeAttempts[relativePath] == 1 &&
+            persisted.isNotEmpty()
+        ) {
+            persisted[0] = (persisted[0].toInt() xor 0xff).toByte()
+        }
+        bytes[node.id] = persisted
         advertisedLengths[node.id] = output.size().toLong()
     }
 

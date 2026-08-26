@@ -6,16 +6,71 @@ import java.io.Writer
 
 sealed class RestoreSelection {
     data object All : RestoreSelection()
-    data class Entries(val relativePaths: Set<String>) : RestoreSelection()
+    data class ConfirmedAll(
+        val undoDocumentId: String,
+        val entryCount: Int,
+        val undoSha256: String
+    ) : RestoreSelection() {
+        init {
+            requireValidSnapshot(undoDocumentId, entryCount, undoSha256)
+        }
+    }
+    data class Entries(
+        val relativePaths: Set<String>,
+        val undoDocumentId: String,
+        val entryCount: Int,
+        val undoSha256: String
+    ) : RestoreSelection() {
+        init {
+            requireValidSnapshot(undoDocumentId, entryCount, undoSha256)
+        }
+    }
     fun includes(relativePath: String): Boolean = when (this) {
         All -> true
+        is ConfirmedAll -> true
         is Entries -> relativePath in relativePaths
+    }
+}
+
+private fun requireValidSnapshot(undoDocumentId: String, entryCount: Int, undoSha256: String) {
+    require(undoDocumentId.isNotBlank()) { "Undo document identity is required" }
+    require(entryCount >= 0) { "Confirmed entry count must be nonnegative" }
+    require(undoSha256.length == 64 && undoSha256.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+        "Undo document SHA-256 is required"
+    }
+}
+
+internal fun RestoreSelection.requireServiceSnapshot() {
+    require(this != RestoreSelection.All) {
+        "Restore service requests require an exact confirmed undo-log snapshot"
+    }
+}
+
+internal fun RestoreSelection.requireMatchingSnapshot(
+    undoDocument: DocumentNode,
+    run: UndoRun,
+    contentSha256: String
+) {
+    val snapshot = when (this) {
+        RestoreSelection.All -> return
+        is RestoreSelection.ConfirmedAll -> Triple(undoDocumentId, entryCount, undoSha256)
+        is RestoreSelection.Entries -> Triple(undoDocumentId, entryCount, undoSha256)
+    }
+    require(undoDocument.id == snapshot.first) {
+        "Undo log identity changed after restore confirmation"
+    }
+    require(run.entries.size == snapshot.second) {
+        "Undo log entry count changed after restore confirmation"
+    }
+    require(contentSha256.equals(snapshot.third, ignoreCase = true)) {
+        "Undo log contents changed after restore confirmation"
     }
 }
 
 enum class RestoreEntryStatus {
     RESTORED, PATH_REJECTED, BACKUP_MISSING, BACKUP_SIZE_MISMATCH, BACKUP_HASH_MISMATCH,
     ORIGINAL_MISSING, DIRECTORY_REJECTED, WRITE_FAILED, RESTORED_VERIFICATION_FAILED, RECEIPT_FAILED,
+    ORIGINAL_IDENTITY_MISMATCH, ORIGINAL_VERSION_MISMATCH, LEGACY_UNVERIFIED,
     UNPROCESSED_CANCELLED, UNPROCESSED_AUDIT_STOPPED
 }
 
@@ -39,6 +94,7 @@ data class RestoreReport(
     val status: RunStatus,
     val restoredCount: Int,
     val receiptError: String? = null,
+    val criticalError: String? = null,
     /** Exact receipt identity returned by exclusive receipt creation, if a mutation was attempted. */
     val receiptName: String? = null,
     val selectedCount: Int = entries.size,
@@ -104,6 +160,7 @@ class RestoreCoordinator(
         }
         var receipt: RestoreReceipt? = null
         var receiptError: String? = null
+        var criticalError: String? = null
         var status = RunStatus.COMPLETED
         var stoppedForAudit = false
         try {
@@ -122,6 +179,15 @@ class RestoreCoordinator(
                             receiptError = failure.message ?: failure.javaClass.name
                             stoppedForAudit = true
                         }
+                    }
+                    val repairFailure = (attempt.result.repair as? RestoreRepairResult.Failed)?.cause
+                    if (repairFailure != null) {
+                        val detail = repairFailure.message ?: repairFailure.javaClass.name
+                        criticalError =
+                            "CRITICAL: emergency restore repair failed for ${entry.relativePath}: $detail"
+                        status = RunStatus.FAILED
+                        stoppedForAudit = true
+                        break
                     }
                     if (attempt.cancelled) {
                         status = RunStatus.CANCELLED
@@ -170,6 +236,7 @@ class RestoreCoordinator(
             status = status,
             restoredCount = results.count { it.status == RestoreEntryStatus.RESTORED },
             receiptError = receiptError,
+            criticalError = criticalError,
             receiptName = receipt?.name,
             selectedCount = selected.size
         )
@@ -221,21 +288,57 @@ class RestoreCoordinator(
         receiptForAttempt: () -> RestoreReceipt
     ): RestoreAttempt {
         val expectedBackupPath = "FileForge_Backups_$runId/${entry.relativePath}"
-        val original: DocumentNode
+        val expectedDocumentId: String
+        var original: DocumentNode
         val backup: DocumentNode
         try {
             DocumentPathPolicy.requireSafeRelative(entry.relativePath)
             DocumentPathPolicy.requireSafeRelative(entry.backupPath)
             if (entry.backupPath != expectedBackupPath) return RestoreAttempt(result(entry, RestoreEntryStatus.PATH_REJECTED, "Backup is not bound to this run and entry"))
+            if (entry.verificationLevel != UndoVerificationLevel.SHA_256) {
+                return RestoreAttempt(
+                    result(
+                        entry,
+                        RestoreEntryStatus.LEGACY_UNVERIFIED,
+                        "Legacy size-only records are discovery-only and cannot authorize a restore write"
+                    )
+                )
+            }
+            expectedDocumentId = entry.originalDocumentId
+                ?: return RestoreAttempt(
+                    result(
+                        entry,
+                        RestoreEntryStatus.ORIGINAL_IDENTITY_MISMATCH,
+                        "Undo entry does not contain the optimized document identity"
+                    )
+                )
             original = DocumentPathPolicy.resolve(selectedRoot, entry.relativePath, documentGateway)
                 ?: return RestoreAttempt(result(entry, RestoreEntryStatus.ORIGINAL_MISSING, "Original is missing"))
             if (original.isDirectory) return RestoreAttempt(result(entry, RestoreEntryStatus.DIRECTORY_REJECTED, "Restore documents must be files"))
+            if (original.id != expectedDocumentId) {
+                return RestoreAttempt(
+                    result(
+                        entry,
+                        RestoreEntryStatus.ORIGINAL_IDENTITY_MISMATCH,
+                        "Document identity no longer matches the optimized original"
+                    )
+                )
+            }
             backup = DocumentPathPolicy.resolve(selectedRoot, expectedBackupPath, documentGateway)
                 ?: return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_MISSING, "Backup is missing"))
         } catch (_: IllegalArgumentException) {
             return RestoreAttempt(result(entry, RestoreEntryStatus.PATH_REJECTED, "Restore paths must stay within the selected root"))
         }
         if (backup.isDirectory) return RestoreAttempt(result(entry, RestoreEntryStatus.DIRECTORY_REJECTED, "Restore documents must be files"))
+
+        val currentIntegrity = readTargetIntegrity(original, cancellation)
+            ?: return RestoreAttempt(
+                result(
+                    entry,
+                    RestoreEntryStatus.ORIGINAL_VERSION_MISMATCH,
+                    "Current document cannot be verified against the optimized version"
+                )
+            )
 
         val backupIntegrity = try {
             documentGateway.openRead(backup).use { StreamIntegrityChecker.hash(it, cancellation) }
@@ -250,6 +353,35 @@ class RestoreCoordinator(
         ) {
             return RestoreAttempt(result(entry, RestoreEntryStatus.BACKUP_HASH_MISMATCH, "Backup SHA-256 does not match undo record"))
         }
+        if (currentIntegrity.matches(entry.originalBytes, entry.originalSha256)) {
+            return RestoreAttempt(result(entry, RestoreEntryStatus.RESTORED, "Document already matches the verified backup"))
+        }
+        if (!currentIntegrity.matches(entry.optimizedBytes, entry.optimizedSha256)) {
+            return RestoreAttempt(
+                result(
+                    entry,
+                    RestoreEntryStatus.ORIGINAL_VERSION_MISMATCH,
+                    "Current document changed after optimization; restore was not applied"
+                )
+            )
+        }
+        val rebound = try {
+            DocumentPathPolicy.resolve(selectedRoot, entry.relativePath, documentGateway)
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+        if (rebound == null || rebound.isDirectory || rebound.id != expectedDocumentId) {
+            return RestoreAttempt(
+                result(entry, RestoreEntryStatus.ORIGINAL_IDENTITY_MISMATCH, "Document identity changed before restore")
+            )
+        }
+        val reboundIntegrity = readTargetIntegrity(rebound, cancellation)
+        if (reboundIntegrity == null || !reboundIntegrity.matches(entry.optimizedBytes, entry.optimizedSha256)) {
+            return RestoreAttempt(
+                result(entry, RestoreEntryStatus.ORIGINAL_VERSION_MISMATCH, "Current document changed before restore")
+            )
+        }
+        original = rebound
         try { receiptForAttempt() } catch (failure: Exception) { throw ReceiptOpenException(failure) }
         var attemptedWrite = false
         return try {
@@ -259,16 +391,55 @@ class RestoreCoordinator(
             }
             val verified = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, cancellation) }
             val primary = verifiedResult(entry, restored, verified)
-            if (primary.status == RestoreEntryStatus.RESTORED) RestoreAttempt(primary, attemptedWrite = attemptedWrite) else
-                RestoreAttempt(primary.copy(repair = repairFromBackup(original, backup, entry)), attemptedWrite = attemptedWrite)
+            if (primary.status == RestoreEntryStatus.RESTORED) {
+                RestoreAttempt(primary, attemptedWrite = attemptedWrite)
+            } else {
+                val repair = repairFromBackup(original, backup, entry)
+                RestoreAttempt(
+                    primary.copy(message = repairMessage(primary.message, repair), repair = repair),
+                    attemptedWrite = attemptedWrite
+                )
+            }
         } catch (_: OptimizationCancelledException) {
             val repair = repairFromBackup(original, backup, entry)
             val status = if (repair == RestoreRepairResult.Restored) RestoreEntryStatus.RESTORED else RestoreEntryStatus.WRITE_FAILED
-            RestoreAttempt(result(entry, status, "Cancellation repair completed", repair), cancelled = true, attemptedWrite = attemptedWrite)
+            RestoreAttempt(
+                result(entry, status, repairMessage("Cancellation repair completed", repair), repair),
+                cancelled = true,
+                attemptedWrite = attemptedWrite
+            )
         } catch (failure: Exception) {
             val repair = if (attemptedWrite) repairFromBackup(original, backup, entry) else RestoreRepairResult.NotNeeded
-            RestoreAttempt(result(entry, RestoreEntryStatus.WRITE_FAILED, failure.message ?: "Restore write failed", repair), attemptedWrite = attemptedWrite)
+            RestoreAttempt(
+                result(
+                    entry,
+                    RestoreEntryStatus.WRITE_FAILED,
+                    repairMessage(failure.message ?: "Restore write failed", repair),
+                    repair
+                ),
+                attemptedWrite = attemptedWrite
+            )
         }
+    }
+
+    private fun readTargetIntegrity(
+        original: DocumentNode,
+        cancellation: CancellationToken
+    ): StreamIntegrity? = try {
+        documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, cancellation) }
+    } catch (cancelled: OptimizationCancelledException) {
+        throw cancelled
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun StreamIntegrity.matches(expectedBytes: Long, expectedSha256: String?): Boolean =
+        bytes == expectedBytes && expectedSha256 != null && sha256.equals(expectedSha256, ignoreCase = true)
+
+    private fun repairMessage(message: String, repair: RestoreRepairResult): String {
+        val failure = (repair as? RestoreRepairResult.Failed)?.cause ?: return message
+        val detail = failure.message ?: failure.javaClass.name
+        return "$message. Emergency repair failed: $detail"
     }
 
     private fun repairFromBackup(original: DocumentNode, backup: DocumentNode, entry: UndoEntry): RestoreRepairResult = try {

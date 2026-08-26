@@ -36,12 +36,20 @@ class OptimizationServiceRequestCodecTest {
     fun restoreRoundTripsAllAndUnicodeEntrySelections() {
         val selections = listOf(
             RestoreSelection.All,
+            RestoreSelection.ConfirmedAll(
+                undoDocumentId = "content://provider/document/undo-42",
+                entryCount = 42,
+                undoSha256 = "a".repeat(64)
+            ),
             RestoreSelection.Entries(
-                linkedSetOf(
+                relativePaths = linkedSetOf(
                     "docs/雪 and space.txt",
                     "quoted/\"report\".json",
                     "emoji/📦.zip"
-                )
+                ),
+                undoDocumentId = "content://provider/document/undo-42",
+                entryCount = 3,
+                undoSha256 = "a".repeat(64)
             )
         )
 
@@ -63,6 +71,53 @@ class OptimizationServiceRequestCodecTest {
     }
 
     @Test
+    fun confirmedSelectionsRejectChangedUndoIdentityCountOrContentForAllAndPartialRestores() {
+        val run = UndoRun(
+            header = UndoHeader("run-1", "start"),
+            entries = listOf(
+                UndoEntry(
+                    relativePath = "docs/a.zip",
+                    originalBytes = 2,
+                    optimizedBytes = 1,
+                    backupPath = "FileForge_Backups_run-1/docs/a.zip",
+                    originalSha256 = "a".repeat(64),
+                    note = "test",
+                    optimizedSha256 = "b".repeat(64)
+                )
+            ),
+            status = RunStatus.RUNNING
+        )
+        val selection = RestoreSelection.ConfirmedAll(
+            undoDocumentId = "undo-node",
+            entryCount = 1,
+            undoSha256 = "c".repeat(64)
+        )
+
+        selection.requireMatchingSnapshot(DocumentNode("undo-node", "undo.jsonl", false, 0), run, "c".repeat(64))
+        assertThrows(IllegalArgumentException::class.java) {
+            selection.requireMatchingSnapshot(
+                DocumentNode("replacement", "undo.jsonl", false, 0),
+                run,
+                "c".repeat(64)
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            selection.copy(entryCount = 0)
+                .requireMatchingSnapshot(DocumentNode("undo-node", "undo.jsonl", false, 0), run, "c".repeat(64))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            selection.requireMatchingSnapshot(DocumentNode("undo-node", "undo.jsonl", false, 0), run, "d".repeat(64))
+        }
+
+        RestoreSelection.Entries(
+            relativePaths = setOf("docs/a.zip"),
+            undoDocumentId = "undo-node",
+            entryCount = 1,
+            undoSha256 = "c".repeat(64)
+        ).requireMatchingSnapshot(DocumentNode("undo-node", "undo.jsonl", false, 0), run, "c".repeat(64))
+    }
+
+    @Test
     fun restoreEncodingKeepsAllCompactAndRejectsOversizedIndividualSubsetsBeforeBinderDispatch() {
         val all = ServiceRunRequest.Restore(
             treeUri = "content://tree/root",
@@ -70,10 +125,20 @@ class OptimizationServiceRequestCodecTest {
             selection = RestoreSelection.All
         )
         val tooMany = all.copy(
-            selection = RestoreSelection.Entries((0 until 20_000).mapTo(linkedSetOf()) { "docs/$it.txt" })
+            selection = RestoreSelection.Entries(
+                (0 until 20_000).mapTo(linkedSetOf()) { "docs/$it.txt" },
+                "undo-node",
+                20_000,
+                "a".repeat(64)
+            )
         )
         val tooLarge = all.copy(
-            selection = RestoreSelection.Entries(setOf("docs/${"x".repeat(600_000)}.txt"))
+            selection = RestoreSelection.Entries(
+                setOf("docs/${"x".repeat(600_000)}.txt"),
+                "undo-node",
+                1,
+                "a".repeat(64)
+            )
         )
 
         val encodedAll = OptimizationServiceRequestCodec.encode(all)

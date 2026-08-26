@@ -41,6 +41,41 @@ class OptimizerEngineTraversalHardeningTest {
         assertTrue("lazy traversal should not enumerate the full chain", gateway.listCalls <= 2)
     }
 
+    @Test
+    fun cyclicProviderDirectoryIdentityIsSkippedWithABoundedError() = withEngine { gateway, engine ->
+        gateway.cycleRoot = true
+        val cancellation = CancellationToken {
+            if (gateway.listCalls > 10) throw OptimizationCancelledException("cycle was not bounded")
+        }
+
+        val report = engine.run(cancellation) {}
+
+        assertEquals(RunStatus.COMPLETED_WITH_ERRORS, report.status)
+        assertEquals(1, report.errors)
+        assertTrue(gateway.listCalls <= 2)
+    }
+
+    @Test
+    fun uniqueProviderDepthIsStoppedByATraversalBudget() = withEngine { gateway, engine ->
+        gateway.depth = 17_000
+
+        val report = engine.run(NeverCancelled) {}
+
+        assertEquals(RunStatus.FAILED, report.status)
+        assertTrue(report.terminalError.orEmpty().contains("depth", ignoreCase = true))
+    }
+
+    @Test
+    fun opaqueProviderNamesContainingSlashesAreRejectedBeforeAnyDocumentRead() = withEngine { gateway, engine ->
+        gateway.includeUnsafeName = true
+
+        val report = engine.run(NeverCancelled) {}
+
+        assertEquals(RunStatus.COMPLETED_WITH_ERRORS, report.status)
+        assertEquals(1, report.errors)
+        assertFalse(gateway.readIds.contains("file:unsafe"))
+    }
+
     private fun withEngine(block: (GeneratedDeepGateway, OptimizerEngine) -> Unit) {
         val cache = Files.createTempDirectory("fileforge-deep-engine").toFile()
         try {
@@ -67,6 +102,8 @@ class OptimizerEngineTraversalHardeningTest {
         val readIds = mutableListOf<String>()
         var depth: Int = 0
         var listCalls: Int = 0
+        var cycleRoot: Boolean = false
+        var includeUnsafeName: Boolean = false
 
         override fun openRead(node: DocumentNode): InputStream {
             readIds += node.id
@@ -78,11 +115,12 @@ class OptimizerEngineTraversalHardeningTest {
             listCalls++
             val level = node.id.substringAfter(':').toInt()
             return when {
+                cycleRoot && level == 0 -> listOf(DocumentNode("directory:0", "loop", true, 0))
                 level == 0 -> listOf(
                     DocumentNode("file:0", "first.bin", false, 1),
                     DocumentNode("directory:1", "d1", true, 0),
                     DocumentNode("artifact:0", "FileForge_Backups_hidden", true, 0)
-                )
+                ) + if (includeUnsafeName) listOf(DocumentNode("file:unsafe", "folder/file.txt", false, 1)) else emptyList()
                 level < depth -> listOf(DocumentNode("directory:${level + 1}", "d${level + 1}", true, 0))
                 else -> listOf(DocumentNode("file:deep", "deep.bin", false, 1))
             }

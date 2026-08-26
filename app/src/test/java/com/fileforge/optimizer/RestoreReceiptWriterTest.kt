@@ -27,8 +27,9 @@ class RestoreReceiptWriterTest {
                     optimizedBytes = 1,
                     backupPath = "FileForge_Backups_run-1/docs/a.zip",
                     originalSha256 = backup.sha256(),
-                    optimizedSha256 = "0".repeat(64),
-                    note = "transaction"
+                    optimizedSha256 = byteArrayOf(9).sha256(),
+                    note = "transaction",
+                    originalDocumentId = "root/docs/a.zip"
                 )
             ),
             RunStatus.COMPLETED

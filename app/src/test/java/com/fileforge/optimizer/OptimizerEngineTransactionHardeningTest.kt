@@ -72,6 +72,41 @@ class OptimizerEngineTransactionHardeningTest {
         }
 
     @Test
+    fun failedStreamingRollbackAfterOriginalMutationFailsRunBeforeSecondFile() =
+        withEngine(realRun) { gateway, engine, _ ->
+            gateway.put("a-first.zip", zipFixture)
+            gateway.put("b-second.zip", zipFixture)
+            gateway.corruptFirstWriteForPath = "a-first.zip"
+            gateway.failEmergencyRollbackForPath = "a-first.zip"
+
+            val report = engine.run(NeverCancelled) {}
+
+            assertEquals(RunStatus.FAILED, report.status)
+            assertTrue(report.terminalError!!.contains("rollback", ignoreCase = true))
+            assertTrue(report.rollbackFailure!!.contains("emergency rollback write failed"))
+            assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.zip") })
+            assertTrue(gateway.mutations.none { it == "open-write:b-second.zip" })
+        }
+
+    @Test
+    fun failedByteArrayRollbackAfterOriginalMutationFailsRunBeforeSecondFile() =
+        withEngine(realRun) { gateway, engine, _ ->
+            val original = "%PDF-1.4\n%%EOF\ntrailing garbage".toByteArray()
+            gateway.put("a-first.pdf", original)
+            gateway.put("b-second.pdf", original)
+            gateway.corruptFirstWriteForPath = "a-first.pdf"
+            gateway.failEmergencyRollbackForPath = "a-first.pdf"
+
+            val report = engine.run(NeverCancelled) {}
+
+            assertEquals(RunStatus.FAILED, report.status)
+            assertTrue(report.terminalError!!.contains("rollback", ignoreCase = true))
+            assertTrue(report.rollbackFailure!!.contains("emergency rollback write failed"))
+            assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.pdf") })
+            assertTrue(gateway.mutations.none { it == "open-write:b-second.pdf" })
+        }
+
+    @Test
     fun poisonedUndoWriteOrAmbiguousFlushAbortsBeforeSecondFileAndNeverFinalizesWriter() {
         listOf(UndoFault.MID_LINE_WRITE, UndoFault.FLUSH_AFTER_DELEGATE).forEach { fault ->
             withEngine(realRun) { gateway, engine, _ ->

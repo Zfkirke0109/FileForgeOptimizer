@@ -86,6 +86,8 @@
     <string name="restore_entry_details">Original %1$s • Optimized %2$s\nBackup: %3$s</string>
     <string name="restore_select_entry">Select %1$s</string>
     <string name="restore_select_all">Select all</string>
+    <string name="restore_show_more">Show %1$d more</string>
+    <string name="restore_show_more_description">Show more entries from %1$s</string>
     <string name="restore_selected">Restore selected</string>
     <string name="cancel_restore">Cancel restore</string>
     <string name="restore_confirmation_message">Backups and undo logs remain after restore.</string>

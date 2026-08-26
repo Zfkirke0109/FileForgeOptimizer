@@ -75,6 +75,103 @@ class OptimizationCoordinatorDryRunTest {
     }
 
     @Test
+    fun unsupportedZip64ArchiveIsReportedAsAnExplicitSkip() {
+        withCandidateDirectory { candidateDirectory ->
+            val gateway = RecordingDocumentGateway(compressibleZipFixture)
+            val processor = object : ZipCandidateProcessor {
+                override fun optimize(
+                    input: InputStream,
+                    output: OutputStream,
+                    mode: OptimizeMode,
+                    cancellation: CancellationToken
+                ): ZipOptimizationSummary = throw UnsupportedZipFeatureException("ZIP64 archives")
+
+                override fun verify(input: InputStream, cancellation: CancellationToken): ZipVerification =
+                    error("verify must not run")
+            }
+
+            val outcome = expectType<FileOutcome.Skipped>(
+                coordinator(gateway, candidateDirectory, processor).process(
+                    gateway.rootFile,
+                    "archive.zip",
+                    dryRunIntent,
+                    NeverCancelled
+                )
+            )
+
+            assertEquals(SkipReason.UNSUPPORTED, outcome.reason)
+            assertTrue(outcome.note.contains("ZIP64"))
+            assertDirectoryEmpty(candidateDirectory)
+        }
+    }
+
+    @Test
+    fun archiveWorkLimitIsReportedAsAnExplicitSkip() {
+        withCandidateDirectory { candidateDirectory ->
+            val gateway = RecordingDocumentGateway(compressibleZipFixture)
+            val processor = object : ZipCandidateProcessor {
+                override fun optimize(
+                    input: InputStream,
+                    output: OutputStream,
+                    mode: OptimizeMode,
+                    cancellation: CancellationToken
+                ): ZipOptimizationSummary = throw ArchiveResourceLimitException("inflated payload limit")
+
+                override fun verify(input: InputStream, cancellation: CancellationToken): ZipVerification =
+                    error("verify must not run")
+            }
+
+            val outcome = expectType<FileOutcome.Skipped>(
+                coordinator(gateway, candidateDirectory, processor).process(
+                    gateway.rootFile,
+                    "archive.zip",
+                    dryRunIntent,
+                    NeverCancelled
+                )
+            )
+
+            assertEquals(SkipReason.ARCHIVE_LIMIT, outcome.reason)
+            assertTrue(outcome.note.contains("limit"))
+            assertDirectoryEmpty(candidateDirectory)
+        }
+    }
+
+    @Test
+    fun candidateStorageLimitIsReportedAsAnExplicitSkipAndCleansThePartialFile() {
+        withCandidateDirectory { candidateDirectory ->
+            val gateway = RecordingDocumentGateway(compressibleZipFixture)
+            val processor = object : ZipCandidateProcessor {
+                override fun optimize(
+                    input: InputStream,
+                    output: OutputStream,
+                    mode: OptimizeMode,
+                    cancellation: CancellationToken
+                ): ZipOptimizationSummary {
+                    input.copyTo(OutputStream.nullOutputStream())
+                    output.write(ByteArray(16))
+                    return ZipOptimizationSummary(1, compressibleZipFixture.size.toLong(), 16, "oversized")
+                }
+
+                override fun verify(input: InputStream, cancellation: CancellationToken): ZipVerification =
+                    error("verify must not run")
+            }
+            val coordinator = OptimizationCoordinator(
+                gateway,
+                CandidateStore(candidateDirectory, "storage-test", maxCandidateBytes = 8),
+                processor
+            )
+
+            val outcome = expectType<FileOutcome.Skipped>(
+                coordinator.process(gateway.rootFile, "archive.zip", dryRunIntent, NeverCancelled)
+            )
+
+            assertEquals(SkipReason.STORAGE_LIMIT, outcome.reason)
+            assertTrue(outcome.note.contains("8-byte"))
+            assertDirectoryEmpty(candidateDirectory)
+        }
+    }
+
+    @Test
     fun briefConstructorUsesItsRunIdWithAnUnscopedCandidateStore() {
         withCandidateDirectory { candidateDirectory ->
             val gateway = RecordingDocumentGateway(compressibleZipFixture)

@@ -17,9 +17,18 @@ interface DocumentGateway {
     fun openRead(node: DocumentNode): InputStream
     fun openWrite(node: DocumentNode): OutputStream
     fun list(node: DocumentNode): List<DocumentNode>
+    fun listBounded(node: DocumentNode, maxChildren: Int): List<DocumentNode> {
+        require(maxChildren >= 0) { "Child limit must be nonnegative" }
+        return list(node).also { children ->
+            if (children.size > maxChildren) {
+                throw RunInvariantException("Selected directory exceeded the child-count limit")
+            }
+        }
+    }
     fun resolve(parent: DocumentNode, name: String): DocumentNode?
     fun createDirectory(parent: DocumentNode, name: String): DocumentNode
     fun createFile(parent: DocumentNode, mimeType: String, name: String): DocumentNode
+    fun delete(node: DocumentNode): Boolean = false
     fun createDirectoryExact(parent: DocumentNode, name: String): DocumentNode {
         if (resolve(parent, name) != null) throw DocumentAlreadyExistsException("Document already exists: $name")
         val created = createDirectory(parent, name)
