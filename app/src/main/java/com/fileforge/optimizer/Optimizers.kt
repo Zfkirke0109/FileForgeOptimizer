@@ -5,6 +5,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
@@ -16,6 +17,235 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import javax.xml.parsers.DocumentBuilderFactory
+
+/** Bounded compatibility path for formats whose Kotlin optimizers still require complete byte arrays. */
+class ByteArrayOptimizerAdapter(
+    private val documentGateway: DocumentGateway,
+    private val commitContext: CommitContext? = null,
+    private val maxInputBytes: Long = DEFAULT_MAX_INPUT_BYTES
+) {
+    init {
+        require(maxInputBytes >= 1L && maxInputBytes <= Int.MAX_VALUE.toLong()) {
+            "Byte-array limit must fit a JVM array"
+        }
+    }
+
+    fun process(
+        node: DocumentNode,
+        relativePath: String,
+        kind: FileKind,
+        runIntent: RunIntent,
+        cancellation: CancellationToken
+    ): FileOutcome {
+        require(kind != FileKind.ZIP_LIKE && kind != FileKind.APK) { "ZIP-family input must use strict streaming" }
+        return try {
+            cancellation.throwIfCancelled()
+            val original = readBounded(node, cancellation)
+            val settings = OptimizerSettings(runIntent.mode, runIntent.apkLabMode, runIntent.textMinify)
+            val result = Optimizers.optimize(node.name, kind, original, settings)
+                ?: return FileOutcome.Skipped(relativePath, SkipReason.NO_CHANGE)
+            if (result.bytes.size >= original.size) return FileOutcome.Skipped(relativePath, SkipReason.NO_GAIN)
+            if (FileTypeDetector.detect(node.name, result.bytes) != kind || !Optimizers.verify(kind, result.bytes, settings)) {
+                val failure = IOException("Optimizer output failed format verification")
+                return FileOutcome.Failed(relativePath, failure.message!!, failure)
+            }
+
+            val oldBytes = original.size.toLong()
+            val newBytes = result.bytes.size.toLong()
+            if (runIntent.dryRun) {
+                FileOutcome.WouldOptimize(relativePath, oldBytes, newBytes, TOOL_ID, result.note)
+            } else {
+                val context = commitContext
+                    ?: return FileOutcome.Failed(relativePath, "Replacement is unavailable until the backup transaction is installed.")
+                commit(node, relativePath, kind, original, result, context, cancellation)
+            }
+        } catch (cancelled: OptimizationCancelledException) {
+            throw cancelled
+        } catch (poisoned: UndoDurabilityException) {
+            throw poisoned
+        } catch (invariant: RunInvariantException) {
+            throw invariant
+        } catch (_: InputLimitExceededException) {
+            FileOutcome.Skipped(relativePath, SkipReason.MEMORY_LIMIT, "Input exceeded the $maxInputBytes-byte in-memory limit while reading.")
+        } catch (failure: Exception) {
+            FileOutcome.Failed(relativePath, failure.message ?: failure.javaClass.name, failure)
+        }
+    }
+
+    private fun readBounded(node: DocumentNode, cancellation: CancellationToken): ByteArray {
+        val output = ByteArrayOutputStream()
+        val buffer = ByteArray(TRANSFER_BUFFER_BYTES)
+        var total = 0L
+        documentGateway.openRead(node).use { input ->
+            while (true) {
+                cancellation.throwIfCancelled()
+                val read = input.read(buffer)
+                if (read < 0) break
+                if (read == 0) continue
+                total = try {
+                    Math.addExact(total, read.toLong())
+                } catch (overflow: ArithmeticException) {
+                    throw InputLimitExceededException(overflow)
+                }
+                if (total > maxInputBytes) throw InputLimitExceededException()
+                output.write(buffer, 0, read)
+            }
+        }
+        return output.toByteArray()
+    }
+
+    private fun commit(
+        originalNode: DocumentNode,
+        relativePath: String,
+        kind: FileKind,
+        originalBytes: ByteArray,
+        result: OptimizeResult,
+        context: CommitContext,
+        cancellation: CancellationToken
+    ): FileOutcome {
+        val backupTree = BackupTree(documentGateway)
+        var backup: BackupArtifact? = null
+        var originalIntegrity: StreamIntegrity? = null
+        var originalMutationStarted = false
+        var mutationCommitted = false
+        var undoDurable = false
+        var undoAppendStarted = false
+        return try {
+            val expectedOriginal = originalBytes.inputStream().use { StreamIntegrityChecker.hash(it, cancellation) }
+            val backupPath = backupPath(context.runId, relativePath)
+            val backupArtifact = backupTree.create(context.selectedRoot, backupPath)
+            backup = backupArtifact
+            val backupNode = backupArtifact.file
+            val backedUp = documentGateway.openRead(originalNode).use { source ->
+                documentGateway.openWrite(backupNode).use { destination ->
+                    StreamIntegrityChecker.copyAndHash(source, destination, cancellation)
+                }
+            }
+            originalIntegrity = backedUp
+            check(backedUp == expectedOriginal) { "Original changed before backup completed" }
+            val verifiedBackup = documentGateway.openRead(backupNode).use { StreamIntegrityChecker.hash(it, cancellation) }
+            check(verifiedBackup == expectedOriginal) { "Backup verification failed" }
+
+            val expectedCandidate = result.bytes.inputStream().use { source ->
+                StreamIntegrityChecker.hash(source, cancellation)
+            }
+            undoAppendStarted = true
+            context.undoEntrySink.appendAndFlush(
+                UndoEntry(
+                    relativePath = relativePath,
+                    originalBytes = expectedOriginal.bytes,
+                    optimizedBytes = expectedCandidate.bytes,
+                    backupPath = backupPath,
+                    originalSha256 = expectedOriginal.sha256,
+                    optimizedSha256 = expectedCandidate.sha256,
+                    note = result.note,
+                    fileKind = kind,
+                    toolId = TOOL_ID,
+                    completedAt = context.completedAt(),
+                    originalDocumentId = originalNode.id
+                )
+            )
+            undoDurable = true
+
+            cancellation.throwIfCancelled()
+            val liveOriginal = documentGateway.openRead(originalNode).use { source ->
+                StreamIntegrityChecker.hash(source, cancellation)
+            }
+            check(liveOriginal == expectedOriginal) { "Original changed immediately before replacement" }
+            cancellation.throwIfCancelled()
+            originalMutationStarted = true
+            val writtenCandidate = result.bytes.inputStream().use { source ->
+                documentGateway.openWrite(originalNode).use { destination ->
+                    StreamIntegrityChecker.copyAndHash(source, destination, cancellation)
+                }
+            }
+            val verifiedOriginal = documentGateway.openRead(originalNode).use { StreamIntegrityChecker.hash(it, cancellation) }
+            check(writtenCandidate == expectedCandidate && verifiedOriginal == expectedCandidate) {
+                "Optimized document verification failed"
+            }
+            mutationCommitted = true
+            FileOutcome.Optimized(relativePath, expectedOriginal.bytes, writtenCandidate.bytes, TOOL_ID, result.note)
+        } catch (failure: Throwable) {
+            val rollbackBackup = backup?.file
+            val rollbackIntegrity = originalIntegrity
+            if (!originalMutationStarted && !undoAppendStarted) {
+                backup?.let { backupTree.cleanupBeforeOriginalMutation(it, failure) }
+            }
+            val rollback = if (originalMutationStarted && !mutationCommitted && rollbackBackup != null && rollbackIntegrity != null) {
+                restoreBackup(originalNode, rollbackBackup, rollbackIntegrity)
+            } else {
+                RollbackResult.NotNeeded
+            }
+            if (undoAppendStarted && !undoDurable) {
+                throw poisonedUndoFailure(failure, rollback)
+            }
+            val fatal = fatalPrimary(failure, rollback)
+            if (fatal != null) {
+                attachSecondaryFailure(fatal, failure, rollback)
+                throw fatal
+            }
+            if (rollback is RollbackResult.Failed) {
+                throw EmergencyRollbackException(failure, rollback.cause)
+            }
+            if (failure is OptimizationCancelledException) {
+                throw failure
+            }
+            FileOutcome.Failed(relativePath, failure.message ?: failure.javaClass.name, failure, rollback)
+        }
+    }
+
+    private fun backupPath(runId: String, relativePath: String): String {
+        DocumentPathPolicy.requireSafeSegment(runId)
+        DocumentPathPolicy.requireSafeRelative(relativePath)
+        return "$BACKUP_PREFIX$runId/$relativePath"
+    }
+
+    private fun restoreBackup(original: DocumentNode, backup: DocumentNode, expected: StreamIntegrity): RollbackResult = try {
+        val restored = documentGateway.openRead(backup).use { source ->
+            documentGateway.openWrite(original).use { destination ->
+                StreamIntegrityChecker.copyAndHash(source, destination, NeverCancelled)
+            }
+        }
+        val verified = documentGateway.openRead(original).use { StreamIntegrityChecker.hash(it, NeverCancelled) }
+        check(restored == expected && verified == expected) { "Rollback verification failed" }
+        RollbackResult.Restored
+    } catch (failure: Throwable) {
+        RollbackResult.Failed(failure)
+    }
+
+    private fun poisonedUndoFailure(failure: Throwable, rollback: RollbackResult): UndoDurabilityException {
+        val fatal = fatalPrimary(failure, rollback)
+        if (fatal != null) attachSecondaryFailure(fatal, failure, rollback)
+        return UndoDurabilityException(
+            "Undo append/flush failed; the run log is poisoned",
+            failure,
+            rollback,
+            fatal
+        ).also { poisoned ->
+            if (fatal == null && rollback is RollbackResult.Failed) poisoned.addSuppressed(rollback.cause)
+        }
+    }
+
+    private fun fatalPrimary(failure: Throwable, rollback: RollbackResult): Throwable? = when {
+        failure.isVmFatal() -> failure
+        rollback is RollbackResult.Failed && rollback.cause.isVmFatal() -> rollback.cause
+        else -> null
+    }
+
+    private fun attachSecondaryFailure(primary: Throwable, failure: Throwable, rollback: RollbackResult) {
+        if (failure !== primary) primary.addSuppressed(failure)
+        if (rollback is RollbackResult.Failed && rollback.cause !== primary) primary.addSuppressed(rollback.cause)
+    }
+
+    private class InputLimitExceededException(cause: Throwable? = null) : IOException("Input memory limit exceeded", cause)
+
+    companion object {
+        const val DEFAULT_MAX_INPUT_BYTES = 64L * 1024L * 1024L
+        private const val TRANSFER_BUFFER_BYTES = 32 * 1024
+        private const val TOOL_ID = "KotlinByteArrayOptimizer"
+        private const val BACKUP_PREFIX = "FileForge_Backups_"
+    }
+}
 
 object Optimizers {
     fun optimize(name: String, kind: FileKind, input: ByteArray, settings: OptimizerSettings): OptimizeResult? {

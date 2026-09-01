@@ -1,193 +1,244 @@
 package com.fileforge.optimizer
 
-import android.app.Activity
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
-import android.net.Uri
+import android.content.ServiceConnection
 import android.os.Bundle
-import android.view.Gravity
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.view.Menu
 import android.view.View
-import android.widget.Button
-import android.widget.CheckBox
+import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ProgressBar
-import android.widget.ScrollView
-import android.widget.TextView
-import android.widget.Toast
-import androidx.documentfile.provider.DocumentFile
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import com.google.android.material.appbar.MaterialToolbar
+import com.google.android.material.bottomnavigation.BottomNavigationView
 
-class MainActivity : Activity() {
-    private val requestTreeCode = 4107
-    private lateinit var selectedFolderText: TextView
-    private lateinit var logText: TextView
-    private lateinit var progress: ProgressBar
-    private lateinit var apkLabBox: CheckBox
-    private lateinit var textMinifyBox: CheckBox
-    private var selectedTreeUri: Uri? = null
-    private var running = false
+class MainActivity : AppCompatActivity() {
+    private lateinit var toolbar: MaterialToolbar
+    private lateinit var contentContainer: FrameLayout
+    private lateinit var bottomNavigation: BottomNavigationView
+    private lateinit var optimizeController: OptimizeScreenController
+    private lateinit var restoreController: RestoreScreenController
+    private lateinit var aboutController: AboutScreenController
+    private var currentDestination: Int = R.id.navigation_optimize
+    private var activityVisible = false
+    private var serviceBinder: OptimizationBinder? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val observationSequencer = RunStateObservationSequencer()
+    private val runStateDispatcher = LatestValueDispatcher<SequencedRunState>(
+        schedule = { task ->
+            mainHandler.post { task() }
+            Unit
+        },
+        deliver = { state ->
+            optimizeController.render(state)
+            restoreController.render(state)
+        }
+    )
+
+    private val runStateListener: (RunState) -> Unit = { state ->
+        runStateDispatcher.submit(observationSequencer.next(state))
+    }
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as? OptimizationBinder ?: return
+            serviceBinder = binder
+            binder.addListener(runStateListener)
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            serviceBinder?.removeListener(runStateListener)
+            serviceBinder = null
+        }
+
+        override fun onNullBinding(name: ComponentName?) {
+            serviceBinder = null
+        }
+    }
+
+    private val serviceSession = OptimizeServiceSession(
+        object : OptimizeServicePort {
+            override fun bind(): Boolean = bindService(
+                Intent(this@MainActivity, OptimizationService::class.java),
+                serviceConnection,
+                Context.BIND_AUTO_CREATE
+            )
+
+            override fun unbind() {
+                serviceBinder?.removeListener(runStateListener)
+                serviceBinder = null
+                unbindService(serviceConnection)
+            }
+
+            override fun start(request: ServiceRunRequest.Optimize) {
+                OptimizationService.start(this@MainActivity, request)
+            }
+
+            override fun cancel() {
+                OptimizationService.cancel(this@MainActivity)
+            }
+        }
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        ThemePreferences.applyActivityThemeBeforeOnCreate(this)
         super.onCreate(savedInstanceState)
-        selectedTreeUri = getPreferences(MODE_PRIVATE).getString("treeUri", null)?.let(Uri::parse)
-        buildUi()
-        updateSelectedText()
-    }
-
-    private fun buildUi() {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(28, 32, 28, 24)
-        }
-
-        val title = TextView(this).apply {
-            text = "FileForge Optimizer"
-            textSize = 24f
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-        root.addView(title)
-
-        val subtitle = TextView(this).apply {
-            text = "Rootless same-type optimizer. Uses Storage Access Framework folder access."
-            textSize = 14f
-            setPadding(0, 8, 0, 18)
-        }
-        root.addView(subtitle)
-
-        selectedFolderText = TextView(this).apply { textSize = 13f }
-        root.addView(selectedFolderText)
-
-        val pick = Button(this).apply {
-            text = "Pick folder"
-            setOnClickListener { pickFolder() }
-        }
-        root.addView(pick)
-
-        apkLabBox = CheckBox(this).apply {
-            text = "Enable APK Lab Mode (unsafe for install/update compatibility)"
-            isChecked = false
-        }
-        root.addView(apkLabBox)
-
-        textMinifyBox = CheckBox(this).apply {
-            text = "Enable XML/JSON/SVG/TXT minify (may alter whitespace/metadata)"
-            isChecked = false
-        }
-        root.addView(textMinifyBox)
-
-        val safe = Button(this).apply {
-            text = "Run Safe Mode"
-            setOnClickListener { runOptimizer(OptimizeMode.SAFE) }
-        }
-        root.addView(safe)
-
-        val aggressive = Button(this).apply {
-            text = "Run Aggressive Mode"
-            setOnClickListener { runOptimizer(OptimizeMode.AGGRESSIVE) }
-        }
-        root.addView(aggressive)
-
-        val clear = Button(this).apply {
-            text = "Clear log"
-            setOnClickListener { logText.text = "" }
-        }
-        root.addView(clear)
-
-        progress = ProgressBar(this).apply { visibility = View.GONE }
-        root.addView(progress)
-
-        val scroll = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
-        }
-        logText = TextView(this).apply {
-            textSize = 12f
-            setTextIsSelectable(true)
-        }
-        scroll.addView(logText)
-        root.addView(scroll)
-
-        setContentView(root)
-    }
-
-    private fun pickFolder() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-            addFlags(Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)
-        }
-        startActivityForResult(intent, requestTreeCode)
-    }
-
-    @Deprecated("Deprecated by Activity Result APIs, but fine for this minimal no-AndroidX-Activity MVP.")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == requestTreeCode && resultCode == RESULT_OK) {
-            val uri = data?.data ?: return
-            val flags = data.flags and (
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            )
-            try {
-                contentResolver.takePersistableUriPermission(uri, flags)
-            } catch (_: Exception) {
-                // Some providers do not allow persisted grants; the active grant can still work for the session.
-            }
-            selectedTreeUri = uri
-            getPreferences(MODE_PRIVATE).edit().putString("treeUri", uri.toString()).apply()
-            updateSelectedText()
-            appendLog("Selected folder: $uri")
-        }
-    }
-
-    private fun updateSelectedText() {
-        selectedFolderText.text = selectedTreeUri?.let { "Selected: $it" } ?: "Selected: none"
-    }
-
-    private fun runOptimizer(mode: OptimizeMode) {
-        if (running) return
-        val uri = selectedTreeUri
-        if (uri == null) {
-            Toast.makeText(this, "Pick a folder first.", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val root = DocumentFile.fromTreeUri(this, uri)
-        if (root == null || !root.exists() || !root.canRead() || !root.canWrite()) {
-            Toast.makeText(this, "Cannot read/write that folder. Pick it again.", Toast.LENGTH_LONG).show()
-            return
-        }
-
-        val settings = OptimizerSettings(
-            mode = mode,
-            apkLabMode = apkLabBox.isChecked,
-            textMinify = textMinifyBox.isChecked
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        optimizeController = OptimizeScreenController(
+            activity = this,
+            startRun = serviceSession::start,
+            cancelRun = serviceSession::cancel,
+            observationWatermark = { observationSequencer.watermark }
         )
-
-        running = true
-        progress.visibility = View.VISIBLE
-        appendLog("\n=== Run started: $settings ===")
-
-        Thread {
-            val report = try {
-                OptimizerEngine(this, root, settings) { message -> appendLog(message) }.run()
-            } catch (t: Throwable) {
-                appendLog("Fatal error: ${t.message ?: t.javaClass.name}")
-                null
-            }
-            runOnUiThread {
-                running = false
-                progress.visibility = View.GONE
-                if (report != null) {
-                    appendLog("=== Done: scanned=${report.scanned}, optimized=${report.optimized}, saved=${report.savedBytes} bytes, skipped=${report.skipped}, errors=${report.errors} ===")
-                }
-            }
-        }.start()
+        val restoreStartTransport = RestoreScreenTestHooks.snapshot()?.startRestore
+        restoreController = RestoreScreenController(
+            activity = this,
+            startRestore = restoreStartTransport
+                ?: { request -> OptimizationService.start(this, request) },
+            cancelRun = serviceSession::cancel
+        )
+        aboutController = AboutScreenController(this)
+        buildMaterialHost()
     }
 
-    private fun appendLog(message: String) {
-        runOnUiThread {
-            logText.append(message + "\n")
+    override fun onStart() {
+        super.onStart()
+        activityVisible = true
+        if (currentDestination == R.id.navigation_restore) restoreController.onVisible()
+        else optimizeController.onVisible()
+        runStateDispatcher.resume()
+        optimizeController.awaitServiceReplay()
+        optimizeController.refreshTreeCapabilities()
+        serviceSession.onVisible()
+    }
+
+    override fun onStop() {
+        if (currentDestination == R.id.navigation_restore) restoreController.onHidden()
+        else optimizeController.onHidden()
+        activityVisible = false
+        runStateDispatcher.clear()
+        serviceSession.onHidden()
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        optimizeController.close()
+        restoreController.close()
+        aboutController.close()
+        super.onDestroy()
+    }
+
+    private fun buildMaterialHost() {
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        toolbar = MaterialToolbar(this).apply {
+            id = R.id.toolbar
+            setTitle(R.string.navigation_optimize)
+            contentDescription = getString(R.string.toolbar_description)
+        }
+        root.addView(
+            toolbar,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        contentContainer = FrameLayout(this).apply { id = R.id.content_container }
+        root.addView(
+            contentContainer,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        )
+        bottomNavigation = BottomNavigationView(this).apply {
+            id = R.id.bottom_navigation
+            contentDescription = getString(R.string.bottom_navigation_description)
+            menu.add(Menu.NONE, R.id.navigation_optimize, 0, R.string.navigation_optimize)
+                .setIcon(android.R.drawable.ic_menu_manage)
+            menu.add(Menu.NONE, R.id.navigation_restore, 1, R.string.navigation_restore)
+                .setIcon(android.R.drawable.ic_menu_revert)
+            menu.add(Menu.NONE, R.id.navigation_about, 2, R.string.navigation_about)
+                .setIcon(android.R.drawable.ic_menu_info_details)
+            setOnItemSelectedListener { item ->
+                showDestination(item.itemId)
+                true
+            }
+        }
+        root.addView(
+            bottomNavigation,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        setContentView(root)
+        applySystemBarInsets(root)
+        bottomNavigation.selectedItemId = R.id.navigation_optimize
+    }
+
+    private fun showDestination(itemId: Int) {
+        if (itemId != currentDestination && activityVisible) {
+            if (currentDestination == R.id.navigation_restore) restoreController.onHidden()
+            else optimizeController.onHidden()
+        }
+        currentDestination = itemId
+        contentContainer.removeAllViews()
+        when (itemId) {
+            R.id.navigation_restore -> {
+                toolbar.setTitle(R.string.navigation_restore)
+                (restoreController.view.parent as? ViewGroup)?.removeView(restoreController.view)
+                contentContainer.addView(restoreController.view)
+                if (activityVisible) restoreController.onVisible()
+            }
+            R.id.navigation_about -> {
+                toolbar.setTitle(R.string.navigation_about)
+                (aboutController.view.parent as? ViewGroup)?.removeView(aboutController.view)
+                contentContainer.addView(aboutController.view)
+            }
+            else -> {
+                toolbar.setTitle(R.string.navigation_optimize)
+                (optimizeController.view.parent as? ViewGroup)?.removeView(optimizeController.view)
+                contentContainer.addView(optimizeController.view)
+                if (activityVisible) optimizeController.onVisible()
+            }
         }
     }
+
+    private fun applySystemBarInsets(root: View) {
+        val toolbarLeft = toolbar.paddingLeft
+        val toolbarTop = toolbar.paddingTop
+        val toolbarRight = toolbar.paddingRight
+        val toolbarBottom = toolbar.paddingBottom
+        val navigationLeft = bottomNavigation.paddingLeft
+        val navigationTop = bottomNavigation.paddingTop
+        val navigationRight = bottomNavigation.paddingRight
+        val navigationBottom = bottomNavigation.paddingBottom
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, windowInsets ->
+            val insets = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            view.setPadding(insets.left, 0, insets.right, 0)
+            toolbar.setPadding(
+                toolbarLeft,
+                toolbarTop + insets.top,
+                toolbarRight,
+                toolbarBottom
+            )
+            bottomNavigation.setPadding(
+                navigationLeft,
+                navigationTop,
+                navigationRight,
+                navigationBottom + insets.bottom
+            )
+            windowInsets
+        }
+        ViewCompat.requestApplyInsets(root)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 }

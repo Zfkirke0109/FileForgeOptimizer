@@ -1,0 +1,401 @@
+package com.fileforge.optimizer
+
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
+import java.io.StringReader
+import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.zip.Deflater
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+class OptimizerEngineTransactionHardeningTest {
+    @Test
+    fun everyRecoverableThrowableAfterUndoAppendStartsPoisonsRunAndStopsBeforeSecondFile() {
+        listOf(
+            UndoFault.MID_LINE_ASSERTION,
+            UndoFault.FLUSH_AFTER_DELEGATE_ASSERTION,
+            UndoFault.MID_LINE_CANCELLATION
+        ).forEach { fault ->
+            withEngine(realRun) { gateway, engine, _ ->
+                gateway.put("a-first.zip", zipFixture)
+                gateway.put("b-second.zip", zipFixture)
+                gateway.undoFault = fault
+
+                val report = engine.run(NeverCancelled) {}
+                val durable = gateway.readDurableUndo()
+
+                assertEquals("run status for $fault", RunStatus.FAILED, report.status)
+                assertArrayEquals("first original restored for $fault", zipFixture, gateway.contents("a-first.zip"))
+                assertArrayEquals("second original untouched for $fault", zipFixture, gateway.contents("b-second.zip"))
+                assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.zip") })
+                assertTrue(gateway.mutations.none { it == "open-write:b-second.zip" })
+                assertEquals("no terminal write for $fault", 0, gateway.undoWritesAfterPoison)
+                assertEquals("no writer flush for $fault", 0, gateway.undoFlushesAfterPoison)
+                assertEquals(1, gateway.undoCloses)
+                assertEquals(RunStatus.RUNNING, durable.status)
+                assertEquals(null, durable.terminal)
+            }
+        }
+    }
+
+    @Test
+    fun poisonedUndoEntryStopsBeforeOriginalMutationAndLeavesLogUnfinalized() =
+        withEngine(realRun) { gateway, engine, _ ->
+            gateway.put("a-first.zip", zipFixture)
+            gateway.put("b-second.zip", zipFixture)
+            gateway.undoFault = UndoFault.MID_LINE_WRITE
+            gateway.failEmergencyRollbackForPath = "a-first.zip"
+
+            val report = engine.run(NeverCancelled) {}
+            val durable = gateway.readDurableUndo()
+
+            assertEquals(RunStatus.FAILED, report.status)
+            assertEquals(null, report.rollbackFailure)
+            assertTrue(report.terminalError!!.contains("undo", ignoreCase = true))
+            assertTrue(gateway.mutations.none { it == "open-write:a-first.zip" })
+            assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.zip") })
+            assertTrue(gateway.mutations.none { it == "open-write:b-second.zip" })
+            assertEquals(0, gateway.undoWritesAfterPoison)
+            assertEquals(0, gateway.undoFlushesAfterPoison)
+            assertEquals(RunStatus.RUNNING, durable.status)
+            assertEquals(null, durable.terminal)
+        }
+
+    @Test
+    fun failedStreamingRollbackAfterOriginalMutationFailsRunBeforeSecondFile() =
+        withEngine(realRun) { gateway, engine, _ ->
+            gateway.put("a-first.zip", zipFixture)
+            gateway.put("b-second.zip", zipFixture)
+            gateway.corruptFirstWriteForPath = "a-first.zip"
+            gateway.failEmergencyRollbackForPath = "a-first.zip"
+
+            val report = engine.run(NeverCancelled) {}
+
+            assertEquals(RunStatus.FAILED, report.status)
+            assertTrue(report.terminalError!!.contains("rollback", ignoreCase = true))
+            assertTrue(report.rollbackFailure!!.contains("emergency rollback write failed"))
+            assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.zip") })
+            assertTrue(gateway.mutations.none { it == "open-write:b-second.zip" })
+        }
+
+    @Test
+    fun failedByteArrayRollbackAfterOriginalMutationFailsRunBeforeSecondFile() =
+        withEngine(realRun) { gateway, engine, _ ->
+            val original = "%PDF-1.4\n%%EOF\ntrailing garbage".toByteArray()
+            gateway.put("a-first.pdf", original)
+            gateway.put("b-second.pdf", original)
+            gateway.corruptFirstWriteForPath = "a-first.pdf"
+            gateway.failEmergencyRollbackForPath = "a-first.pdf"
+
+            val report = engine.run(NeverCancelled) {}
+
+            assertEquals(RunStatus.FAILED, report.status)
+            assertTrue(report.terminalError!!.contains("rollback", ignoreCase = true))
+            assertTrue(report.rollbackFailure!!.contains("emergency rollback write failed"))
+            assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.pdf") })
+            assertTrue(gateway.mutations.none { it == "open-write:b-second.pdf" })
+        }
+
+    @Test
+    fun poisonedUndoWriteOrAmbiguousFlushAbortsBeforeSecondFileAndNeverFinalizesWriter() {
+        listOf(UndoFault.MID_LINE_WRITE, UndoFault.FLUSH_AFTER_DELEGATE).forEach { fault ->
+            withEngine(realRun) { gateway, engine, _ ->
+                gateway.put("a-first.zip", zipFixture)
+                gateway.put("b-second.zip", zipFixture)
+                gateway.undoFault = fault
+
+                val report = engine.run(NeverCancelled) {}
+                val durable = gateway.readDurableUndo()
+
+                assertEquals(RunStatus.FAILED, report.status)
+                assertArrayEquals(zipFixture, gateway.contents("a-first.zip"))
+                assertArrayEquals(zipFixture, gateway.contents("b-second.zip"))
+                assertTrue(gateway.mutations.none { it.contains("FileForge_Backups_$RUN_ID/b-second.zip") })
+                assertTrue(gateway.mutations.none { it == "open-write:b-second.zip" })
+                assertEquals(0, gateway.undoWritesAfterPoison)
+                assertEquals(1, gateway.undoCloses)
+                assertEquals(RunStatus.RUNNING, durable.status)
+                assertEquals(null, durable.terminal)
+            }
+        }
+    }
+
+    @Test
+    fun recoverableAssertionErrorFromListProducesFailedReportAndBestEffortFailedTerminal() = withEngine(realRun) { gateway, engine, _ ->
+        gateway.put("unknown.bin", byteArrayOf(1))
+        gateway.listFailure = AssertionError("provider list assertion")
+
+        val report = engine.run(NeverCancelled) {}
+        val durable = gateway.readDurableUndo()
+
+        assertEquals(RunStatus.FAILED, report.status)
+        assertTrue(report.terminalError!!.contains("provider list assertion"))
+        assertEquals(RunStatus.FAILED, durable.status)
+    }
+
+    @Test
+    fun recoverableAssertionErrorFromReadProducesFailedReportAndBestEffortFailedTerminal() = withEngine(realRun) { gateway, engine, _ ->
+        gateway.put("unknown.bin", byteArrayOf(1))
+        gateway.readFailure = AssertionError("provider read assertion")
+
+        val report = engine.run(NeverCancelled) {}
+        val durable = gateway.readDurableUndo()
+
+        assertEquals(RunStatus.FAILED, report.status)
+        assertTrue(report.terminalError!!.contains("provider read assertion"))
+        assertEquals(RunStatus.FAILED, durable.status)
+    }
+
+    @Test
+    fun finalizationAssertionErrorNeverMasksPrimaryRecoverableError() {
+        val cache = Files.createTempDirectory("fileforge-error-finality").toFile()
+        try {
+            val gateway = TransactionalEngineGateway().apply {
+                put("unknown.bin", byteArrayOf(1))
+                listFailure = AssertionError("primary provider failure")
+                finalizeFailure = AssertionError("secondary close failure")
+            }
+            val engine = OptimizerEngine(
+                documentGateway = gateway,
+                selectedRoot = gateway.root,
+                candidateStore = CandidateStore(cache, "error-run"),
+                runId = "error-run",
+                runIntent = realRun,
+                startedAt = { "start" },
+                completedAt = { throw AssertionError("secondary timestamp failure") },
+                appVersion = "test",
+                buildVariant = "standard-test"
+            )
+
+            val report = engine.run(NeverCancelled) {}
+
+            assertEquals(RunStatus.FAILED, report.status)
+            assertTrue(report.terminalError!!.contains("primary provider failure"))
+            assertTrue(report.terminalFailures.any { it.contains("secondary timestamp failure") })
+            assertTrue(report.terminalFailures.any { it.contains("secondary close failure") })
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun zipUndoWriteOrFlushFailureRollsBackAndNeverCountsUnloggedReplacement() {
+        listOf(UndoFault.WRITE, UndoFault.FLUSH).forEach { fault ->
+            withEngine(realRun) { gateway, engine, _ ->
+                gateway.put("archive.zip", zipFixture)
+                gateway.undoFault = fault
+
+                val report = engine.run(NeverCancelled) {}
+
+                assertArrayEquals("original restored for $fault", zipFixture, gateway.contents("archive.zip"))
+                assertEquals(0, report.optimized)
+                assertEquals(0, report.savedBytes)
+                assertTrue(report.errors > 0)
+            }
+        }
+    }
+
+    @Test
+    fun nonZipUndoWriteOrFlushFailureRollsBackAndNeverCountsUnloggedReplacement() {
+        listOf(UndoFault.WRITE, UndoFault.FLUSH).forEach { fault ->
+            withEngine(realRun) { gateway, engine, _ ->
+                val original = "%PDF-1.4\n%%EOF\ntrailing garbage".toByteArray()
+                gateway.put("document.pdf", original)
+                gateway.undoFault = fault
+
+                val report = engine.run(NeverCancelled) {}
+
+                assertArrayEquals("original restored for $fault", original, gateway.contents("document.pdf"))
+                assertEquals(0, report.optimized)
+                assertEquals(0, report.savedBytes)
+                assertTrue(report.errors > 0)
+            }
+        }
+    }
+
+    @Test
+    fun undoExactCreationFaultRejectsBeforeAnyOriginalMutation() {
+        ExactCreationFault.entries.forEach { fault ->
+            withEngine(realRun) { gateway, engine, _ ->
+                gateway.put("archive.zip", zipFixture)
+                gateway.exactCreationFault = fault
+
+                val report = engine.run(NeverCancelled) {}
+
+                assertEquals(RunStatus.FAILED, report.status)
+                assertArrayEquals(zipFixture, gateway.contents("archive.zip"))
+                assertTrue(gateway.mutations.none { it == "open-write:archive.zip" })
+            }
+        }
+    }
+
+    @Test
+    fun secondRunOfSameEngineRejectsBeforeAnyAdditionalTreeMutation() = withEngine(realRun) { gateway, engine, _ ->
+        gateway.put("unknown.bin", byteArrayOf(1))
+        engine.run(NeverCancelled) {}
+        val mutationsAfterFirst = gateway.mutations.toList()
+
+        assertThrows(IllegalStateException::class.java) { engine.run(NeverCancelled) {} }
+
+        assertEquals(mutationsAfterFirst, gateway.mutations)
+    }
+
+    @Test
+    fun concurrentSecondRunRejectsBeforeSelectedTreeMutation() = withEngine(realRun) { gateway, engine, _ ->
+        gateway.put("unknown.bin", byteArrayOf(1))
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        gateway.firstListEntered = entered
+        gateway.blockFirstList = release
+        val first = Thread { engine.run(NeverCancelled) {} }.apply { start() }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        val mutationsDuringFirst = gateway.mutations.toList()
+
+        try {
+            assertThrows(IllegalStateException::class.java) { engine.run(NeverCancelled) {} }
+            assertEquals(mutationsDuringFirst, gateway.mutations)
+        } finally {
+            release.countDown()
+            first.join(5_000)
+        }
+        assertFalse(first.isAlive)
+    }
+
+    @Test
+    fun closeFailureAfterFlushedTerminalDoesNotChangeReturnedDurableReport() = withEngine(realRun) { gateway, engine, _ ->
+        gateway.put("unknown.bin", byteArrayOf(1))
+        gateway.undoFault = UndoFault.CLOSE_AFTER_FLUSH
+
+        val report = engine.run(NeverCancelled) {}
+        val durable = gateway.readDurableUndo()
+
+        assertEquals(RunStatus.COMPLETED, report.status)
+        assertEquals(report.status, durable.status)
+        assertEquals(report.errors, durable.terminal!!.errors)
+        assertEquals(report.scanned, durable.terminal!!.scanned)
+        assertEquals(report.skipped, durable.terminal!!.skipped)
+    }
+
+    @Test
+    fun terminalWriteOrFlushFailureReturnsFailedNeverRunningEvenWhenLogRemainsInterrupted() {
+        listOf(UndoFault.WRITE, UndoFault.FLUSH).forEach { fault ->
+            withEngine(realRun) { gateway, engine, _ ->
+                gateway.put("unknown.bin", byteArrayOf(1))
+                gateway.undoFault = fault
+
+                val report = engine.run(NeverCancelled) {}
+                val durable = gateway.readDurableUndo()
+
+                assertEquals(RunStatus.FAILED, report.status)
+                assertTrue(report.errors > 0)
+                assertEquals("unfinalized durable log must parse as interrupted for $fault", RunStatus.RUNNING, durable.status)
+                assertEquals(null, durable.terminal)
+            }
+        }
+    }
+
+    @Test
+    fun candidateCleanupFailureAfterCommitKeepsReportAndTerminalConsistentWithDurableEntry() {
+        val cache = Files.createTempDirectory("fileforge-engine-cleanup").toFile()
+        try {
+            val gateway = TransactionalEngineGateway().apply { put("archive.zip", zipFixture) }
+            val engine = OptimizerEngine(
+                documentGateway = gateway,
+                selectedRoot = gateway.root,
+                candidateStore = CandidateStore(cache, RUN_ID, DeleteFailingCandidateFileSystem),
+                runId = RUN_ID,
+                runIntent = realRun,
+                startedAt = { "2026-08-13T20:00:00Z" },
+                completedAt = { "2026-08-13T20:01:00Z" },
+                appVersion = "test",
+                buildVariant = "standard-test"
+            )
+
+            val report = engine.run(NeverCancelled) {}
+            val durable = gateway.readDurableUndo()
+
+            assertEquals(1, report.optimized)
+            assertEquals(1, durable.entries.size)
+            assertEquals(report.optimized, durable.terminal!!.optimized)
+            assertEquals(report.savedBytes, durable.terminal!!.savedBytes)
+            assertArrayEquals(optimizeZip(zipFixture), gateway.contents("archive.zip"))
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun runInvariantFailureWritesFailedTerminalNeverRunningTerminal() = withEngine(realRun) { gateway, engine, _ ->
+        gateway.put("unknown.bin", byteArrayOf(1))
+        gateway.runInvariantFailure = RunInvariantException("selected tree contract lost")
+
+        val report = engine.run(NeverCancelled) {}
+        val durable = gateway.readDurableUndo()
+
+        assertEquals(RunStatus.FAILED, report.status)
+        assertEquals(RunStatus.FAILED, durable.status)
+        assertEquals(RunStatus.FAILED, durable.terminal!!.status)
+    }
+
+    private fun withEngine(
+        intent: RunIntent,
+        block: (TransactionalEngineGateway, OptimizerEngine, File) -> Unit
+    ) {
+        val cache = Files.createTempDirectory("fileforge-engine-hardening").toFile()
+        try {
+            val gateway = TransactionalEngineGateway()
+            val engine = OptimizerEngine(
+                documentGateway = gateway,
+                selectedRoot = gateway.root,
+                candidateStore = CandidateStore(cache, RUN_ID),
+                runId = RUN_ID,
+                runIntent = intent,
+                startedAt = { "2026-08-13T20:00:00Z" },
+                completedAt = { "2026-08-13T20:01:00Z" },
+                appVersion = "test",
+                buildVariant = "standard-test"
+            )
+            block(gateway, engine, cache)
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    private class TransactionalEngineGateway : FaultInjectingEngineGateway() {
+        var runInvariantFailure: RunInvariantException? = null
+        override fun list(node: DocumentNode): List<DocumentNode> {
+            runInvariantFailure?.let { throw it }
+            return super.list(node)
+        }
+
+        fun readDurableUndo(): UndoRun = UndoLogRepository().read(
+            StringReader(contents("FileForge_Undo_v2_$RUN_ID.jsonl").toString(Charsets.UTF_8))
+        )
+    }
+
+    private companion object {
+        const val RUN_ID = "run-transaction"
+        val realRun = RunIntent(OptimizeMode.SAFE, dryRun = false, apkLabMode = false, textMinify = true)
+        val zipFixture = ByteArrayOutputStream().also { output ->
+            ZipOutputStream(output).use { zip ->
+                zip.setLevel(Deflater.NO_COMPRESSION)
+                zip.putNextEntry(ZipEntry("repeated.bin").apply { time = 0L })
+                zip.write(ByteArray(128 * 1024) { (it % 4).toByte() })
+                zip.closeEntry()
+            }
+        }.toByteArray()
+
+        private fun optimizeZip(input: ByteArray): ByteArray = ByteArrayOutputStream().also { output ->
+            StreamingZipOptimizer().optimize(input.inputStream(), output, OptimizeMode.SAFE, NeverCancelled) {}
+        }.toByteArray()
+    }
+}

@@ -1,28 +1,117 @@
-name: Build debug APK
+name: Verify and release APKs
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fileforge-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: 27.2.12479018
+  CMAKE_VERSION: 3.22.1
+  RUST_VERSION: 1.88.0
+  CARGO_NDK_VERSION: 4.1.2
 
 jobs:
-  build:
+  verify-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - name: Install Android SDK platform
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
-      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407  # v3
+
+      - name: Install pinned Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmake/$CMAKE_VERSION/bin" >> "$GITHUB_PATH"
+
+      - uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d  # v4
         with:
           gradle-version: '8.10.2'
-      - name: Build debug APK
-        run: gradle assembleDebug
-      - name: Sign and verify APK with shared keystore
+
+      - name: Install pinned Rust and shell test tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal --target aarch64-linux-android
+          rustup default "$RUST_VERSION"
+          cargo install cargo-ndk --version 4.1.2 --locked
+          sudo apt-get update
+          sudo apt-get install --yes bats
+
+      - name: Fetch and build pinned native tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-native-sources.sh
+          bash scripts/build-native-tools.sh
+          bash scripts/verify-native-tools.sh
+          bats scripts/tests/native-tools.bats scripts/tests/workflow-contracts.bats
+
+      - name: Test and lint both variants
+        run: >-
+          gradle
+          :app:testStandardDebugUnitTest
+          :app:testNativeArm64DebugUnitTest
+          :app:lintStandardDebug
+          :app:lintNativeArm64Debug
+
+      - name: Assemble release variants
+        run: gradle :app:assembleStandardRelease :app:assembleNativeArm64Release
+
+      - name: Verify unsigned APK inventories
+        shell: bash
+        run: |
+          set -euo pipefail
+          standard="app/build/outputs/apk/standard/release/FileForgeOptimizer-standard.apk"
+          native="app/build/outputs/apk/nativeArm64/release/FileForgeOptimizer-native-arm64.apk"
+          test -f "$standard"
+          test -f "$native"
+
+          mapfile -t standard_libraries < <(unzip -Z1 "$standard" | awk '/^lib\/.*\.so$/ {print}' | sort)
+          mapfile -t native_libraries < <(unzip -Z1 "$native" | awk '/^lib\/.*\.so$/ {print}' | sort)
+          expected_native_libraries=(
+            lib/arm64-v8a/libfileforge_jpegtran.so
+            lib/arm64-v8a/libfileforge_oxipng.so
+            lib/arm64-v8a/libfileforge_qpdf.so
+            lib/arm64-v8a/libfileforge_zipalign.so
+            lib/arm64-v8a/libfileforge_zopflipng.so
+          )
+          test "${#standard_libraries[@]}" -eq 0 || { echo "standard APK contains native libraries" >&2; exit 1; }
+          test "${native_libraries[*]}" = "${expected_native_libraries[*]}" || { echo "native tool inventory mismatch" >&2; exit 1; }
+
+          unzip -p "$standard" assets/native-tools.json | \
+            jq -e '.schemaVersion == 1 and .abi == null and (.tools | length == 0)' >/dev/null
+          unzip -p "$native" assets/native-tools.json | \
+            jq -e '.schemaVersion == 1 and .abi == "arm64-v8a" and (.tools | length == 5)' >/dev/null
+          unzip -Z1 "$native" | grep -Fxq assets/NOTICE.md
+          for id in qpdf oxipng jpegtran zopflipng zipalign; do
+            unzip -Z1 "$native" | grep -Fxq "lib/arm64-v8a/libfileforge_${id}.so"
+          done
+
+      - name: Sign and verify release APKs
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -35,29 +124,62 @@ jobs:
           for secret in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD EXPECTED_SIGNER_SHA256; do
             test -n "${!secret}" || { echo "::error::Required signing secret $secret is not configured."; exit 1; }
           done
-          keystore="$RUNNER_TEMP/rootlesszachdsp.jks"
+
+          keystore="$RUNNER_TEMP/fileforge-release.jks"
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
           chmod 600 "$keystore"
           keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
           expected="$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')"
-          cert="$(keytool -exportcert -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" | sha256sum | awk '{print toupper($1)}')"
-          test "$cert" = "$expected" || { echo "::error::Signing certificate fingerprint mismatch."; exit 1; }
+          certificate="$(keytool -exportcert -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" | sha256sum | awk '{print toupper($1)}')"
+          test "$certificate" = "$expected" || { echo "::error::Signing certificate fingerprint mismatch."; exit 1; }
 
-          apk="app/build/outputs/apk/debug/app-debug.apk"
-          aligned="$RUNNER_TEMP/app-debug-aligned.apk"
-          signed="$RUNNER_TEMP/app-debug-signed.apk"
-          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -f -P 16 4 "$apk" "$aligned"
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --ks "$keystore" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD --out "$signed" "$aligned"
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$signed" | tee "$RUNNER_TEMP/apksigner.txt"
-          actual="$(awk -F': ' '/Signer #[0-9]+ certificate SHA-256 digest:/ {print toupper($2); exit}' "$RUNNER_TEMP/apksigner.txt" | tr -d '[:space:]:' )"
-          test "$actual" = "$expected" || { echo "::error::Signed APK certificate mismatch."; exit 1; }
-          mv "$signed" "$apk"
-          rm -f "$keystore" "$aligned"
-      - name: Remove signing material from runner
+          zipalign="$ANDROID_HOME/build-tools/35.0.0/zipalign"
+          apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          mkdir -p dist
+          for variant in standard native-arm64; do
+            source="app/build/outputs/apk/${variant/native-arm64/nativeArm64}/release/FileForgeOptimizer-${variant}.apk"
+            aligned="$RUNNER_TEMP/FileForgeOptimizer-${variant}-aligned.apk"
+            signed="$GITHUB_WORKSPACE/dist/FileForgeOptimizer-${variant}.apk"
+            "$zipalign" -f -P 16 4 "$source" "$aligned"
+            "$apksigner" sign \
+              --ks "$keystore" \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:KEYSTORE_PASSWORD \
+              --key-pass env:KEY_PASSWORD \
+              --out "$signed" \
+              "$aligned"
+            "$apksigner" verify --verbose --print-certs "$signed" > "$RUNNER_TEMP/apksigner-${variant}.txt"
+            actual="$(awk -F': ' '/Signer #[0-9]+ certificate SHA-256 digest:/ {print toupper($2); exit}' "$RUNNER_TEMP/apksigner-${variant}.txt" | tr -d '[:space:]:' )"
+            test "$actual" = "$expected" || { echo "::error::Signed APK certificate mismatch."; exit 1; }
+            "$zipalign" -c -P 16 4 "$signed"
+            (cd dist && sha256sum "FileForgeOptimizer-${variant}.apk" > "FileForgeOptimizer-${variant}.apk.sha256")
+          done
+
+      - name: Remove signing material
         if: always()
-        run: rm -f "$RUNNER_TEMP/rootlesszachdsp.jks"
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        shell: bash
+        run: |
+          rm -f \
+            "$RUNNER_TEMP/fileforge-release.jks" \
+            "$RUNNER_TEMP/FileForgeOptimizer-standard-aligned.apk" \
+            "$RUNNER_TEMP/FileForgeOptimizer-native-arm64-aligned.apk"
+
+      - name: Upload standard release artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: FileForgeOptimizer-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: FileForgeOptimizer-standard-v0.2.0
+          path: |
+            dist/FileForgeOptimizer-standard.apk
+            dist/FileForgeOptimizer-standard.apk.sha256
+          if-no-files-found: error
+
+      - name: Upload native arm64 release artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: FileForgeOptimizer-native-arm64-v0.2.0
+          path: |
+            dist/FileForgeOptimizer-native-arm64.apk
+            dist/FileForgeOptimizer-native-arm64.apk.sha256
+          if-no-files-found: error

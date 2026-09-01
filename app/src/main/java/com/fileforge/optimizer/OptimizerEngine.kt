@@ -2,196 +2,502 @@ package com.fileforge.optimizer
 
 import android.content.Context
 import androidx.documentfile.provider.DocumentFile
-import java.io.ByteArrayOutputStream
+import java.io.OutputStreamWriter
+import java.io.OutputStream
+import java.io.Writer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
+/** Android-free orchestration for one selected-tree optimization run. */
 class OptimizerEngine(
-    private val context: Context,
-    private val root: DocumentFile,
-    private val settings: OptimizerSettings,
-    private val logger: (String) -> Unit
+    private val documentGateway: DocumentGateway,
+    private val selectedRoot: DocumentNode,
+    private val candidateStore: CandidateStore,
+    private val runId: String,
+    private val runIntent: RunIntent,
+    private val startedAt: () -> String,
+    private val completedAt: () -> String,
+    private val appVersion: String,
+    private val buildVariant: String,
+    private val nativeToolExecutor: NativeToolExecutor? = null
 ) {
-    private val resolver = context.contentResolver
-    private val maxBytes = 300L * 1024L * 1024L
-    private val report = OptimizationReport()
-    private val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-    private val undoLines = StringBuilder()
-    private lateinit var backupRoot: DocumentFile
+    private val undoRepository = UndoLogRepository()
+    private val runClaimed = AtomicBoolean(false)
+    private var compatibilityLogger: ((String) -> Unit)? = null
 
-    fun run(): OptimizationReport {
-        backupRoot = root.createDirectory("FileForge_Backups_$stamp")
-            ?: throw IllegalStateException("Could not create backup directory in selected folder.")
-        undoLines.append("FileForge Undo Log $stamp\n")
-        undoLines.append("Mode=$settings\n")
-        undoLines.append("Format: relative_path | original_bytes | optimized_bytes | backup_path | note\n\n")
-
-        walk(root, "")
-        writeUndoLog()
-        return report
+    init {
+        require(selectedRoot.isDirectory) { "The selected root must be a directory" }
+        DocumentPathPolicy.requireSafeSegment(runId)
+        require(appVersion.isNotBlank()) { "appVersion must not be blank" }
+        require(buildVariant.isNotBlank()) { "buildVariant must not be blank" }
     }
 
-    private fun walk(dir: DocumentFile, relativeDir: String) {
-        val children = try {
-            dir.listFiles()
-        } catch (t: Throwable) {
-            report.errors++
-            logger("ERROR listing $relativeDir: ${t.message}")
-            return
-        }
+    /** Compatibility bridge for the original activity. New callers should use the Android-free primary constructor. */
+    constructor(
+        context: Context,
+        root: DocumentFile,
+        settings: OptimizerSettings,
+        logger: (String) -> Unit
+    ) : this(AndroidBridge(context, root), settings, logger)
 
-        for (child in children) {
-            val name = child.name ?: continue
-            if (child.isDirectory) {
-                if (name.startsWith("FileForge_Backups_") || name.startsWith("FileForge_Undo_")) continue
-                val childRel = if (relativeDir.isBlank()) name else "$relativeDir/$name"
-                walk(child, childRel)
-            } else if (child.isFile) {
-                val rel = if (relativeDir.isBlank()) name else "$relativeDir/$name"
-                processFile(child, rel)
+    private constructor(
+        bridge: AndroidBridge,
+        settings: OptimizerSettings,
+        logger: (String) -> Unit
+    ) : this(
+        documentGateway = bridge.gateway,
+        selectedRoot = bridge.gateway.rootNode,
+        candidateStore = bridge.candidateStore,
+        runId = bridge.runId,
+        runIntent = RunIntent(
+            mode = settings.mode,
+            dryRun = false,
+            apkLabMode = settings.apkLabMode,
+            textMinify = settings.textMinify
+        ),
+        startedAt = bridge::timestamp,
+        completedAt = bridge::timestamp,
+        appVersion = bridge.appVersion,
+        buildVariant = bridge.buildVariant,
+        nativeToolExecutor = bridge.nativeToolExecutor
+    ) {
+        compatibilityLogger = logger
+    }
+
+    fun run(): OptimizationReport = run(NeverCancelled) { snapshot ->
+        compatibilityLogger?.invoke(
+            buildString {
+                append(snapshot.phase)
+                snapshot.currentRelativePath?.let { append(": ").append(it) }
+                append(" (processed=").append(snapshot.filesProcessed)
+                append(", optimized=").append(snapshot.optimized)
+                append(", saved=").append(snapshot.savedBytes).append(" bytes)")
             }
-        }
+        )
     }
 
-    private fun processFile(file: DocumentFile, relativePath: String) {
-        report.scanned++
-        val name = file.name ?: relativePath.substringAfterLast('/')
+    fun run(
+        cancellation: CancellationToken,
+        onProgress: (ProgressSnapshot) -> Unit
+    ): OptimizationReport {
+        check(runClaimed.compareAndSet(false, true)) { "An OptimizerEngine instance can run only once" }
+        val report = OptimizationReport()
+        var filesDiscovered = 0
+        var filesProcessed = 0
+        var undo: UndoSession? = null
+        var undoPoisoned = false
+        var vmFatal: Throwable? = null
 
-        val length = file.length()
-        if (length > maxBytes) {
-            report.skipped++
-            logger("SKIP too large: $relativePath (${length} bytes)")
-            return
+        fun progress(phase: String, path: String? = null) {
+            try {
+                onProgress(
+                    ProgressSnapshot(
+                        phase = phase,
+                        currentRelativePath = path,
+                        filesDiscovered = filesDiscovered,
+                        filesProcessed = filesProcessed,
+                        candidates = report.candidates,
+                        optimized = report.optimized,
+                        skipsByReason = report.skipsByReason,
+                        errors = report.errors,
+                        bytesRead = report.bytesRead,
+                        bytesWritten = report.bytesWritten,
+                        savedBytes = report.savedBytes,
+                        potentialSavingsBytes = report.potentialSavingsBytes,
+                        totalWork = null
+                    )
+                )
+            } catch (failure: Throwable) {
+                if (failure.isVmFatal()) throw failure
+                // Observers (activities, services, or notifications) do not own engine state.
+            }
         }
 
         try {
-            val original = readFile(file, maxBytes)
-            val kind = FileTypeDetector.detect(name, original)
-            if (kind == FileKind.UNSUPPORTED) {
-                report.skipped++
-                return
-            }
-            if (kind == FileKind.APK && !settings.apkLabMode) {
-                report.skipped++
-                logger("SKIP APK safe guard: $relativePath")
-                return
-            }
+            if (!runIntent.dryRun) undo = openUndoSession()
+            progress(if (runIntent.dryRun) "analyzing" else "optimizing")
 
-            val result = Optimizers.optimize(name, kind, original, settings)
-            if (result == null) {
-                report.skipped++
-                logger("NO CHANGE candidate skipped: $relativePath [$kind]")
-                return
+            val commitContext = undo?.let { session ->
+                CommitContext(
+                    selectedRoot = selectedRoot,
+                    runId = runId,
+                    undoEntrySink = UndoEntrySink { entry ->
+                        undoRepository.appendEntry(session.writer, entry)
+                        session.entriesCommitted = checkedIncrement(session.entriesCommitted)
+                    },
+                    completedAt = completedAt
+                )
             }
-
-            if (result.bytes.size >= original.size) {
-                report.skipped++
-                logger("NO GAIN: $relativePath [$kind] old=${original.size}, new=${result.bytes.size}")
-                return
+            val streamingCoordinator = if (commitContext == null) {
+                OptimizationCoordinator(documentGateway, candidateStore, runId, nativeToolExecutor)
+            } else {
+                OptimizationCoordinator(
+                    documentGateway,
+                    candidateStore,
+                    StrictStreamingZipCandidateProcessor,
+                    commitContext,
+                    nativeToolExecutor
+                )
             }
-
-            val newKind = FileTypeDetector.detect(name, result.bytes)
-            if (newKind != kind) {
-                report.errors++
-                logger("ERROR type changed, not replacing: $relativePath [$kind -> $newKind]")
-                return
-            }
-
-            if (!Optimizers.verify(kind, result.bytes, settings)) {
-                report.errors++
-                logger("ERROR verification failed, not replacing: $relativePath [$kind]")
-                return
+            val byteArrayAdapter = ByteArrayOptimizerAdapter(documentGateway, commitContext)
+            val nativeDocumentOptimizer = nativeToolExecutor?.let { executor ->
+                NativeDocumentOptimizer(
+                    documentGateway = documentGateway,
+                    candidateStore = candidateStore,
+                    executor = executor,
+                    fallback = byteArrayAdapter,
+                    commitContext = commitContext
+                )
             }
 
-            val backupPath = backupOriginal(relativePath, original)
-            try {
-                writeFile(file, result.bytes)
-            } catch (t: Throwable) {
-                report.errors++
-                logger("ERROR writing optimized file, attempting restore: $relativePath: ${t.message}")
-                try { writeFile(file, original) } catch (_: Throwable) {}
-                return
-            }
-
-            val saved = original.size - result.bytes.size
-            report.optimized++
-            report.savedBytes += saved.toLong()
-            undoLines.append(relativePath)
-                .append(" | ").append(original.size)
-                .append(" | ").append(result.bytes.size)
-                .append(" | ").append(backupPath)
-                .append(" | ").append(result.note.replace('\n', ' '))
-                .append('\n')
-            logger("OPTIMIZED: $relativePath saved=$saved bytes. ${result.note}")
-        } catch (t: Throwable) {
-            report.errors++
-            logger("ERROR processing $relativePath: ${t.message ?: t.javaClass.name}")
-        }
-    }
-
-    private fun readFile(file: DocumentFile, maxAllowed: Long): ByteArray {
-        resolver.openInputStream(file.uri).use { input ->
-            if (input == null) throw IllegalStateException("Cannot open input stream")
-            val out = ByteArrayOutputStream()
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            var total = 0L
+            val files = TreeCursor(cancellation) { report.errors = checkedIncrement(report.errors) }
             while (true) {
-                val read = input.read(buffer)
-                if (read <= 0) break
-                total += read.toLong()
-                if (total > maxAllowed) throw IllegalStateException("File exceeded max read guard: $maxAllowed bytes")
-                out.write(buffer, 0, read)
+                cancellation.throwIfCancelled()
+                val file = files.next() ?: break
+                filesDiscovered = checkedIncrement(filesDiscovered)
+                report.scanned = checkedIncrement(report.scanned)
+                progress(if (runIntent.dryRun) "analyzing" else "optimizing", file.relativePath)
+                val outcome = process(
+                    file,
+                    streamingCoordinator,
+                    byteArrayAdapter,
+                    nativeDocumentOptimizer,
+                    cancellation
+                )
+                aggregate(report, outcome)
+                filesProcessed = checkedIncrement(filesProcessed)
+                progress(if (runIntent.dryRun) "analyzing" else "optimizing", file.relativePath)
             }
-            return out.toByteArray()
-        }
-    }
-
-    private fun writeFile(file: DocumentFile, bytes: ByteArray) {
-        resolver.openOutputStream(file.uri, "wt").use { output ->
-            if (output == null) throw IllegalStateException("Cannot open output stream")
-            output.write(bytes)
-            output.flush()
-        }
-    }
-
-    private fun backupOriginal(relativePath: String, bytes: ByteArray): String {
-        val parts = relativePath.split('/').filter { it.isNotBlank() }
-        if (parts.isEmpty()) throw IllegalStateException("Invalid relative path")
-        var current = backupRoot
-        for (dirName in parts.dropLast(1)) {
-            current = findOrCreateDirectory(current, dirName)
-        }
-        val fileName = parts.last()
-        val backupFile = current.createFile("application/octet-stream", fileName)
-            ?: throw IllegalStateException("Could not create backup file for $relativePath")
-        resolver.openOutputStream(backupFile.uri, "wt").use { output ->
-            if (output == null) throw IllegalStateException("Cannot write backup")
-            output.write(bytes)
-            output.flush()
-        }
-        return "FileForge_Backups_$stamp/$relativePath"
-    }
-
-    private fun findOrCreateDirectory(parent: DocumentFile, name: String): DocumentFile {
-        parent.findFile(name)?.let { if (it.isDirectory) return it }
-        return parent.createDirectory(name)
-            ?: throw IllegalStateException("Could not create backup subdirectory: $name")
-    }
-
-    private fun writeUndoLog() {
-        val undoFile = root.createFile("text/plain", "FileForge_Undo_$stamp.txt")
-        if (undoFile == null) {
-            logger("WARN could not create undo log in selected folder.")
-            return
-        }
-        resolver.openOutputStream(undoFile.uri, "wt").use { output ->
-            if (output == null) {
-                logger("WARN could not write undo log.")
-                return
+            report.status = if (report.errors == 0) RunStatus.COMPLETED else RunStatus.COMPLETED_WITH_ERRORS
+        } catch (_: OptimizationCancelledException) {
+            report.status = RunStatus.CANCELLED
+        } catch (rollback: EmergencyRollbackException) {
+            report.errors = saturatingIncrement(report.errors)
+            report.status = RunStatus.FAILED
+            val detail = rollback.rollbackFailure.message ?: rollback.rollbackFailure.javaClass.name
+            report.rollbackFailure = detail
+            report.terminalFailures = TerminalFailureDetails.append(
+                report.terminalFailures,
+                "Emergency rollback failed: $detail",
+                priority = true
+            )
+            report.terminalError = rollback.message ?: "CRITICAL: emergency rollback failed: $detail"
+        } catch (poisoned: UndoDurabilityException) {
+            undoPoisoned = true
+            report.errors = saturatingIncrement(report.errors)
+            report.status = RunStatus.FAILED
+            val rollbackFailure = (poisoned.rollback as? RollbackResult.Failed)?.cause
+            if (rollbackFailure == null) {
+                report.terminalError = poisoned.message ?: poisoned.javaClass.name
+            } else {
+                val detail = rollbackFailure.message ?: rollbackFailure.javaClass.name
+                report.rollbackFailure = detail
+                report.terminalFailures = TerminalFailureDetails.append(
+                    report.terminalFailures,
+                    "Emergency rollback failed: $detail",
+                    priority = true
+                )
+                report.terminalError = "CRITICAL: undo log durability failed and emergency rollback failed: $detail"
             }
-            output.write(undoLines.toString().toByteArray(Charsets.UTF_8))
-            output.flush()
+            poisoned.fatalPrimary?.let { vmFatal = it }
+        } catch (failure: Throwable) {
+            report.errors = saturatingIncrement(report.errors)
+            report.status = RunStatus.FAILED
+            report.terminalError = failure.message ?: failure.javaClass.name
+            if (failure.isVmFatal()) vmFatal = failure
+        } finally {
+            if (report.status == RunStatus.RUNNING) {
+                report.errors = saturatingIncrement(report.errors)
+                report.status = RunStatus.FAILED
+                report.terminalError = report.terminalError ?: "Run ended without a terminal status"
+            }
+            val session = undo
+            if (session != null) {
+                var terminalDurable = false
+                if (!undoPoisoned) try {
+                    undoRepository.appendTerminal(session.writer, report.toTerminal(session.entriesCommitted, completedAt()))
+                    terminalDurable = true
+                } catch (failure: Throwable) {
+                    val primaryFatal = vmFatal
+                    when {
+                        primaryFatal != null -> if (failure !== primaryFatal) primaryFatal.addSuppressed(failure)
+                        failure.isVmFatal() -> vmFatal = failure
+                        else -> recordFinalizationFailure(report, failure, mutateStatus = true)
+                    }
+                }
+                try {
+                    if (undoPoisoned) session.output.close() else session.writer.close()
+                } catch (failure: Throwable) {
+                    val primaryFatal = vmFatal
+                    when {
+                        primaryFatal != null -> if (failure !== primaryFatal) primaryFatal.addSuppressed(failure)
+                        failure.isVmFatal() -> vmFatal = failure
+                        else -> recordFinalizationFailure(report, failure, mutateStatus = !terminalDurable && !undoPoisoned)
+                    }
+                }
+            }
+            try {
+                progress(
+                    when (report.status) {
+                        RunStatus.COMPLETED -> "completed"
+                        RunStatus.COMPLETED_WITH_ERRORS -> "completed-with-errors"
+                        RunStatus.CANCELLED -> "cancelled"
+                        RunStatus.FAILED -> "failed"
+                        RunStatus.RUNNING -> "running"
+                    }
+                )
+            } catch (failure: Throwable) {
+                val primary = vmFatal
+                if (primary != null) {
+                    if (failure !== primary) primary.addSuppressed(failure)
+                } else throw failure
+            }
         }
+        vmFatal?.let { throw it }
+        return report
+    }
+
+    private fun process(
+        file: ScannedFile,
+        streamingCoordinator: OptimizationCoordinator,
+        byteArrayAdapter: ByteArrayOptimizerAdapter,
+        nativeDocumentOptimizer: NativeDocumentOptimizer?,
+        cancellation: CancellationToken
+    ): FileOutcome = try {
+        val kind = FileTypeDetector.detect(file.node.name, readHeader(file.node, cancellation))
+        when {
+            kind == FileKind.UNSUPPORTED -> FileOutcome.Skipped(file.relativePath, SkipReason.UNSUPPORTED)
+            kind == FileKind.APK && !runIntent.apkLabMode ->
+                FileOutcome.Skipped(file.relativePath, SkipReason.APK_GUARD)
+            kind == FileKind.ZIP_LIKE || kind == FileKind.APK ->
+                streamingCoordinator.process(file.node, file.relativePath, runIntent, cancellation)
+            nativeDocumentOptimizer != null ->
+                nativeDocumentOptimizer.process(file.node, file.relativePath, kind, runIntent, cancellation)
+            else -> byteArrayAdapter.process(file.node, file.relativePath, kind, runIntent, cancellation)
+        }
+    } catch (cancelled: OptimizationCancelledException) {
+        throw cancelled
+    } catch (poisoned: UndoDurabilityException) {
+        throw poisoned
+    } catch (invariant: RunInvariantException) {
+        throw invariant
+    } catch (failure: Exception) {
+        FileOutcome.Failed(file.relativePath, failure.message ?: failure.javaClass.name, failure)
+    }
+
+    private inner class TreeCursor(
+        private val cancellation: CancellationToken,
+        private val onListError: () -> Unit
+    ) {
+        private val frames = ArrayDeque<DirectoryFrame>()
+        private val directorySegments = ArrayDeque<String>()
+        private val visitedDirectories = hashSetOf(selectedRoot.id)
+        private var nodesSeen = 0
+
+        init {
+            frames.addLast(DirectoryFrame(children(selectedRoot)))
+        }
+
+        fun next(): ScannedFile? {
+            while (frames.isNotEmpty()) {
+                cancellation.throwIfCancelled()
+                val frame = frames.last()
+                if (!frame.children.hasNext()) {
+                    frames.removeLast()
+                    if (directorySegments.isNotEmpty()) directorySegments.removeLast()
+                    continue
+                }
+                val child = frame.children.next()
+                nodesSeen = checkedIncrement(nodesSeen)
+                if (nodesSeen > MAX_TRAVERSAL_NODES) {
+                    throw RunInvariantException("Selected tree exceeded the traversal node limit")
+                }
+                try {
+                    DocumentPathPolicy.requireSafeSegment(child.name)
+                } catch (_: IllegalArgumentException) {
+                    onListError()
+                    continue
+                }
+                if (child.isDirectory) {
+                    if (!visitedDirectories.add(child.id)) {
+                        onListError()
+                        continue
+                    }
+                    if (frames.size >= MAX_TRAVERSAL_DEPTH) {
+                        throw RunInvariantException("Selected tree exceeded the traversal depth limit")
+                    }
+                    val childIterator = children(child)
+                    directorySegments.addLast(child.name)
+                    frames.addLast(DirectoryFrame(childIterator))
+                } else {
+                    val relativePath = buildString {
+                        directorySegments.forEach { segment -> append(segment).append('/') }
+                        append(child.name)
+                    }
+                    return ScannedFile(child, relativePath)
+                }
+            }
+            return null
+        }
+
+        private fun children(directory: DocumentNode): Iterator<DocumentNode> {
+            cancellation.throwIfCancelled()
+            val listed = try {
+                documentGateway.listBounded(directory, MAX_DIRECTORY_CHILDREN)
+            } catch (invariant: RunInvariantException) {
+                throw invariant
+            } catch (_: Exception) {
+                onListError()
+                emptyList()
+            }
+            return listed.asSequence()
+                .filterNot { isManagedArtifact(it.name) }
+                .sortedWith(compareBy<DocumentNode>({ it.isDirectory }, { it.name }, { it.id }))
+                .iterator()
+        }
+    }
+
+    private fun readHeader(node: DocumentNode, cancellation: CancellationToken): ByteArray {
+        val header = ByteArray(HEADER_BYTES)
+        var offset = 0
+        documentGateway.openRead(node).use { input ->
+            while (offset < header.size) {
+                cancellation.throwIfCancelled()
+                val read = input.read(header, offset, header.size - offset)
+                if (read < 0) break
+                if (read > 0) offset += read
+            }
+        }
+        return header.copyOf(offset)
+    }
+
+    private fun aggregate(report: OptimizationReport, outcome: FileOutcome) {
+        when (outcome) {
+            is FileOutcome.WouldOptimize -> {
+                report.candidates = checkedIncrement(report.candidates)
+                report.bytesRead = checkedAdd(report.bytesRead, outcome.oldBytes)
+                report.bytesWritten = checkedAdd(report.bytesWritten, outcome.newBytes)
+                report.potentialSavingsBytes = checkedAdd(report.potentialSavingsBytes, outcome.potentialSavingsBytes)
+            }
+            is FileOutcome.Optimized -> {
+                report.candidates = checkedIncrement(report.candidates)
+                report.optimized = checkedIncrement(report.optimized)
+                report.bytesRead = checkedAdd(report.bytesRead, outcome.oldBytes)
+                report.bytesWritten = checkedAdd(report.bytesWritten, outcome.newBytes)
+                report.savedBytes = checkedAdd(report.savedBytes, outcome.savedBytes)
+            }
+            is FileOutcome.Skipped -> {
+                report.skipped = checkedIncrement(report.skipped)
+                val updated = LinkedHashMap(report.skipsByReason)
+                updated[outcome.reason] = checkedIncrement(updated[outcome.reason] ?: 0)
+                report.skipsByReason = updated
+            }
+            is FileOutcome.Failed -> {
+                report.errors = checkedIncrement(report.errors)
+                report.terminalFailures = TerminalFailureDetails.append(
+                    report.terminalFailures,
+                    "${outcome.relativePath}: ${outcome.note}"
+                )
+            }
+        }
+    }
+
+    private fun openUndoSession(): UndoSession {
+        val name = "FileForge_Undo_v2_$runId.jsonl"
+        val node = documentGateway.createFileExact(selectedRoot, "application/x-ndjson", name)
+        val output = documentGateway.openWrite(node)
+        val writer = OutputStreamWriter(output, Charsets.UTF_8)
+        return try {
+            undoRepository.start(
+                writer,
+                UndoHeader(
+                    runId = runId,
+                    startedAt = startedAt(),
+                    mode = runIntent.mode,
+                    apkLabMode = runIntent.apkLabMode,
+                    textMinify = runIntent.textMinify,
+                    dryRun = false,
+                    appVersion = appVersion,
+                    buildVariant = buildVariant
+                )
+            )
+            UndoSession(writer, output)
+        } catch (failure: Exception) {
+            try { writer.close() } catch (closeFailure: Exception) { failure.addSuppressed(closeFailure) }
+            throw failure
+        }
+    }
+
+    private fun OptimizationReport.toTerminal(entries: Int, timestamp: String) = UndoTerminalSummary(
+        status = status,
+        completedAt = timestamp,
+        entriesCommitted = entries,
+        scanned = scanned,
+        optimized = optimized,
+        skipped = skipped,
+        errors = errors,
+        savedBytes = savedBytes,
+        bytesRead = bytesRead,
+        bytesWritten = bytesWritten,
+        potentialSavingsBytes = potentialSavingsBytes
+    )
+
+    private fun isManagedArtifact(name: String): Boolean = MANAGED_PREFIXES.any { name.startsWith(it) }
+
+    private fun checkedIncrement(value: Int): Int = Math.addExact(value, 1)
+    private fun checkedAdd(left: Long, right: Long): Long = Math.addExact(left, right)
+
+    private fun recordFinalizationFailure(report: OptimizationReport, failure: Throwable, mutateStatus: Boolean) {
+        val message = failure.message ?: failure.javaClass.name
+        report.terminalFailures = TerminalFailureDetails.append(
+            report.terminalFailures,
+            message,
+            priority = true
+        )
+        if (mutateStatus) {
+            report.errors = saturatingIncrement(report.errors)
+            report.status = RunStatus.FAILED
+            report.terminalError = report.terminalError ?: message
+        }
+    }
+
+    private fun saturatingIncrement(value: Int): Int = if (value == Int.MAX_VALUE) value else value + 1
+
+    private data class ScannedFile(val node: DocumentNode, val relativePath: String)
+    private data class DirectoryFrame(val children: Iterator<DocumentNode>)
+    private data class UndoSession(val writer: Writer, val output: OutputStream, var entriesCommitted: Int = 0)
+
+    private class AndroidBridge(context: Context, root: DocumentFile) {
+        val gateway = SafDocumentGateway(context, root)
+        val runId: String = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) +
+            "_${UUID.randomUUID().toString().take(12)}"
+        val candidateStore = CandidateStore(context.cacheDir, runId)
+        val buildVariant: String = BuildConfig.FILEFORGE_VARIANT
+        val nativeToolExecutor: NativeToolExecutor? = NativeToolRuntime.executorOrNull(context)
+        val appVersion: String = try {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
+        } catch (_: Exception) {
+            "unknown"
+        }
+
+        fun timestamp(): String = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date())
+
+    }
+
+    private companion object {
+        const val HEADER_BYTES = 8 * 1024
+        const val MAX_TRAVERSAL_DEPTH = 16_384
+        const val MAX_TRAVERSAL_NODES = 100_000
+        const val MAX_DIRECTORY_CHILDREN = 100_000
+        val MANAGED_PREFIXES = listOf(
+            "FileForge_Backups_",
+            "FileForge_Undo_",
+            "FileForge_Restore_",
+            "FileForge_Candidate_",
+            "FileForge_Temp_"
+        )
     }
 }

@@ -1,0 +1,17 @@
+.gradle/
+.kotlin/
+app/build/
+local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+.env
+native/.sources/
+native/.build/
+native/.licenses/
+native/resolved-sources.json
+app/src/nativeArm64/jniLibs/arm64-v8a/libfileforge_*.so
+app/src/nativeArm64/assets/native-tools.json
+app/src/nativeArm64/assets/NOTICE.md
+app/src/nativeArm64/assets/licenses/

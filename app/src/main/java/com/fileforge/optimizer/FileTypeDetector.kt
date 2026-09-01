@@ -6,18 +6,15 @@ object FileTypeDetector {
     private val zipLikeExtensions = setOf("zip", "jar", "epub", "docx", "xlsx", "pptx")
     private val textExtensions = setOf("txt")
 
-    fun detect(name: String, bytes: ByteArray): FileKind {
+    fun detect(name: String, header: ByteArray): FileKind {
         val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
-        val magic = bytes.take(16).map { it.toInt() and 0xff }
 
-        val isZipMagic = magic.size >= 4 && magic[0] == 0x50 && magic[1] == 0x4b &&
-            (magic[2] == 0x03 || magic[2] == 0x05 || magic[2] == 0x07) &&
-            (magic[3] == 0x04 || magic[3] == 0x06 || magic[3] == 0x08)
-        val isPngMagic = magic.size >= 8 &&
-            magic[0] == 0x89 && magic[1] == 0x50 && magic[2] == 0x4e && magic[3] == 0x47 &&
-            magic[4] == 0x0d && magic[5] == 0x0a && magic[6] == 0x1a && magic[7] == 0x0a
-        val isJpegMagic = magic.size >= 3 && magic[0] == 0xff && magic[1] == 0xd8 && magic[2] == 0xff
-        val isPdfMagic = magic.size >= 5 && bytes.copyOfRange(0, 5).toString(Charsets.ISO_8859_1) == "%PDF-"
+        val isZipMagic = header.hasMagic(0x50, 0x4b, 0x03, 0x04) ||
+            header.hasMagic(0x50, 0x4b, 0x05, 0x06) ||
+            header.hasMagic(0x50, 0x4b, 0x07, 0x08)
+        val isPngMagic = header.hasMagic(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+        val isJpegMagic = header.hasMagic(0xff, 0xd8, 0xff)
+        val isPdfMagic = header.hasMagic(0x25, 0x50, 0x44, 0x46, 0x2d)
 
         return when {
             ext == "apk" && isZipMagic -> FileKind.APK
@@ -32,4 +29,9 @@ object FileTypeDetector {
             else -> FileKind.UNSUPPORTED
         }
     }
+
+    private fun ByteArray.hasMagic(vararg expected: Int): Boolean =
+        size >= expected.size && expected.indices.all { index -> this[index].unsigned() == expected[index] }
+
+    private fun Byte.unsigned(): Int = toInt() and 0xff
 }
