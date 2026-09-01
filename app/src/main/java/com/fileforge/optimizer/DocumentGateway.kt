@@ -32,26 +32,36 @@ interface DocumentGateway {
     fun createDirectoryExact(parent: DocumentNode, name: String): DocumentNode {
         if (resolve(parent, name) != null) throw DocumentAlreadyExistsException("Document already exists: $name")
         val created = createDirectory(parent, name)
-        if (created.name != name) {
-            throw DocumentAlreadyExistsException("Provider collision-renamed $name to ${created.name}")
-        }
-        check(created.isDirectory) { "Provider returned the wrong document type for $name" }
-        val resolved = resolve(parent, name)
-        check(resolved?.id == created.id && resolved.isDirectory) {
-            "Created document is not reachable by its exact requested name: $name"
+        try {
+            if (created.name != name) {
+                throw DocumentAlreadyExistsException("Provider collision-renamed $name to ${created.name}")
+            }
+            check(created.isDirectory) { "Provider returned the wrong document type for $name" }
+            val resolved = resolve(parent, name)
+            check(resolved?.id == created.id && resolved.isDirectory) {
+                "Created document is not reachable by its exact requested name: $name"
+            }
+        } catch (e: Exception) {
+            try { delete(created) } catch (de: Exception) { e.addSuppressed(de) }
+            throw e
         }
         return created
     }
     fun createFileExact(parent: DocumentNode, mimeType: String, name: String): DocumentNode {
         if (resolve(parent, name) != null) throw DocumentAlreadyExistsException("Document already exists: $name")
         val created = createFile(parent, mimeType, name)
-        if (created.name != name) {
-            throw DocumentAlreadyExistsException("Provider collision-renamed $name to ${created.name}")
-        }
-        check(!created.isDirectory) { "Provider returned the wrong document type for $name" }
-        val resolved = resolve(parent, name)
-        check(resolved?.id == created.id && !resolved.isDirectory) {
-            "Created document is not reachable by its exact requested name: $name"
+        try {
+            if (created.name != name) {
+                throw DocumentAlreadyExistsException("Provider collision-renamed $name to ${created.name}")
+            }
+            check(!created.isDirectory) { "Provider returned the wrong document type for $name" }
+            val resolved = resolve(parent, name)
+            check(resolved?.id == created.id && !resolved.isDirectory) {
+                "Created document is not reachable by its exact requested name: $name"
+            }
+        } catch (e: Exception) {
+            try { delete(created) } catch (de: Exception) { e.addSuppressed(de) }
+            throw e
         }
         return created
     }

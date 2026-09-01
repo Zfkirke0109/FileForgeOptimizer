@@ -12,7 +12,7 @@
     <string name="bottom_navigation_description">FileForge destinations</string>
     <string name="optimize_screen_description">Optimization settings and live progress</string>
     <string name="restore_placeholder_title">Restore</string>
-    <string name="restore_placeholder_body">Verified restore controls will be added in the next upgrade task. Optimization runs remain available from Optimize.</string>
+    <string name="restore_placeholder_body">Select a folder and choose files from a verified undo log to restore. Backups and undo logs are preserved after restore.</string>
     <string name="about_screen_description">About, appearance, build information, native tools, and manual updates</string>
     <string name="about_credit">Created by Zachary Kirke</string>
     <string name="about_version_name">Version name: %1$s</string>

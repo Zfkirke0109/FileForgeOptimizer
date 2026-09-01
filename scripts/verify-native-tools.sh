@@ -30,7 +30,7 @@ jq -e '.schemaVersion == 1 and .abi == "arm64-v8a" and (.tools | length == 5)' "
   exit 1
 }
 
-mapfile -t actual_files < <(find "$output_dir" -maxdepth 1 -type f -name '*.so' -printf '%f\n' | sort)
+mapfile -t actual_files < <(find "$output_dir" -maxdepth 1 -type f -name '*.so' -exec basename '{}' ';' | sort)
 mapfile -t expected_files < <(jq -r '.tools[].id | "libfileforge_" + . + ".so"' "$lock_file" | sort)
 [[ "${actual_files[*]}" == "${expected_files[*]}" ]] || {
   echo "native executable inventory mismatch" >&2

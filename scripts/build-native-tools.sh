@@ -103,5 +103,7 @@ mv "$manifest_tmp" "$asset_dir/native-tools.json"
 install -m 0644 "$repo_root/native/NOTICE.md" "$asset_dir/NOTICE.md"
 find "$license_root" -maxdepth 1 -type f -exec install -m 0644 '{}' "$asset_dir/licenses/" ';'
 
-READELF="$ndk_root/toolchains/llvm/prebuilt/$(uname -s | tr '[:upper:]' '[:lower:]')-x86_64/bin/llvm-readelf" \
+_ndk_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+_ndk_arch="$(uname -m)"
+READELF="$ndk_root/toolchains/llvm/prebuilt/${_ndk_os}-${_ndk_arch}/bin/llvm-readelf" \
   bash "$repo_root/scripts/verify-native-tools.sh"
