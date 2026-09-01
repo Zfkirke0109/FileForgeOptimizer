@@ -42,7 +42,11 @@ interface DocumentGateway {
                 "Created document is not reachable by its exact requested name: $name"
             }
         } catch (e: Exception) {
-            try { delete(created) } catch (de: Exception) { e.addSuppressed(de) }
+            try {
+                if (!delete(created)) {
+                    e.addSuppressed(IOException("Cleanup delete returned false for ${created.id}"))
+                }
+            } catch (de: Exception) { e.addSuppressed(de) }
             throw e
         }
         return created
@@ -60,7 +64,11 @@ interface DocumentGateway {
                 "Created document is not reachable by its exact requested name: $name"
             }
         } catch (e: Exception) {
-            try { delete(created) } catch (de: Exception) { e.addSuppressed(de) }
+            try {
+                if (!delete(created)) {
+                    e.addSuppressed(IOException("Cleanup delete returned false for ${created.id}"))
+                }
+            } catch (de: Exception) { e.addSuppressed(de) }
             throw e
         }
         return created

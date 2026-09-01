@@ -25,12 +25,8 @@ import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
-internal fun foregroundServiceTypeForSdk(sdkInt: Int): Int =
-    if (sdkInt >= 35) {
-        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
-    } else {
-        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-    }
+internal fun foregroundServiceType(): Int =
+    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
 
 class OptimizationBinder internal constructor(
     private val binding: OptimizationBinding
@@ -122,7 +118,7 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
             this,
             OptimizationNotification.NOTIFICATION_ID,
             OptimizationNotification.buildAndroidNotification(this, initialState),
-            foregroundServiceTypeForSdk(Build.VERSION.SDK_INT)
+            foregroundServiceType()
         )
         foregroundNotificationActive = true
     }
