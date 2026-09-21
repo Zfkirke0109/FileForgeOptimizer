@@ -8,7 +8,6 @@ build_root="${FILEFORGE_NATIVE_BUILD_ROOT:-$repo_root/native/.build}"
 output_dir="$repo_root/app/src/nativeArm64/jniLibs/arm64-v8a"
 asset_dir="$repo_root/app/src/nativeArm64/assets"
 license_root="$repo_root/native/.licenses"
-resolved_file="$repo_root/native/resolved-sources.json"
 ndk_root="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
 
 [[ -n "$ndk_root" && -f "$ndk_root/build/cmake/android.toolchain.cmake" ]] || {
@@ -41,6 +40,8 @@ find "$output_dir" -maxdepth 1 -type f -name '*.so' -delete
 find "$asset_dir/licenses" -maxdepth 1 -type f -delete
 
 toolchain="$ndk_root/build/cmake/android.toolchain.cmake"
+# The commas below are -Wl linker-flag syntax, not array separators.
+# shellcheck disable=SC2054
 common_cmake=(
   -G Ninja
   -DCMAKE_TOOLCHAIN_FILE="$toolchain"

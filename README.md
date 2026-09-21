@@ -90,6 +90,8 @@ bash scripts/verify-native-tools.sh
 gradle :app:testNativeArm64DebugUnitTest :app:lintNativeArm64Debug :app:assembleNativeArm64Release
 ```
 
+Shell scripts and YAML are linted by the `Lint shell and YAML` workflow, which pins ShellCheck 0.11.0 (checksum-verified) and yamllint 1.38.0. Run the same checks locally with `shellcheck scripts/*.sh` and `yamllint --strict --config-file .yamllint .github .yamllint`, or through `bats scripts/tests/workflow-contracts.bats`, which skips them when the linters are absent.
+
 Launcher icons are generated from `art/fileforge-icon-source.jpg`. Re-run `python3 tools/generate_launcher_icons.py` (needs Pillow) after changing that artwork.
 
 See [Native tools](docs/native-tools.md) for the pinned source and license model and [Releasing](docs/releasing.md) for the signed-artifact procedure.

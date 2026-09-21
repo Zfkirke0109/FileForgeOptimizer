@@ -40,7 +40,7 @@ verify_checkout() {
   expected="$(jq -r '.expectedCommit' <<<"$record")"
   checkout="$source_root/$id"
   [[ -d "$checkout/.git" ]] || { echo "verified source checkout missing: $id" >&2; return 1; }
-  actual="$(git -C "$checkout" rev-parse HEAD^{commit})"
+  actual="$(git -C "$checkout" rev-parse 'HEAD^{commit}')"
   [[ "$actual" == "$expected" ]] || {
     echo "resolved commit mismatch for $id: expected $expected, found $actual" >&2
     return 1
@@ -84,7 +84,7 @@ for record in "${records[@]}"; do
     exit 1
   }
   git -C "$checkout" fetch --depth 1 --force origin "$ref"
-  actual="$(git -C "$checkout" rev-parse FETCH_HEAD^{commit})"
+  actual="$(git -C "$checkout" rev-parse 'FETCH_HEAD^{commit}')"
   [[ "$actual" == "$expected" ]] || {
     echo "source ref moved for $id: expected $expected, resolved $actual" >&2
     exit 1
