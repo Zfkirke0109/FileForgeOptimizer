@@ -58,9 +58,20 @@ APK Lab recompression can invalidate an APK signature and make the result non-in
 
 ## Foreground operation and appearance
 
-Optimization and restore run in a single foreground service with a cancel action and durable terminal state. Android still requires a foreground-service notification when notification permission is denied, although detailed drawer updates may be hidden. If Android invokes its media-processing service time limit, FileForge cancels cooperatively, finalizes the run safely, and reports that the time limit was reached. Individual native processes also fail over after 10 minutes for qpdf, jpegtran, and zipalign, or 30 minutes for oxipng and zopflipng.
+Optimization and restore run in a single foreground service with a cancel action and durable terminal state. Android still requires a foreground-service notification when notification permission is denied, although detailed drawer updates may be hidden. The service runs as `dataSync`, the type declared in the manifest and passed to `startForeground`. If Android invokes its data-sync service time limit, FileForge cancels cooperatively, finalizes the run safely, and reports that the time limit was reached. Individual native processes also fail over after 10 minutes for qpdf, jpegtran, and zipalign, or 30 minutes for oxipng and zopflipng.
 
 The About screen offers System, Light, Dark, and AMOLED themes. Update checks occur only when the user requests one; the app validates the GitHub release response, selects the APK matching the installed variant, and opens the release page in the browser. It never downloads or installs an update itself.
+
+## Install and first run
+
+1. Build or download `FileForgeOptimizer-standard.apk`, or `FileForgeOptimizer-native-arm64.apk` on an arm64 device.
+2. Install it. Sideloading needs "Install unknown apps" enabled for whichever app opens the APK.
+3. Allow notifications when prompted. Android requires a foreground-service notification for a long run; denying the prompt only hides the progress details, it does not stop the run.
+4. Open **Optimize**, tap **Choose folder**, and grant a folder with the system picker. FileForge can reach only that folder and its descendants.
+5. Pick **Safe** or **Aggressive** under Optimization mode, then turn **Dry run** on for the first pass. A dry run measures exact potential savings and writes nothing into the selected folder.
+6. Turn **Dry run** off and tap **Start** to apply the savings. Every replaced file is backed up to `FileForge_Backups_<run-id>/` and journalled in `FileForge_Undo_v2_<run-id>.jsonl` in the same folder, so the **Restore** tab can put the originals back.
+
+Leave **APK Lab Mode** off unless you intend to re-sign the result yourself.
 
 ## Build and verification
 
@@ -78,6 +89,8 @@ bash scripts/build-native-tools.sh
 bash scripts/verify-native-tools.sh
 gradle :app:testNativeArm64DebugUnitTest :app:lintNativeArm64Debug :app:assembleNativeArm64Release
 ```
+
+Launcher icons are generated from `art/fileforge-icon-source.jpg`. Re-run `python3 tools/generate_launcher_icons.py` (needs Pillow) after changing that artwork.
 
 See [Native tools](docs/native-tools.md) for the pinned source and license model and [Releasing](docs/releasing.md) for the signed-artifact procedure.
 

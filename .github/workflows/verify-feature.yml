@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - 'agent/**'
+      - 'claude/**'
 
 permissions:
   contents: read

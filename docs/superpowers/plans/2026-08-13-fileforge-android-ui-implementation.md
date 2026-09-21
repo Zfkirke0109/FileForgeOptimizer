@@ -12,7 +12,7 @@
 
 - Depends on the completed FileForge core implementation plan.
 - Keep `applicationId 'com.fileforge.optimizer'`, `minSdk 26`, `targetSdk 35`, and Java/Kotlin 17.
-- Foreground work starts only from a visible user action and uses `mediaProcessing` where available.
+- Foreground work starts only from a visible user action and uses the `dataSync` service type.
 - Request `POST_NOTIFICATIONS` only in context on Android 13+; denial must not crash the run.
 - Do not add root, broad storage, background polling, analytics, embedded GitHub tokens, silent downloads, or APK-install permissions.
 - Theme choices are exactly System, Light, Dark, and AMOLED and persist across restarts.
@@ -173,7 +173,7 @@ Call `startForegroundService` from the activity, call `startForeground` immediat
 
 - [ ] **Step 4: Implement Android 15 timeout and manifest rules**
 
-Declare `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC`, `FOREGROUND_SERVICE_MEDIA_PROCESSING`, and `POST_NOTIFICATIONS`. Declare the non-exported service with `android:foregroundServiceType="dataSync|mediaProcessing"`; request `dataSync` before API 35 and `mediaProcessing` on API 35+. Override API-35 timeout handling to cancel, publish an actionable failure/cancel summary, and stop promptly.
+Declare `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC`, and `POST_NOTIFICATIONS`. Declare the non-exported service with `android:foregroundServiceType="dataSync"` and request `dataSync` on every API level. `mediaProcessing` cannot be used here: `androidx.core.app.ServiceCompat` masks it away because its allow-list stops at the API 34 types, and the resulting type-none start is rejected from Android 14 on. Override API-35 timeout handling to cancel, publish an actionable failure/cancel summary, and stop promptly.
 
 - [ ] **Step 5: Compile instrumentation tests and commit**
 

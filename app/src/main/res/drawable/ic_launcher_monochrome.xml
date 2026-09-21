@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed-icon layer: the anvil alone, inside the 66dp adaptive safe zone. The
+     forge scene cannot survive a single-colour tint, so it is redrawn as a flat
+     silhouette. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M24,46 L38,39 L84,39 L84,49 L66,49 L63,57 L61,65 L73,67 L75,77 L33,77 L35,67 L47,65 L45,57 L42,49 L38,49 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,21 L56.5,26.5 L62,29 L56.5,31.5 L54,37 L51.5,31.5 L46,29 L51.5,26.5 Z" />
+</vector>

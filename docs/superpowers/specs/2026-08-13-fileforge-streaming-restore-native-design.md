@@ -47,7 +47,7 @@ Views use Material Components rather than introducing a Compose migration in the
 The service:
 
 - enters the foreground immediately with a low-importance notification channel;
-- uses the `mediaProcessing` foreground-service type on API 35+ and the compatible `dataSync` type on older supported Android versions;
+- uses the `dataSync` foreground-service type on every supported Android version, declared in the manifest and passed to `startForeground`;
 - exposes immutable progress snapshots through a local binder;
 - updates the notification at a throttled cadence rather than once per buffer;
 - provides a Cancel notification action;

@@ -123,7 +123,7 @@ object OptimizationNotification {
     fun buildAndroidNotification(context: Context, state: RunState): Notification {
         val spec = render(state)
         val builder = NotificationCompat.Builder(context, spec.channelId)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setSmallIcon(R.drawable.ic_notification_forge)
             .setContentTitle(spec.title)
             .setContentText(spec.text)
             .setOnlyAlertOnce(true)
