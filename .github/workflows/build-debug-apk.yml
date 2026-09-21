@@ -33,6 +33,11 @@ jobs:
           java-version: '17'
 
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407  # v3
+        with:
+          # The action's default package list still asks for the obsolete `tools`
+          # package, which Google removed from the SDK repository; sdkmanager then
+          # exits 1 and fails the job before any build step runs.
+          packages: platform-tools
 
       - name: Install pinned Android toolchain
         shell: bash
