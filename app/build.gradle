@@ -13,6 +13,9 @@ android {
 
     testOptions {
         unitTests.returnDefaultValues = true
+        // Run each instrumented test in its own process. A test that crashes the
+        // app otherwise ends the whole run and silently drops every test after it.
+        execution 'ANDROIDX_TEST_ORCHESTRATOR'
     }
 
     defaultConfig {
@@ -84,4 +87,6 @@ dependencies {
     testImplementation 'org.json:json:20240303'
     androidTestImplementation 'androidx.test.ext:junit:1.2.1'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.6.1'
+    androidTestUtil 'androidx.test:orchestrator:1.6.1'
+    androidTestUtil 'androidx.test.services:test-services:1.6.0'
 }
