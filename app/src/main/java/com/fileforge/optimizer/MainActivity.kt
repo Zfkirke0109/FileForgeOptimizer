@@ -106,8 +106,18 @@ class MainActivity : AppCompatActivity() {
             cancelRun = serviceSession::cancel
         )
         aboutController = AboutScreenController(this)
-        buildMaterialHost()
+        buildMaterialHost(restoredDestination(savedInstanceState))
     }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putInt(STATE_DESTINATION, currentDestination)
+    }
+
+    /** The saved tab, or Optimize on a fresh start or for an id this build does not know. */
+    private fun restoredDestination(savedInstanceState: Bundle?): Int =
+        savedInstanceState?.getInt(STATE_DESTINATION)?.takeIf { it in DESTINATIONS }
+            ?: R.id.navigation_optimize
 
     override fun onStart() {
         super.onStart()
@@ -136,7 +146,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    private fun buildMaterialHost() {
+    private fun buildMaterialHost(initialDestination: Int) {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         toolbar = MaterialToolbar(this).apply {
             id = R.id.toolbar
@@ -178,7 +188,7 @@ class MainActivity : AppCompatActivity() {
         )
         setContentView(root)
         applySystemBarInsets(root)
-        bottomNavigation.selectedItemId = R.id.navigation_optimize
+        bottomNavigation.selectedItemId = initialDestination
     }
 
     private fun showDestination(itemId: Int) {
@@ -241,4 +251,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private companion object {
+        const val STATE_DESTINATION = "com.fileforge.optimizer.state.DESTINATION"
+        val DESTINATIONS = setOf(
+            R.id.navigation_optimize,
+            R.id.navigation_restore,
+            R.id.navigation_about
+        )
+    }
 }

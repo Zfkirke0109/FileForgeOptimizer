@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar icon for the optimization foreground service. Android draws small icons as a flat
+     silhouette and applies its own tint, so this is the themed launcher anvil refitted to 24dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M1.0,10.9 L6.13,8.33 L23.0,8.33 L23.0,12.0 L16.4,12.0 L15.3,14.93 L14.57,17.87 L18.97,18.6 L19.7,22.27 L4.3,22.27 L5.03,18.6 L9.43,17.87 L8.7,14.93 L7.6,12.0 L6.13,12.0 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12.0,1.73 L12.92,3.75 L14.93,4.67 L12.92,5.58 L12.0,7.6 L11.08,5.58 L9.07,4.67 L11.08,3.75 Z" />
+</vector>

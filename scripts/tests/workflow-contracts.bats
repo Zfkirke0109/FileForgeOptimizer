@@ -5,6 +5,8 @@ setup() {
   export BUILD_WORKFLOW="$REPO_ROOT/.github/workflows/build-debug-apk.yml"
   export FEATURE_WORKFLOW="$REPO_ROOT/.github/workflows/verify-feature.yml"
   export SECRET_WORKFLOW="$REPO_ROOT/.github/workflows/secret-scan.yml"
+  export LINT_WORKFLOW="$REPO_ROOT/.github/workflows/lint-sources.yml"
+  export INSTRUMENTED_WORKFLOW="$REPO_ROOT/.github/workflows/instrumented-tests.yml"
 }
 
 @test "release workflow pins toolchains and verifies both flavors" {
@@ -41,7 +43,8 @@ setup() {
 }
 
 @test "workflow actions are pinned to immutable commits" {
-  for workflow in "$BUILD_WORKFLOW" "$FEATURE_WORKFLOW" "$SECRET_WORKFLOW"; do
+  for workflow in "$BUILD_WORKFLOW" "$FEATURE_WORKFLOW" "$SECRET_WORKFLOW" "$LINT_WORKFLOW" \
+    "$INSTRUMENTED_WORKFLOW"; do
     while IFS= read -r action; do
       [[ "$action" =~ @[0-9a-f]{40}([[:space:]]*#.*)?$ ]]
     done < <(grep -E '^[[:space:]]*-?[[:space:]]*uses:' "$workflow")
@@ -64,6 +67,50 @@ setup() {
   grep -Fq 'gitleaks_8.30.1_linux_x64.tar.gz' "$SECRET_WORKFLOW"
   grep -Fq '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' "$SECRET_WORKFLOW"
   grep -Fq 'gitleaks git --redact --no-banner --report-format sarif' "$SECRET_WORKFLOW"
+}
+
+@test "lint workflow pins both linters and checks shell and YAML sources" {
+  [ -f "$LINT_WORKFLOW" ]
+  grep -Fq 'yamllint==1.38.0' "$LINT_WORKFLOW"
+  grep -Fq 'shellcheck-v0.11.0.linux.x86_64.tar.xz' "$LINT_WORKFLOW"
+  grep -Fq '8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198' "$LINT_WORKFLOW"
+  grep -Fq 'sha256sum --check --strict' "$LINT_WORKFLOW"
+  grep -Fq 'yamllint --strict --config-file .yamllint' "$LINT_WORKFLOW"
+  grep -Fq 'shellcheck scripts/*.sh' "$LINT_WORKFLOW"
+}
+
+@test "shell scripts and YAML are clean under the pinned linters" {
+  command -v shellcheck >/dev/null || skip "shellcheck is not installed"
+  command -v yamllint >/dev/null || skip "yamllint is not installed"
+  run shellcheck "$REPO_ROOT"/scripts/*.sh
+  [ "$status" -eq 0 ]
+  run yamllint --strict --config-file "$REPO_ROOT/.yamllint" \
+    "$REPO_ROOT/.github" "$REPO_ROOT/.yamllint"
+  [ "$status" -eq 0 ]
+}
+
+@test "instrumented workflow runs the on-device suites on an Android 15 emulator" {
+  [ -f "$INSTRUMENTED_WORKFLOW" ]
+  grep -Fq 'system-images;android-35;google_apis;x86_64' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq '99-kvm4all.rules' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'sys.boot_completed' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq ':app:connectedStandardDebugAndroidTest' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'packages: platform-tools' "$INSTRUMENTED_WORKFLOW"
+}
+
+@test "instrumented workflow fails fast instead of hanging on a dead emulator" {
+  # The first run hung 43 minutes: the emulator could not find the AVD
+  # avdmanager wrote, died at once, and `adb wait-for-device` never returned.
+  grep -Fq 'export ANDROID_AVD_HOME=' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'emulator -list-avds' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'kill -0 "$emulator_pid"' "$INSTRUMENTED_WORKFLOW"
+  run grep -E '^[[:space:]]*adb wait-for-device[[:space:]]*$' "$INSTRUMENTED_WORKFLOW"
+  [ "$status" -ne 0 ]
+}
+
+@test "instrumented suites declare the AndroidJUnit4 runner they are written for" {
+  grep -Fq "testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'" \
+    "$REPO_ROOT/app/build.gradle"
 }
 
 @test "repository release metadata exists" {

@@ -12,9 +12,9 @@ import androidx.test.espresso.matcher.ViewMatchers.isClickable
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
 import androidx.test.espresso.matcher.ViewMatchers.isEnabled
 import androidx.test.espresso.matcher.ViewMatchers.withId
+import androidx.test.espresso.matcher.ViewMatchers.withContentDescription
 import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import org.hamcrest.Matchers.allOf
 import org.hamcrest.Matchers.not
 import org.junit.Assert.assertEquals
 import org.junit.After
@@ -61,7 +61,7 @@ class OptimizeScreenTest {
             }
 
             onView(withId(R.id.navigation_restore)).perform(click())
-            onView(allOf(withId(R.id.placeholder_title), withText("Restore")))
+            onView(withContentDescription(R.string.restore_screen_description))
                 .check(matches(isDisplayed()))
             onView(withId(R.id.navigation_about)).perform(click())
             onView(withText("Created by Zachary Kirke"))

@@ -2,6 +2,7 @@ package com.fileforge.optimizer
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Notification
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
@@ -13,7 +14,6 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
-import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import java.io.InputStreamReader
@@ -25,8 +25,31 @@ import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+/**
+ * The foreground service type FileForge runs under. It must stay equal to the
+ * `android:foregroundServiceType` declared for [OptimizationService] in the manifest, and it must
+ * stay inside the allow-list that `androidx.core.app.ServiceCompat` masks requested types against.
+ *
+ * `ServiceCompat.startForeground` silently reduces any type outside that allow-list to
+ * [ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE]. The allow-list has never been extended past the types
+ * that existed in API 34, so `FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING` (added in API 35) masked to
+ * zero and Android rejected the start with "Starting FGS with type none ... has been prohibited".
+ * [OptimizationService] therefore calls [Service.startForeground] directly, and data sync is the
+ * accurate type for bulk file rewriting anyway.
+ */
+@SuppressLint("InlinedApi")
 internal fun foregroundServiceType(): Int =
     ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+
+/** Raised when Android refuses the foreground start, keeping the framework reason attached. */
+class ForegroundServiceStartException(
+    requestedType: Int,
+    cause: Throwable
+) : IllegalStateException(
+    "Android refused to start the FileForge foreground service with type 0x" +
+        requestedType.toString(16) + ": " + (cause.message ?: cause.javaClass.name),
+    cause
+)
 
 class OptimizationBinder internal constructor(
     private val binding: OptimizationBinding
@@ -114,13 +137,23 @@ class OptimizationService : Service(), OptimizationServiceRuntime {
         // Android still requires an FGS notification when POST_NOTIFICATIONS is denied.
         detailedNotificationUpdatesAllowed = detailedNotificationsAllowed
         notificationThrottle.shouldDeliver(initialState)
-        ServiceCompat.startForeground(
-            this,
-            OptimizationNotification.NOTIFICATION_ID,
-            OptimizationNotification.buildAndroidNotification(this, initialState),
-            foregroundServiceType()
+        startForegroundNotification(
+            OptimizationNotification.buildAndroidNotification(this, initialState)
         )
         foregroundNotificationActive = true
+    }
+
+    private fun startForegroundNotification(notification: Notification) {
+        val type = foregroundServiceType()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(OptimizationNotification.NOTIFICATION_ID, notification, type)
+            } else {
+                startForeground(OptimizationNotification.NOTIFICATION_ID, notification)
+            }
+        } catch (failure: Exception) {
+            throw ForegroundServiceStartException(type, failure)
+        }
     }
 
     override fun execute(task: () -> Unit) {

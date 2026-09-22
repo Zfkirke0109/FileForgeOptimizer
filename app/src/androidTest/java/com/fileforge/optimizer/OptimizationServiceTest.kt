@@ -38,9 +38,14 @@ class OptimizationServiceTest {
         assertTrue("removeListener" in methods)
     }
 
+    /**
+     * The installed package, not just the source manifest, has to back the type passed to
+     * `startForeground`. When it does not, Android 14 and newer abort the start with
+     * "Starting FGS with type none ... has been prohibited" and every run fails immediately.
+     */
     @Test
-    @SdkSuppress(minSdkVersion = 35)
-    fun manifestDeclaresNonExportedMediaProcessingServiceAndRequiredPermissions() {
+    @SdkSuppress(minSdkVersion = 34)
+    fun installedPackageBacksTheForegroundServiceTypeItStartsWith() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val packageInfo = context.packageManager.getPackageInfo(
             context.packageName,
@@ -50,20 +55,16 @@ class OptimizationServiceTest {
 
         assertTrue(Manifest.permission.FOREGROUND_SERVICE in requestedPermissions)
         assertTrue(Manifest.permission.FOREGROUND_SERVICE_DATA_SYNC in requestedPermissions)
-        assertTrue(Manifest.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING in requestedPermissions)
         assertTrue(Manifest.permission.POST_NOTIFICATIONS in requestedPermissions)
         val serviceInfo = context.packageManager.getServiceInfo(
             ComponentName(context, OptimizationService::class.java),
             PackageManager.GET_META_DATA
         )
         assertFalse(serviceInfo.exported)
-        assertTrue(
-            serviceInfo.foregroundServiceType and
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING != 0
-        )
-        assertTrue(
-            serviceInfo.foregroundServiceType and
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC != 0
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC, foregroundServiceType())
+        assertEquals(
+            foregroundServiceType(),
+            serviceInfo.foregroundServiceType and foregroundServiceType()
         )
     }
 

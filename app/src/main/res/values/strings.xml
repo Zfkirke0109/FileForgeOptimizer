@@ -72,7 +72,6 @@
     <string name="live_counters_value">Processed %1$d of %2$d • Candidates %3$d • Optimized %4$d • Errors %5$d</string>
     <string name="potential_savings_value">Potential savings: %1$s</string>
     <string name="saved_value">Saved: %1$s</string>
-    <string name="bytes_value">%1$d B</string>
     <string name="terminal_status_value">Terminal status: %1$s</string>
     <string name="notification_permission_denied">Notifications are off, so background progress may be less visible. The run will continue safely.</string>
     <string name="start_failed">Could not start optimization: %1$s</string>

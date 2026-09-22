@@ -206,7 +206,7 @@ class RestoreScreenController(
         terminalDetails.removeAllViews()
         restoreTerminalDetails().forEach { detail ->
             terminalDetails.addView(TextView(activity).apply {
-                text = detail
+                text = boundedForDisplay(detail)
                 setTextIsSelectable(true)
                 setPadding(0, dp(8), 0, 0)
             })
@@ -226,7 +226,11 @@ class RestoreScreenController(
         discoveryResult.runs.forEach { discovered -> cards.addView(runCard(discovered), spacedLayout()) }
         discoveryResult.failures.forEach { failure ->
             cards.addView(TextView(activity).apply {
-                text = activity.getString(R.string.restore_parse_failure, failure.undoLogId, failure.message)
+                text = activity.getString(
+                    R.string.restore_parse_failure,
+                    boundedForDisplay(failure.undoLogId),
+                    boundedForDisplay(failure.message)
+                )
                 setPadding(0, dp(8), 0, 0)
             })
         }
@@ -244,7 +248,7 @@ class RestoreScreenController(
             addView(LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(16), dp(16), dp(16), dp(16))
-                addView(TextView(activity).apply { text = card.runId; textSize = 18f })
+                addView(TextView(activity).apply { text = boundedForDisplay(card.runId); textSize = 18f })
                 addView(TextView(activity).apply { text = activity.getString(R.string.restore_run_details, card.runDate, card.status.name, card.entryCount, formatBytes(card.recoverableBytes)) })
                 addView(TextView(activity).apply { text = card.verificationLabel })
                 addView(MaterialButton(activity).apply {
@@ -258,7 +262,7 @@ class RestoreScreenController(
                     addView(CheckBox(activity).apply {
                         id = View.generateViewId()
                         isSaveEnabled = false
-                        text = entry.relativePath
+                        text = boundedForDisplay(entry.relativePath)
                         contentDescription = activity.getString(R.string.restore_select_entry, entry.relativePath)
                         isEnabled = sourceEntry.isRestoreEligible
                         isChecked = selectedUndoLogId == card.undoLogId &&
@@ -270,7 +274,7 @@ class RestoreScreenController(
                             R.string.restore_entry_details,
                             formatBytes(entry.originalBytes),
                             formatBytes(entry.optimizedBytes),
-                            entry.backupPath
+                            boundedForDisplay(entry.backupPath)
                         )
                         setPadding(dp(32), 0, 0, dp(8))
                     })
@@ -422,7 +426,7 @@ class RestoreScreenController(
     private fun showRestoreStartFailure(failure: Throwable) {
         Snackbar.make(
             view,
-            failure.message ?: "Restore could not be started",
+            boundedForDisplay(failure.message ?: "Restore could not be started"),
             Snackbar.LENGTH_LONG
         ).show()
     }
@@ -455,7 +459,7 @@ class RestoreScreenController(
             R.string.restore_progress_value,
             snapshot.filesProcessed,
             snapshot.filesDiscovered,
-            snapshot.currentRelativePath ?: snapshot.phase
+            boundedForDisplay(snapshot.currentRelativePath ?: snapshot.phase)
         )
     }
 
@@ -476,7 +480,7 @@ class RestoreScreenController(
     private fun readSelectedTreeUri(): String? = preferences.getString(KEY_TREE_URI, null)
         ?: activity.getPreferences(Context.MODE_PRIVATE).getString(LEGACY_KEY_TREE_URI, null)
 
-    private fun formatBytes(bytes: Long): String = "$bytes B"
+    private fun formatBytes(bytes: Long): String = formatByteSize(bytes)
     private fun dp(value: Int): Int = (value * activity.resources.displayMetrics.density).toInt()
     private fun spacedLayout() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) }
     private fun weightedLayout(startMargin: Int = 0, endMargin: Int = 0) = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = startMargin; marginEnd = endMargin }

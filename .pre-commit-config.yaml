@@ -1,0 +1,37 @@
+# pre-commit.ci runs these hooks on every pull request, and `pre-commit install`
+# runs them locally before each commit. yamllint and ShellCheck match the
+# versions the Lint shell and YAML workflow pins, and every hook repository is
+# frozen to an immutable commit like the workflow actions are.
+ci:
+  # Report problems; never push fix commits onto contributors' branches.
+  autofix_prs: false
+  # Version-bump PRs, kept rare. Bump lint-sources.yml to match when one lands.
+  autoupdate_schedule: quarterly
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # frozen: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-added-large-files
+      - id: check-shebang-scripts-are-executable
+      - id: check-executables-have-shebangs
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: cba56bcde1fdd01c1deb3f945e69764c291a6530  # frozen: v1.38.0
+    hooks:
+      - id: yamllint
+        args: [--strict, --config-file, .yamllint]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: 745eface02aef23e168a8afb6b5737818efbea95  # frozen: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        # Same scope as the Lint shell and YAML workflow. The Bats suites grep
+        # for literal `$VAR` text on purpose, which ShellCheck reads as a slip.
+        files: ^scripts/[^/]+\.sh$

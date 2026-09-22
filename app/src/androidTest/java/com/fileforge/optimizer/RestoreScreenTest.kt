@@ -157,8 +157,13 @@ class RestoreScreenTest {
 
             scenario.recreate()
 
+            // The Restore screen rescans and clears the selection whenever it reappears, so a
+            // restore is only ever confirmed against freshly verified undo logs. Nothing
+            // survives recreation, least of all onto a different entry.
+            onView(withContentDescription("Select photos/holiday.jpg")).check(matches(not(isChecked())))
             onView(withContentDescription("Select docs/report.txt"))
                 .check(matches(not(isChecked()))).check(matches(not(isEnabled())))
+            onView(withContentDescription("Select photos/holiday.jpg")).perform(click())
             onView(withId(R.id.restore_selected)).perform(click())
             onView(withText("Restore 1 file?")).check(matches(isDisplayed()))
         }
@@ -268,8 +273,8 @@ class RestoreScreenTest {
         )
         ActivityScenario.launch(MainActivity::class.java).use {
             onView(withId(R.id.navigation_restore)).perform(click())
-            onView(withContentDescription("Select all from second")).perform(click())
-            onView(withId(R.id.restore_selected)).perform(click())
+            onView(withContentDescription("Select all from second")).perform(scrollTo(), click())
+            onView(withId(R.id.restore_selected)).perform(scrollTo(), click())
             onView(withText("Restore 2 files?")).check(matches(isDisplayed()))
             onView(withId(android.R.id.button1)).perform(click())
 
@@ -322,8 +327,8 @@ class RestoreScreenTest {
         )
         ActivityScenario.launch(MainActivity::class.java).use {
             onView(withId(R.id.navigation_restore)).perform(click())
-            onView(withContentDescription("Select $hugePath")).perform(click())
-            onView(withId(R.id.restore_selected)).perform(click())
+            onView(withContentDescription("Select $hugePath")).perform(scrollTo(), click())
+            onView(withId(R.id.restore_selected)).perform(scrollTo(), click())
             onView(withId(android.R.id.button1)).perform(click())
 
             onView(withText(containsString("too large"))).check(matches(isDisplayed()))
