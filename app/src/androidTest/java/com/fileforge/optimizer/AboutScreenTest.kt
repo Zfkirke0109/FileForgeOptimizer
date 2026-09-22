@@ -132,7 +132,7 @@ class AboutScreenTest {
                 scenario.recreate()
                 onView(withId(R.id.navigation_about)).perform(click())
                 onView(withText(label)).perform(scrollTo()).check(matches(isChecked()))
-                onView(withText("Optimize")).perform(click())
+                onView(withId(R.id.navigation_optimize)).perform(click())
                 onView(withId(R.id.navigation_about)).perform(click())
                 onView(withText(label)).perform(scrollTo()).check(matches(isChecked()))
             }
