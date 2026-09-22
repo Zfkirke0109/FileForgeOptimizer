@@ -476,7 +476,7 @@ class RestoreScreenController(
     private fun readSelectedTreeUri(): String? = preferences.getString(KEY_TREE_URI, null)
         ?: activity.getPreferences(Context.MODE_PRIVATE).getString(LEGACY_KEY_TREE_URI, null)
 
-    private fun formatBytes(bytes: Long): String = "$bytes B"
+    private fun formatBytes(bytes: Long): String = formatByteSize(bytes)
     private fun dp(value: Int): Int = (value * activity.resources.displayMetrics.density).toInt()
     private fun spacedLayout() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) }
     private fun weightedLayout(startMargin: Int = 0, endMargin: Int = 0) = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = startMargin; marginEnd = endMargin }

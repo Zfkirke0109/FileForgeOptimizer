@@ -237,7 +237,7 @@ object OptimizationNotification {
         return PendingIntent.getService(context, CANCEL_REQUEST_CODE, intent, flags)
     }
 
-    private fun formatBytes(bytes: Long): String = "$bytes B"
+    private fun formatBytes(bytes: Long): String = formatByteSize(bytes)
 
     private const val CANCEL_REQUEST_CODE = 1002
 }

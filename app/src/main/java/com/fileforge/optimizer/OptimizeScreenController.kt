@@ -729,7 +729,7 @@ class OptimizeScreenController(
             marginEnd = endMargin
         }
 
-    private fun formatBytes(bytes: Long): String = activity.getString(R.string.bytes_value, bytes)
+    private fun formatBytes(bytes: Long): String = formatByteSize(bytes)
 
     private fun dp(value: Int): Int =
         (value * activity.resources.displayMetrics.density).toInt()
