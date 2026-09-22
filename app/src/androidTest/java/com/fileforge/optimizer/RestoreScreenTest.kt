@@ -322,8 +322,8 @@ class RestoreScreenTest {
         )
         ActivityScenario.launch(MainActivity::class.java).use {
             onView(withId(R.id.navigation_restore)).perform(click())
-            onView(withContentDescription("Select $hugePath")).perform(click())
-            onView(withId(R.id.restore_selected)).perform(click())
+            onView(withContentDescription("Select $hugePath")).perform(scrollTo(), click())
+            onView(withId(R.id.restore_selected)).perform(scrollTo(), click())
             onView(withId(android.R.id.button1)).perform(click())
 
             onView(withText(containsString("too large"))).check(matches(isDisplayed()))
