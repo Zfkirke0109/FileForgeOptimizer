@@ -268,8 +268,8 @@ class RestoreScreenTest {
         )
         ActivityScenario.launch(MainActivity::class.java).use {
             onView(withId(R.id.navigation_restore)).perform(click())
-            onView(withContentDescription("Select all from second")).perform(click())
-            onView(withId(R.id.restore_selected)).perform(click())
+            onView(withContentDescription("Select all from second")).perform(scrollTo(), click())
+            onView(withId(R.id.restore_selected)).perform(scrollTo(), click())
             onView(withText("Restore 2 files?")).check(matches(isDisplayed()))
             onView(withId(android.R.id.button1)).perform(click())
 

@@ -13,6 +13,7 @@ import androidx.test.espresso.action.ViewActions.scrollTo
 import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.isChecked
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
+import androidx.test.espresso.matcher.ViewMatchers.withId
 import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import java.io.ByteArrayInputStream
@@ -50,7 +51,7 @@ class AboutScreenTest {
         )
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            onView(withText("About")).perform(click())
+            onView(withId(R.id.navigation_about)).perform(click())
 
             onView(withText("Created by Zachary Kirke")).perform(scrollTo()).check(matches(isDisplayed()))
             onView(withText("FileForge Optimizer")).perform(scrollTo()).check(matches(isDisplayed()))
@@ -87,7 +88,7 @@ class AboutScreenTest {
         )
 
         ActivityScenario.launch(MainActivity::class.java).use {
-            onView(withText("About")).perform(click())
+            onView(withId(R.id.navigation_about)).perform(click())
             onView(withText("Repository")).perform(scrollTo(), click())
             onView(withText("GitHub profile")).perform(scrollTo(), click())
             onView(withText("Issues")).perform(scrollTo(), click())
@@ -124,15 +125,15 @@ class AboutScreenTest {
                 worker = Executor { it.run() }
             )
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-                onView(withText("About")).perform(click())
+                onView(withId(R.id.navigation_about)).perform(click())
                 onView(withText(label)).perform(scrollTo(), click())
                 assertEquals(selected, ThemePreferences.forAndroid(context).read())
 
                 scenario.recreate()
-                onView(withText("About")).perform(click())
+                onView(withId(R.id.navigation_about)).perform(click())
                 onView(withText(label)).perform(scrollTo()).check(matches(isChecked()))
                 onView(withText("Optimize")).perform(click())
-                onView(withText("About")).perform(click())
+                onView(withId(R.id.navigation_about)).perform(click())
                 onView(withText(label)).perform(scrollTo()).check(matches(isChecked()))
             }
         }
@@ -160,7 +161,7 @@ class AboutScreenTest {
                 worker = Executor { it.run() }
             )
             ActivityScenario.launch(MainActivity::class.java).use {
-                onView(withText("About")).perform(click())
+                onView(withId(R.id.navigation_about)).perform(click())
                 onView(withText("Check for updates")).perform(scrollTo(), click())
                 onView(withText(expectedText)).perform(scrollTo()).check(matches(isDisplayed()))
             }
@@ -180,7 +181,7 @@ class AboutScreenTest {
         )
 
         ActivityScenario.launch(MainActivity::class.java).use {
-            onView(withText("About")).perform(click())
+            onView(withId(R.id.navigation_about)).perform(click())
             onView(withText("Distribution: standard")).perform(scrollTo()).check(matches(isDisplayed()))
             onView(withText("Release asset: standard")).perform(scrollTo()).check(matches(isDisplayed()))
             onView(withText("Packaged ABI: none")).perform(scrollTo()).check(matches(isDisplayed()))
@@ -208,7 +209,7 @@ class AboutScreenTest {
         )
 
         ActivityScenario.launch(MainActivity::class.java).use {
-            onView(withText("About")).perform(click())
+            onView(withId(R.id.navigation_about)).perform(click())
             onView(withText("Check for updates")).perform(scrollTo(), click())
             onView(withText("Update available: 2.0.0")).perform(scrollTo()).check(matches(isDisplayed()))
             assertEquals(emptyList<Intent>(), launched)
