@@ -6,6 +6,7 @@ setup() {
   export FEATURE_WORKFLOW="$REPO_ROOT/.github/workflows/verify-feature.yml"
   export SECRET_WORKFLOW="$REPO_ROOT/.github/workflows/secret-scan.yml"
   export LINT_WORKFLOW="$REPO_ROOT/.github/workflows/lint-sources.yml"
+  export INSTRUMENTED_WORKFLOW="$REPO_ROOT/.github/workflows/instrumented-tests.yml"
 }
 
 @test "release workflow pins toolchains and verifies both flavors" {
@@ -42,7 +43,8 @@ setup() {
 }
 
 @test "workflow actions are pinned to immutable commits" {
-  for workflow in "$BUILD_WORKFLOW" "$FEATURE_WORKFLOW" "$SECRET_WORKFLOW" "$LINT_WORKFLOW"; do
+  for workflow in "$BUILD_WORKFLOW" "$FEATURE_WORKFLOW" "$SECRET_WORKFLOW" "$LINT_WORKFLOW" \
+    "$INSTRUMENTED_WORKFLOW"; do
     while IFS= read -r action; do
       [[ "$action" =~ @[0-9a-f]{40}([[:space:]]*#.*)?$ ]]
     done < <(grep -E '^[[:space:]]*-?[[:space:]]*uses:' "$workflow")
@@ -85,6 +87,20 @@ setup() {
   run yamllint --strict --config-file "$REPO_ROOT/.yamllint" \
     "$REPO_ROOT/.github" "$REPO_ROOT/.yamllint"
   [ "$status" -eq 0 ]
+}
+
+@test "instrumented workflow runs the on-device suites on an Android 15 emulator" {
+  [ -f "$INSTRUMENTED_WORKFLOW" ]
+  grep -Fq 'system-images;android-35;google_apis;x86_64' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq '99-kvm4all.rules' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'sys.boot_completed' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq ':app:connectedStandardDebugAndroidTest' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'packages: platform-tools' "$INSTRUMENTED_WORKFLOW"
+}
+
+@test "instrumented suites declare the AndroidJUnit4 runner they are written for" {
+  grep -Fq "testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'" \
+    "$REPO_ROOT/app/build.gradle"
 }
 
 @test "repository release metadata exists" {

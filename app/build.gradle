@@ -21,6 +21,10 @@ android {
         targetSdk 35
         versionCode 2
         versionName '0.2.0'
+        // Without this AGP falls back to the legacy android.test.InstrumentationTestRunner, which
+        // cannot discover @RunWith(AndroidJUnit4::class) suites, so the whole androidTest set is
+        // silently unrunnable.
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
 
     flavorDimensions 'distribution'
