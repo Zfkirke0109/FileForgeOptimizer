@@ -70,16 +70,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # avdmanager and the emulator resolve their default AVD directories
+          # differently on the runner, so the emulator could not find the AVD
+          # avdmanager had just created. ANDROID_AVD_HOME is the first place
+          # both of them look, which makes them agree.
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_AVD_HOME"
+          log="$RUNNER_TEMP/emulator.log"
+          fail() {
+            echo "::error::$1"
+            cat "$log" 2>/dev/null || true
+            exit 1
+          }
+
           echo no | avdmanager create avd --force --name fileforge-api35 \
             --package "$SYSTEM_IMAGE" --device pixel_6
+          emulator -list-avds | grep -Fxq fileforge-api35 \
+            || fail "The emulator cannot see the AVD avdmanager created in $ANDROID_AVD_HOME"
+
           nohup emulator -avd fileforge-api35 \
             -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data \
             -memory 4096 -gpu swiftshader_indirect \
             -camera-back none -camera-front none \
-            > "$RUNNER_TEMP/emulator.log" 2>&1 &
-          adb wait-for-device
-          timeout 600 bash -c \
-            'until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do sleep 5; done'
+            > "$log" 2>&1 &
+          emulator_pid=$!
+
+          # Poll instead of `adb wait-for-device`, which waits forever for an
+          # emulator that has already died. Fail within seconds if the process
+          # exits, and within ten minutes if it never finishes booting.
+          deadline=$((SECONDS + 600))
+          until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; do
+            kill -0 "$emulator_pid" 2>/dev/null || fail "The emulator exited before it finished booting"
+            [ "$SECONDS" -lt "$deadline" ] || fail "The emulator did not finish booting within ten minutes"
+            sleep 5
+          done
           # Espresso needs a settled, unlocked screen with no animations.
           adb shell settings put global window_animation_scale 0
           adb shell settings put global transition_animation_scale 0

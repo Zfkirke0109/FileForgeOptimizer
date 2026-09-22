@@ -98,6 +98,16 @@ setup() {
   grep -Fq 'packages: platform-tools' "$INSTRUMENTED_WORKFLOW"
 }
 
+@test "instrumented workflow fails fast instead of hanging on a dead emulator" {
+  # The first run hung 43 minutes: the emulator could not find the AVD
+  # avdmanager wrote, died at once, and `adb wait-for-device` never returned.
+  grep -Fq 'export ANDROID_AVD_HOME=' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'emulator -list-avds' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'kill -0 "$emulator_pid"' "$INSTRUMENTED_WORKFLOW"
+  run grep -E '^[[:space:]]*adb wait-for-device[[:space:]]*$' "$INSTRUMENTED_WORKFLOW"
+  [ "$status" -ne 0 ]
+}
+
 @test "instrumented suites declare the AndroidJUnit4 runner they are written for" {
   grep -Fq "testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'" \
     "$REPO_ROOT/app/build.gradle"
