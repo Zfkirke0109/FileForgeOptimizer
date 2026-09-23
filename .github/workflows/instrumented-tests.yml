@@ -109,7 +109,27 @@ jobs:
           adb shell settings put global window_animation_scale 0
           adb shell settings put global transition_animation_scale 0
           adb shell settings put global animator_duration_scale 0
-          adb shell input keyevent 82
+          adb shell svc power stayon true
+          adb shell settings put system screen_off_timeout 2147483647
+
+          # sys.boot_completed turns 1 before the home screen has drawn. One run
+          # sent its unlock key before the launcher appeared. Every activity
+          # the tests launched after that drew but never got input focus, and
+          # 23 of 29 tests failed with RootViewWithoutFocusException. So wait
+          # until the launcher itself holds input focus, dismissing the lock
+          # screen and any system dialog on each pass.
+          settle_deadline=$((SECONDS + 180))
+          focused=""
+          until [[ "$focused" == *[Ll]auncher* ]]; do
+            [ "$SECONDS" -lt "$settle_deadline" ] \
+              || fail "The home screen never took input focus. Last focused window: ${focused:-none}"
+            adb shell input keyevent KEYCODE_WAKEUP || true
+            adb shell wm dismiss-keyguard || true
+            adb shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS > /dev/null 2>&1 || true
+            sleep 2
+            focused="$(adb shell dumpsys window 2>/dev/null | tr -d '\r' | grep -m1 'mCurrentFocus=' || true)"
+          done
+          echo "Focused window before the tests: $focused"
           adb shell getprop ro.build.version.release
           adb shell getprop ro.build.version.sdk
 
@@ -121,6 +141,14 @@ jobs:
           adb logcat -v threadtime > "$RUNNER_TEMP/logcat.txt" 2>&1 &
           gradle :app:connectedStandardDebugAndroidTest
 
+      - name: Capture the screen and window state after a failure
+        if: failure()
+        shell: bash
+        run: |
+          # Shows what held input focus when a test could not get it.
+          adb shell dumpsys window > "$RUNNER_TEMP/window-state.txt" 2>&1 || true
+          adb exec-out screencap -p > "$RUNNER_TEMP/screen.png" 2>/dev/null || true
+
       - name: Upload test reports and device logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -131,4 +159,6 @@ jobs:
             app/build/outputs/androidTest-results/
             ${{ runner.temp }}/emulator.log
             ${{ runner.temp }}/logcat.txt
+            ${{ runner.temp }}/window-state.txt
+            ${{ runner.temp }}/screen.png
           if-no-files-found: warn
