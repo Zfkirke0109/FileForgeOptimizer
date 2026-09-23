@@ -108,6 +108,16 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
+@test "instrumented workflow waits for the home screen to hold input focus" {
+  # One run sent its unlock key before the launcher had drawn, and 23 of 29
+  # tests then failed because no activity they launched ever got input focus.
+  grep -Fq 'mCurrentFocus=' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'wm dismiss-keyguard' "$INSTRUMENTED_WORKFLOW"
+  grep -Fq 'window-state.txt' "$INSTRUMENTED_WORKFLOW"
+  run grep -E '^[[:space:]]*adb shell input keyevent 82[[:space:]]*$' "$INSTRUMENTED_WORKFLOW"
+  [ "$status" -ne 0 ]
+}
+
 @test "instrumented suites declare the AndroidJUnit4 runner they are written for" {
   grep -Fq "testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'" \
     "$REPO_ROOT/app/build.gradle"
