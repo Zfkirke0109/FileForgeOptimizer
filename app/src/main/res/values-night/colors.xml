@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="fileforge_primary">#A4C8FF</color>
+    <color name="fileforge_on_primary">#00315F</color>
+    <color name="fileforge_secondary">#BBC7DB</color>
+    <color name="fileforge_on_secondary">#253140</color>
+    <color name="fileforge_background">#111318</color>
+    <color name="fileforge_on_background">#E2E2E9</color>
+    <color name="fileforge_surface">#111318</color>
+    <color name="fileforge_surface_container">#1D2024</color>
+    <color name="fileforge_on_surface">#E2E2E9</color>
+    <color name="fileforge_outline">#8D9199</color>
+</resources>

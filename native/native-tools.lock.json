@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "ndkVersion": "27.2.12479018",
+  "rustToolchain": "1.88.0",
+  "cargoNdkVersion": "4.1.2",
+  "licenseAllowlist": ["Apache-2.0", "MIT", "IJG-AND-BSD-3-Clause"],
+  "systemLibraries": ["libc.so", "libm.so", "libdl.so", "liblog.so", "libz.so"],
+  "tools": [
+    {
+      "id": "qpdf",
+      "version": "12.4.0",
+      "repository": "https://github.com/qpdf/qpdf.git",
+      "ref": "v12.4.0",
+      "expectedCommit": "babad179ce5db9a21635c8d1ac17baa59637eada",
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "oxipng",
+      "version": "10.2.0",
+      "repository": "https://github.com/oxipng/oxipng.git",
+      "ref": "v10.2.0",
+      "expectedCommit": "340cd9878d8d8289f09fa101b48a8f5f0b7783f4",
+      "license": "MIT"
+    },
+    {
+      "id": "jpegtran",
+      "version": "3.1.4.1",
+      "repository": "https://github.com/libjpeg-turbo/libjpeg-turbo.git",
+      "ref": "3.1.4.1",
+      "expectedCommit": "9217719d3a58633923b096af4c1d50d304768a64",
+      "license": "IJG-AND-BSD-3-Clause"
+    },
+    {
+      "id": "zopflipng",
+      "version": "1.0.3",
+      "repository": "https://github.com/google/zopfli.git",
+      "ref": "zopfli-1.0.3",
+      "expectedCommit": "bd64b2f0553d4f1ef4e6627647c5d9fc8c71ffc0",
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "zipalign",
+      "version": "platform-tools-31.0.0",
+      "repository": "https://android.googlesource.com/platform/build",
+      "ref": "refs/tags/platform-tools-31.0.0",
+      "expectedCommit": "0600846b9bf9377c091a7e95d2e46cbf59014f43",
+      "license": "Apache-2.0"
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "aosp-system-core",
+      "repository": "https://android.googlesource.com/platform/system/core",
+      "ref": "refs/tags/platform-tools-31.0.0",
+      "expectedCommit": "acbbe4eaf4ec9397ce614a7b907df112ab770010",
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "aosp-libziparchive",
+      "repository": "https://android.googlesource.com/platform/system/libziparchive",
+      "ref": "refs/tags/platform-tools-31.0.0",
+      "expectedCommit": "847ea929a82adeb3b08f4307975e75cc073bddaa",
+      "license": "Apache-2.0"
+    }
+  ]
+}

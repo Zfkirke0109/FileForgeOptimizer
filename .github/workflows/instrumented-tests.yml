@@ -1,0 +1,164 @@
+name: Instrumented tests on Android 15
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fileforge-instrumented-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SYSTEM_IMAGE: system-images;android-35;google_apis;x86_64
+
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407  # v3
+        with:
+          # The default list asks for the obsolete `tools` package, which Google
+          # removed; see build-debug-apk.yml.
+          packages: platform-tools
+
+      - name: Enable hardware acceleration
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GitHub's Linux runners expose KVM, but only to root until this rule
+          # opens it up. Without KVM an x86_64 emulator will not boot at all.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install the Android 15 emulator and system image
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "emulator" \
+            "$SYSTEM_IMAGE"
+          echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          sdkmanager --list_installed | grep -E 'emulator|system-images'
+
+      - uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d  # v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Assemble the app and instrumentation APKs
+        run: gradle :app:assembleStandardDebug :app:assembleStandardDebugAndroidTest
+
+      - name: Boot a headless Android 15 emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          # avdmanager and the emulator resolve their default AVD directories
+          # differently on the runner, so the emulator could not find the AVD
+          # avdmanager had just created. ANDROID_AVD_HOME is the first place
+          # both of them look, which makes them agree.
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/avd"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_AVD_HOME"
+          log="$RUNNER_TEMP/emulator.log"
+          fail() {
+            echo "::error::$1"
+            cat "$log" 2>/dev/null || true
+            exit 1
+          }
+
+          echo no | avdmanager create avd --force --name fileforge-api35 \
+            --package "$SYSTEM_IMAGE" --device pixel_6
+          emulator -list-avds | grep -Fxq fileforge-api35 \
+            || fail "The emulator cannot see the AVD avdmanager created in $ANDROID_AVD_HOME"
+
+          nohup emulator -avd fileforge-api35 \
+            -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data \
+            -memory 4096 -gpu swiftshader_indirect \
+            -camera-back none -camera-front none \
+            > "$log" 2>&1 &
+          emulator_pid=$!
+
+          # Poll instead of `adb wait-for-device`, which waits forever for an
+          # emulator that has already died. Fail within seconds if the process
+          # exits, and within ten minutes if it never finishes booting.
+          deadline=$((SECONDS + 600))
+          until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; do
+            kill -0 "$emulator_pid" 2>/dev/null || fail "The emulator exited before it finished booting"
+            [ "$SECONDS" -lt "$deadline" ] || fail "The emulator did not finish booting within ten minutes"
+            sleep 5
+          done
+          # Espresso needs a settled, unlocked screen with no animations.
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell svc power stayon true
+          adb shell settings put system screen_off_timeout 2147483647
+
+          # sys.boot_completed turns 1 before the home screen has drawn. One run
+          # sent its unlock key before the launcher appeared. Every activity
+          # the tests launched after that drew but never got input focus, and
+          # 23 of 29 tests failed with RootViewWithoutFocusException. So wait
+          # until the launcher itself holds input focus, dismissing the lock
+          # screen and any system dialog on each pass.
+          settle_deadline=$((SECONDS + 180))
+          focused=""
+          until [[ "$focused" == *[Ll]auncher* ]]; do
+            [ "$SECONDS" -lt "$settle_deadline" ] \
+              || fail "The home screen never took input focus. Last focused window: ${focused:-none}"
+            adb shell input keyevent KEYCODE_WAKEUP || true
+            adb shell wm dismiss-keyguard || true
+            adb shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS > /dev/null 2>&1 || true
+            sleep 2
+            focused="$(adb shell dumpsys window 2>/dev/null | tr -d '\r' | grep -m1 'mCurrentFocus=' || true)"
+          done
+          echo "Focused window before the tests: $focused"
+          adb shell getprop ro.build.version.release
+          adb shell getprop ro.build.version.sdk
+
+      - name: Run the instrumented suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          adb logcat -c
+          adb logcat -v threadtime > "$RUNNER_TEMP/logcat.txt" 2>&1 &
+          gradle :app:connectedStandardDebugAndroidTest
+
+      - name: Capture the screen and window state after a failure
+        if: failure()
+        shell: bash
+        run: |
+          # Shows what held input focus when a test could not get it.
+          adb shell dumpsys window > "$RUNNER_TEMP/window-state.txt" 2>&1 || true
+          adb exec-out screencap -p > "$RUNNER_TEMP/screen.png" 2>/dev/null || true
+
+      - name: Upload test reports and device logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: instrumented-test-reports
+          path: |
+            app/build/reports/androidTests/
+            app/build/outputs/androidTest-results/
+            ${{ runner.temp }}/emulator.log
+            ${{ runner.temp }}/logcat.txt
+            ${{ runner.temp }}/window-state.txt
+            ${{ runner.temp }}/screen.png
+          if-no-files-found: warn
